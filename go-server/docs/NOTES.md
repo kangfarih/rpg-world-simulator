@@ -137,3 +137,9 @@
 - Appended §6 (G1–G16) to `go-server/docs/GO-SERVER-PLAN.md`: commands table, minigame split, 7 area types, globals, mob AI, pets, loot 2-phase, stores, social+relay, REST+hub auth, Sentry/admin scope, E2E+M8, map-build+world_hash, hub consolidation, filter+i18n, inventory checklist rows. 1111→1721 words (<2000).
 - Mirrored identically to `~/.config/opencode/.harness-memory/rpg-world-sim/GO-SERVER-PLAN.md` (`cmp` clean). `packages/*` untouched. `go vet ./...` green in `go-server/`.
 - Verify: `git status --porcelain` in /Users/appfuxion/repo/rpg-world-sim = clean (empty); no commits made.
+
+## GO-SERVER-PLAN final coverage nits (2026-09-15, docs only)
+- GAP-1 Discord: G9 extended — `packages/common/api/discord.ts` local-broadcast hook only (`onMessage`→global chat), full Discord bot bridge OOS.
+- GAP-2 sprites.json: §1 inventory — marked client-generated/optional (not server-authoritative, no port); no `packages/server/data/sprites.json` exists.
+- GAP-3 areas: G3 rewritten to 7 impl files `camera/chest/dynamic/minigame/music/overlay/pvp.ts` with aliases (chest≈event/loot, dynamic≈door/trigger, minigame≈event/instance, overlay≈safe, spawn via spawn-queue hooks).
+- Mirrored identically to `~/.config/opencode/.harness-memory/rpg-world-sim/GO-SERVER-PLAN.md` (`cmp` clean). `packages/*` untouched. `go vet ./...` green in `go-server/` (docs only).
