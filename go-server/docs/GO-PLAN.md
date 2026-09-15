@@ -12,7 +12,7 @@ TARGET: Go 1.22 + `gobwas/ws` (`nhooyr.io/websocket` fallback) + `modernc.org/sq
 ### 1. Inventory
 
 Subsystems: bootstrap; conn + anti-spam (handshake/login/ready, IP throttle, chat bucket); regions/areas (48 tiles/region, sideLength 24, surroundingRegions); movement + anticheat (speed/collision/entity-grid verify, teleport-back); combat + projectiles (GCD, aggro, poison/burn/freeze/bleed); gathering (deplete→respawn); drops/loot (30–50s despawn); quests + achievements; stores/bank/trade/craft/enchant (stub: stores in-memory only); guilds/friends/hub; chat/commands ~1300 lines; abilities; minigames teamwar/coursing; NPC/pet/stats.
-Data (verified 2026-09-15): `items.json` 525, `mobs.json` 148, `npcs/spawns/tables.json`, `trees/rocks/fishing/foraging.json`, `stores.json`, `crafting/` 7 recipes + index loader, `quests/` 21 + `quest_bases/` 28, `abilities.json`, `minigames.json`, `map/world.json` 1152×1008; `sprites.json` client-only, no port.
+Data (verified 2026-09-15): `items.json` 525, `mobs.json` 148, `npcs/spawns/tables.json`, `trees/rocks/fishing/foraging.json`, `stores.json`, `crafting/` 7 files, `quests/` 21 + `quest_bases/` 28, `abilities.json`, `minigames.json`, `map/world.json` 1152×1008; `sprites.json` client-only, no port.
 Packets: 61 (0–60 Connected…AdminSync; 59 Resource, 60 AdminSync) + opcodes (movement 0/1/2/3/4/5/7, equipment Batch0, store/guild/quest/ability/minigame sub-ops). Port all 53 `network/impl/*.ts` frames exactly.
 State split — persistent TARGET TODO (no DB in stub): players, equipment/inventory/bank, quests/achievements, skills/XP, stats, abilities, guilds; `meta` + migrations TODO. In-memory: entities, grids/regions, combat, loot timers, resource timers, store cache 20s TTL, minigame lobby/queue.
 
@@ -58,7 +58,7 @@ In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/ch
 - M3 combat+projectiles+GCD — TODO: formulas, `Combat/Heal/Effect`, projectile flight, aggro/leash/respawn, DoT ticks, death→despawn.
 - M4 resources+gathering — PARTIAL (shake + stump): TODO all tables, tool tiers, deplete→respawn, `Animation` + `Resource` sync.
 - M5 drops/loot+XP/skills — TODO: drop tables → lootbag/chest (30–50s), pickup, XP curves, 19 skills.
-- M6 quests/achievements+stores/bank/trade/craft — TODO: quest engine + achievements, store buy/sell/select + cache, bank, trade, 7-file recipes, enchant.
+- M6 quests/achievements+stores/bank/trade/craft — TODO: quest engine + achievements, store buy/sell/select + cache, bank, trade, `crafting/` 7 files, enchant.
 - M7 social+hub+chat/commands — TODO: guilds/friends persist + hub routing, ~1300-line commands port, anti-spam + per-IP limits.
 - M8 minigames+hardening — TODO: teamwar/coursing lobby/queue/score; region-scope sends, per-tick bulks, rate limits, load/soak, `go vet/build/gofmt` green.
 
@@ -94,7 +94,7 @@ TARGET: one `go-server` binary as `router` / `shard` / `all-in-one` (flags); gob
 
 ### 8. Worlds-as-versions
 
-A deploy = new world rows in the hub server-list tagged with the new version (`buildID`, `gVer`, state). Router sends all NEW logins to the newest healthy (RUNNING) version; the old version drains: no new sessions, existing players finish tasks naturally, state persists, then shutdown on empty or drain timeout. Rollback = flip the router flag back to the old version (kept warm) — no data migration, no redeploy.
+A deploy = new world rows in the hub server-list tagged with the new version (`buildID`, `gVer`, state). Router sends all NEW logins to the newest healthy (RUNNING) version; the old version drains: no new sessions, existing players finish tasks naturally, state persists, then shutdown on empty or drain timeout. Rollback = router swap-back to the old version (kept warm) — no data migration, no redeploy.
 
 ### 9. gVer lockstep + client banner
 
@@ -112,7 +112,7 @@ No RAM-only progression: every XP/item/quest grant enters the write queue before
 
 Map: shards own region groups within one world version; worlds-as-versions = parallel blue/green world copies across a version swap; R1–R4 = V2-M1–M4 respectively.
 
-- R1 router + gVer gate: `Register`/heartbeat table, newest-RUNNING routing, `Handshake{gVer}` reject→hub redirect, SIGTERM→DRAINING, drain timeout + flush barrier, `/healthz`. Done: `kill -TERM` mid-session keeps players on; new logins land on new proc.
+- R1 router + gVer gate: `Register`/heartbeat table, newest-RUNNING routing, `Handshake{gVer}` reject→hub redirect, SIGTERM→DRAINING, drain timeout + flush barrier, `/healthz`. Done: `kill -TERM` mid-session keeps players on; new logins land on new proc. Relaxation allowed: ship router-only (no shard sim) and gate the criteria on routing + drain, not world sim.
 - R2 multi-world versions: version-tagged world rows, new-login swap, old drains, cross-shard handoff RPC + router region→build lookup; same-build shard move = seamless, no reload (RPC/socket handoff); cross-build version swap = disconnect+reconnect via login/hub with reload, never bare Teleport across builds; refresh banner via Chat-19 (Notification-25 alt), no new opcode. Done: two versions live side by side, clients split by login time.
 - R3 runbook + rollback: backup (Go-side snapshot via `VACUUM INTO '<timestamped>.db'` through database/sql on the owner connection, no sqlite3 CLI, timestamped archive) → migrate → start new → health-gate → canary 5% → 100% → TERM old → warm-hold 15 min → shutdown; rollback = router swap-back. Done: full deploy with players online, only gVer-mismatched redirects.
 - R4 chaos drill: 100+ bots, `kill -TERM` mid-fight/mid-trade, `kill -9` (WAL recovery), skew soak. Pass: no item/XP/quest loss, p95 tick <50 ms, hub reconnect <10s.

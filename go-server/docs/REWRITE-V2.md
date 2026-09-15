@@ -14,7 +14,7 @@ Existing Kaetram hooks to reuse (all TODO — none wired in stub today): `Handsh
 
 ## 1. Goals / non-goals
 
-Goals: (a) full MMO parity per GO-SERVER-PLAN §6 — all 61 packets, combat/skills/quests/economy/social/minigames, 525 items / 148 mobs / 94 recipes / 49 quests; (b) zero-downtime deploys — old build drains while new build takes new sessions; (c) single-binary ops — one `go-server` binary runs as router, shard, or both via flags; SQLite per shard + shared account DB, no external DB dependency.
+Goals: (a) full MMO parity per GO-SERVER-PLAN §6 — all 61 packets, combat/skills/quests/economy/social/minigames, 525 items / 148 mobs / `crafting/` 7 files / `quests/` 21 + `quest_bases/` 28; (b) zero-downtime deploys — old build drains while new build takes new sessions; (c) single-binary ops — one `go-server` binary runs as router, shard, or both via flags; SQLite per shard + shared account DB, no external DB dependency.
 
 Non-goals: no client changes (JSON wire frozen, client only sees new address via login/hub reconnect — Teleport never crosses builds); no background-asset streaming (client full-reloads on reconnect — accepted); no cross-region single-tick atomicity (trades/guild ops via shard-to-shard RPC, eventually consistent).
 
@@ -52,7 +52,7 @@ Crash recovery: on boot, shard loads latest checkpoint + replays write-ahead (WA
 
 Expand-only, backward-compatible: new columns always nullable or with defaults; new tables additive; never rename/drop in a deploy that overlaps a drain window. `schema_version` table; binary checks min-compatible version at boot and refuses to start on newer-than-known (fail fast, router keeps old build).
 
-Skew window: during drain, old build writes old schema, new build writes new schema — both must succeed, but they NEVER share one file as dual writers (owner+RPC per §2). So migration runs BEFORE new-build rollout and must be readable+writable by old code (e.g. add column nullable → old ignores it; backfill in background after old build fully SHUTDOWN; drop/rename only two releases later). Rollback-safe: downgrade = router flip only, no down-migration.
+Skew window: during drain, old build writes old schema, new build writes new schema — both must succeed, but they NEVER share one file as dual writers (owner+RPC per §2). So migration runs BEFORE new-build rollout and must be readable+writable by old code (e.g. add column nullable → old ignores it; backfill in background after old build fully SHUTDOWN; drop/rename only two releases later). Rollback-safe: downgrade = router swap-back, no down-migration.
 
 ## 6. Milestones
 
@@ -60,7 +60,7 @@ Map: shards own region groups within one world version; worlds-as-versions = par
 
 V2-M1 standalone router + gVer gate + drain lifecycle (router FIRST as a separate tiny process — NOT all-in-one; all-in-one comes later, or relax the done-criteria to router-only): `Register`/heartbeat table, login routes to newest RUNNING, `Handshake{gVer}` reject→hub redirect (hub must be built for the redirect to land anywhere), SIGTERM→DRAINING (no new conns, existing play on), drain timeout + pre-shutdown flush barrier, `/healthz` + state endpoint. Done when: old proc `kill -TERM` mid-session keeps player connected until logout, new logins land on new proc. Relaxation allowed: ship router-only (no shard sim) and gate the criteria on routing + drain, not world sim.
 
-V2-M2 multi-instance regions + registration: shard flag takes region-group assignment; cross-shard handoff RPC (DB flush + state transfer + Spawn on target); same-build shard move = seamless, no reload (RPC/socket handoff); cross-build version swap = disconnect+reconnect via login/hub with reload — Teleport packet used only for same-socket moves, never bare Teleport across builds; router region→build lookup. Done when: two shards split the map, walking across boundary hands off without dup/loss.
+V2-M2 multi-instance regions + registration: shard flag takes region-group assignment; cross-shard handoff RPC (DB flush + state transfer + Spawn on target); same-build shard move = seamless, no reload (RPC/socket handoff); cross-build version swap = disconnect+reconnect via login/hub with reload — Teleport packet used only for same-socket moves, never bare Teleport across builds; router region→build lookup; refresh banner via Chat-19 (Notification-25 alt), no new opcode. Done when: two shards split the map, walking across boundary hands off without dup/loss.
 
 V2-M3 blue-green deploy runbook + rollback: deploy script (backup DBs first, build, migrate expand-only, start new, health-gate, canary 5% → router swap to 100%, TERM old, warm-hold N min, shutdown), backup/restore steps (pre-deploy snapshot of every shard DB + account DB via Go-side path — owner connection runs `VACUUM INTO '<timestamped>.db'` through database/sql, no sqlite3 CLI — timestamped archive, restore procedure = stop new, restore files, router swap-back, restart old buildID, verify checkpoint), rollback path (router swap-back), runbook doc + dry-run on staging. Done when: full deploy with players online, zero rejects except gVer-mismatched clients redirected cleanly via hub.
 
