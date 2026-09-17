@@ -1389,6 +1389,8 @@ func applyBossHitLocked(attacker string, dmg, typ int, skills []string, ranged b
 		bossAttackers = map[string]bool{}
 		broadcast(pkt(PacketDespawn, despawnData{Instance: combatDummyInstance}))
 		log.Printf("combat: boss died -> despawned, respawn in %v", dummyRespawnDelay)
+		// M5: boss death rolls the golem drop tables (attacker owns the loot).
+		m5SpawnLoot("golem", combatDummyX, combatDummyY, attacker)
 		time.AfterFunc(dummyRespawnDelay, combatRespawn)
 	}
 }
@@ -2263,6 +2265,7 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
 			setEntityPos(c.instance, s.playerX, s.playerY)
 			updateClientRegion(c)
+			m5TrackPos(c)
 		}
 	case MovementStep:
 		if mv.NextGridX != nil && mv.NextGridY != nil {
@@ -2276,12 +2279,16 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
 			setEntityPos(c.instance, s.playerX, s.playerY)
 			updateClientRegion(c)
+			m5TrackPos(c)
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
 			blocked(*mv.NextGridX, *mv.NextGridY) &&
 			!targetsResource(*mv.NextGridX, *mv.NextGridY, mv.TargetInstance, s.target) {
 			stopPlayer(conn, s, c.instance)
 			updateClientRegion(c)
+		} else if mv.NextGridX != nil && mv.NextGridY != nil {
+			// M5: stepping onto a loot tile picks it up.
+			m5PickupAtTile(c, *mv.NextGridX, *mv.NextGridY)
 		}
 	case MovementFollow:
 		// Log-only: a Follow carrying a resource targetInstance is just the
@@ -2324,14 +2331,19 @@ func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 		return
 	}
 	log.Printf("target opcode=%d instance=%s", opcode, instance)
+	// M5: Target on a loot entity picks it up (in addition to Step).
+	if m5IsLoot(instance) {
+		m5Pickup(c, instance)
+		return
+	}
 	if opcode == TargetObject && isResourceInstance(instance) {
 		hitResource(c.instance, instance)
 	}
 }
 
-// handleCombatReq is log-only: combat frames never gather (only Target Object
-// counts as a gather swing).
-func handleCombatReq(frame clientFrame) {
+// handleCombatReq routes one hero swing at a killable mob (M5); anything
+// else stays log-only (combat frames never gather).
+func handleCombatReq(c *playerConn, frame clientFrame) {
 	var data json.RawMessage
 	switch {
 	case len(frame) >= 3:
@@ -2353,6 +2365,9 @@ func handleCombatReq(frame clientFrame) {
 		return
 	}
 	log.Printf("combat instance=%s target=%s", cd.Instance, cd.Target)
+	if cd.Target == combatDummyInstance || cd.Target == combatRatInstance || cd.Target == "m1" {
+		handlePlayerAttack(c, cd.Target)
+	}
 }
 
 // handleAnimationReq is log-only: animation echoes never gather (only Target
@@ -2508,6 +2523,7 @@ type Entity struct {
 type playerConn struct {
 	conn     *websocket.Conn
 	instance string
+	username string // login name, DB key for the M5 persist slice
 	sess     session
 	outbox   chan []any // queued S->C frames, flushed by the tick loop
 	regions  []int      // current 9-region interest set
@@ -2787,6 +2803,8 @@ func removeClient(conn *websocket.Conn) {
 	entitiesMu.Lock()
 	delete(entities, c.instance)
 	entitiesMu.Unlock()
+	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
+	m5SaveSync(c.username)
 	_ = conn.Close()
 	broadcast(pkt(PacketDespawn, despawnData{Instance: c.instance}))
 	log.Printf("client removed: instance=%s (despawn broadcast)", c.instance)
@@ -2874,6 +2892,8 @@ func hitResource(attacker, instance string) {
 	}
 	log.Printf("resource %s exhausted: +%d %s xp (M5 hook, key %s item %s)",
 		instance, info.Experience, skill, desc.Key, info.Item)
+	// M5: table experience lands on the real gathering skill.
+	m5GatherXP(attacker, skill, info.Experience)
 	resMu.Lock()
 	st.depleted = true
 	delay := resourceRespawnDelay(info)
@@ -3023,6 +3043,10 @@ func spawnPayload(instance string) (any, bool) {
 		return p, true
 	}
 	projMu.Unlock()
+	// M5: live loot entities resolve here for Who.
+	if p, ok := m5LootPayload(instance); ok {
+		return p, true
+	}
 	resMu.Lock()
 	_, isRes := resources[instance]
 	resMu.Unlock()
@@ -3232,10 +3256,17 @@ func handleConn(conn *websocket.Conn) {
 					return
 				}
 			case PacketLogin: // C Login (opcode lives inside data) -> Welcome + Map only
-				if err := send(conn,
-					pkt(PacketWelcome, welcomePlayer(c.instance)),
-					buildMapFrame(),
-				); err != nil {
+				var login struct {
+					Username string `json:"username"`
+				}
+				if len(frame) >= 2 {
+					_ = json.Unmarshal(frame[1], &login)
+				}
+				// M5: Welcome from DB when the login username is known, else
+				// fresh; Container/Skill batches restore visible state.
+				ph, extra := m5LoginWelcome(c, login.Username)
+				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
+				if err := send(conn, frames...); err != nil {
 					log.Printf("write welcome/map: %v", err)
 					return
 				}
@@ -3262,8 +3293,8 @@ func handleConn(conn *websocket.Conn) {
 				}
 			case PacketTarget: // C Target [opcode, instance] -> gather on that resource
 				handleTarget(conn, c, frame)
-			case PacketCombat: // C Combat {instance,target} -> chop on that oak
-				handleCombatReq(frame)
+			case PacketCombat: // C Combat {instance,target} -> hero swing on killables
+				handleCombatReq(c, frame)
 			case PacketAnimation: // C Animation {resourceInstance} -> chop on that oak
 				handleAnimationReq(frame)
 			default:
@@ -3274,6 +3305,7 @@ func handleConn(conn *websocket.Conn) {
 }
 
 func main() {
+	m5Init()
 	startTickLoop()
 	initEntities()
 	startShowcase()

@@ -717,6 +717,295 @@ func main() {
 		lastFrames = nil
 	}
 	check(respawned, "boss respawns after ~15s (Spawn m-dummy)")
+	lastFrames = nil
+
+	// --- M5 slice 1: kill rat -> loot spawns -> pickup -> XP -> persist ---
+	// NOTE: steps are paced 500ms (server speed allowance is 209ms/tile and
+	// sess trails NextGrid by one step, so back-to-back steps look like a
+	// 2-tile jump); the trailing stationary step converges sess onto the
+	// destination with no speed check (dx+dy == 0).
+	fmt.Println("m5: hero steps 100,96 -> 102,96 ...")
+	send(conn, `[11,{"opcode":0,"requestX":101,"requestY":96}]`)
+	time.Sleep(500 * time.Millisecond)
+	send(conn, `[11,{"opcode":2,"playerX":100,"playerY":96,"nextGridX":101,"nextGridY":96}]`)
+	time.Sleep(500 * time.Millisecond)
+	send(conn, `[11,{"opcode":2,"playerX":101,"playerY":96,"nextGridX":102,"nextGridY":96}]`)
+	time.Sleep(500 * time.Millisecond)
+	send(conn, `[11,{"opcode":2,"playerX":102,"playerY":96,"nextGridX":102,"nextGridY":96}]`)
+	time.Sleep(500 * time.Millisecond)
+	send(conn, `[6]`)
+	drain(2 * time.Second)
+	heroXY := [2]int{100, 96}
+	for _, s := range lastFrames {
+		var id int
+		_ = json.Unmarshal(s.f[0], &id)
+		if id != 6 || len(s.f) < 3 {
+			continue
+		}
+		var opcode int
+		_ = json.Unmarshal(s.f[1], &opcode)
+		if opcode != 1 {
+			continue
+		}
+		var lp struct {
+			Positions map[string]struct {
+				X int `json:"x"`
+				Y int `json:"y"`
+			} `json:"positions"`
+		}
+		if json.Unmarshal(frameData(s.f), &lp) == nil {
+			if p, ok := lp.Positions[welcome.Instance]; ok {
+				heroXY = [2]int{p.X, p.Y}
+			}
+		}
+	}
+	lastFrames = nil
+	fmt.Printf("  info: hero authoritative pos %v\n", heroXY)
+
+	fmt.Println("m5: hero attacks rat (4 swings)...")
+	for i := 0; i < 4; i++ {
+		send(conn, fmt.Sprintf(`[15,{"instance":%q,"target":"m-rat-1"}]`, welcome.Instance))
+		time.Sleep(300 * time.Millisecond)
+	}
+	drain(6 * time.Second)
+	ratGone, ratPoints := false, 0
+	type lootSpawn struct {
+		Instance string
+		Type     int
+		X, Y     int
+	}
+	var lootSpawns []lootSpawn
+	xpHits, skillUps := 0, 0
+	for _, s := range lastFrames {
+		var id int
+		_ = json.Unmarshal(s.f[0], &id)
+		switch id {
+		case 5:
+			var sp spawn
+			if json.Unmarshal(frameData(s.f), &sp) != nil {
+				continue
+			}
+			if sp.Type == 2 || sp.Type == 8 {
+				lootSpawns = append(lootSpawns, lootSpawn{sp.Instance, sp.Type, sp.X, sp.Y})
+			}
+		case 13:
+			var d struct {
+				Instance string `json:"instance"`
+			}
+			if json.Unmarshal(frameData(s.f), &d) == nil && d.Instance == "m-rat-1" {
+				ratGone = true
+			}
+		case 17:
+			var p points
+			if json.Unmarshal(frameData(s.f), &p) == nil && p.Instance == "m-rat-1" {
+				ratPoints++
+			}
+		case 28:
+			if len(s.f) < 3 {
+				continue
+			}
+			var opcode int
+			_ = json.Unmarshal(s.f[1], &opcode)
+			if opcode != 1 {
+				continue
+			}
+			var e struct {
+				Instance string `json:"instance"`
+				Amount   int    `json:"amount"`
+				Skill    int    `json:"skill"`
+			}
+			if json.Unmarshal(frameData(s.f), &e) == nil && e.Instance == welcome.Instance && e.Amount > 0 &&
+				(e.Skill == 6 || e.Skill == 3) {
+				xpHits++
+			}
+		case 44:
+			skillUps++
+		}
+	}
+	lastFrames = nil
+	fmt.Printf("  info: ratGone=%v ratPoints=%d loot=%v xpHits=%d skillUps=%d\n",
+		ratGone, ratPoints, lootSpawns, xpHits, skillUps)
+	check(ratGone, "hero kills rat (Despawn m-rat-1)")
+	check(ratPoints >= 1, fmt.Sprintf("rat HP drops via Points (got %d)", ratPoints))
+	check(len(lootSpawns) >= 1, fmt.Sprintf("loot spawns at corpse (Item type 2 or LootBag type 8, got %v)", lootSpawns))
+	check(xpHits >= 2, fmt.Sprintf("combat XP gained (Experience Skill Strength/Health, got %d)", xpHits))
+	check(skillUps >= 1, fmt.Sprintf("Skill Update packets (got %d)", skillUps))
+
+	fmt.Println("m5: Target-take all loot ...")
+	for _, l := range lootSpawns {
+		send(conn, fmt.Sprintf(`[14,[3,%q]]`, l.Instance))
+		time.Sleep(200 * time.Millisecond)
+	}
+	drain(4 * time.Second)
+	took := map[string]bool{}
+	gotSlots := map[string]int{}
+	for _, s := range lastFrames {
+		var id int
+		_ = json.Unmarshal(s.f[0], &id)
+		switch id {
+		case 13:
+			var d struct {
+				Instance string `json:"instance"`
+			}
+			if json.Unmarshal(frameData(s.f), &d) == nil {
+				took[d.Instance] = true
+			}
+		case 21:
+			if len(s.f) < 3 {
+				continue
+			}
+			var opcode int
+			_ = json.Unmarshal(s.f[1], &opcode)
+			if opcode != 1 {
+				continue
+			}
+			var cd struct {
+				Slot *struct {
+					Key   string `json:"key"`
+					Count int    `json:"count"`
+				} `json:"slot"`
+			}
+			if json.Unmarshal(frameData(s.f), &cd) == nil && cd.Slot != nil {
+				gotSlots[cd.Slot.Key] += cd.Slot.Count
+			}
+		}
+	}
+	lastFrames = nil
+	allTook := true
+	for _, l := range lootSpawns {
+		if !took[l.Instance] {
+			allTook = false
+		}
+	}
+	fmt.Printf("  info: took=%v slots=%v\n", took, gotSlots)
+	check(allTook, fmt.Sprintf("loot despawns on pickup (took %v)", took))
+	total := 0
+	for _, c := range gotSlots {
+		total += c
+	}
+	check(total >= 1, fmt.Sprintf("pickup lands in inventory (Container Add slots=%v)", gotSlots))
+
+	fmt.Println("m5: persist round-trip (hero stays at 102,96) ...")
+	send(conn, `[6]`)
+	drain(2 * time.Second)
+	savedXY := [2]int{102, 96}
+	for _, s := range lastFrames {
+		var id int
+		_ = json.Unmarshal(s.f[0], &id)
+		if id != 6 || len(s.f) < 3 {
+			continue
+		}
+		var opcode int
+		_ = json.Unmarshal(s.f[1], &opcode)
+		if opcode != 1 {
+			continue
+		}
+		var lp struct {
+			Positions map[string]struct {
+				X int `json:"x"`
+				Y int `json:"y"`
+			} `json:"positions"`
+		}
+		if json.Unmarshal(frameData(s.f), &lp) == nil {
+			if p, ok := lp.Positions[welcome.Instance]; ok {
+				savedXY = [2]int{p.X, p.Y}
+			}
+		}
+	}
+	lastFrames = nil
+	fmt.Printf("  info: saved pos %v slots %v\n", savedXY, gotSlots)
+	check(savedXY == [2]int{102, 96},
+		fmt.Sprintf("hero stands on 102,96 before disconnect (got %v)", savedXY))
+	conn.Close()
+	time.Sleep(800 * time.Millisecond)
+
+	incoming = make(chan []json.RawMessage, 65536)
+	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	check(err == nil, "m5 reconnect dials")
+	if err != nil {
+		fmt.Println("RECONNECT DIAL FAIL:", err)
+		os.Exit(1)
+	}
+	defer conn2.Close()
+	go reader(conn2)
+	drain(1500 * time.Millisecond)
+	lastFrames = nil
+	send(conn2, `[1,{"gVer":1}]`)
+	drain(1500 * time.Millisecond)
+	lastFrames = nil
+	send(conn2, `[2,{"opcode":0,"username":"tester","password":"x"}]`)
+	drain(2 * time.Second)
+	var rwelcome struct {
+		Instance string `json:"instance"`
+		X        int    `json:"x"`
+		Y        int    `json:"y"`
+	}
+	restored := map[string]int{}
+	restoredXP := map[int]int{}
+	for _, s := range lastFrames {
+		var id int
+		_ = json.Unmarshal(s.f[0], &id)
+		switch id {
+		case 3:
+			_ = json.Unmarshal(frameData(s.f), &rwelcome)
+		case 21:
+			if len(s.f) < 3 {
+				continue
+			}
+			var opcode int
+			_ = json.Unmarshal(s.f[1], &opcode)
+			if opcode != 0 {
+				continue
+			}
+			var cb struct {
+				Data *struct {
+					Slots []struct {
+						Key   string `json:"key"`
+						Count int    `json:"count"`
+					} `json:"slots"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(frameData(s.f), &cb) == nil && cb.Data != nil {
+				for _, sl := range cb.Data.Slots {
+					restored[sl.Key] += sl.Count
+				}
+			}
+		case 44:
+			if len(s.f) < 3 {
+				continue
+			}
+			var opcode int
+			_ = json.Unmarshal(s.f[1], &opcode)
+			if opcode != 0 {
+				continue
+			}
+			var sb struct {
+				Skills []struct {
+					Type       int `json:"type"`
+					Experience int `json:"experience"`
+				} `json:"skills"`
+			}
+			if json.Unmarshal(frameData(s.f), &sb) == nil {
+				for _, sk := range sb.Skills {
+					restoredXP[sk.Type] = sk.Experience
+				}
+			}
+		}
+	}
+	lastFrames = nil
+	fmt.Printf("  info: reconnect Welcome %d,%d restored=%v xp=%v\n",
+		rwelcome.X, rwelcome.Y, restored, restoredXP)
+	check(rwelcome.X == savedXY[0] && rwelcome.Y == savedXY[1],
+		fmt.Sprintf("position restored from DB (want %v got %d,%d)", savedXY, rwelcome.X, rwelcome.Y))
+	match := len(gotSlots) > 0 && len(restored) > 0
+	for k, c := range gotSlots {
+		if restored[k] != c {
+			match = false
+		}
+	}
+	check(match, fmt.Sprintf("inventory restored from DB (want %v got %v)", gotSlots, restored))
+	check(restoredXP[6] > 0 || restoredXP[3] > 0,
+		fmt.Sprintf("skill XP restored from DB (got %v)", restoredXP))
 
 	if len(failures) > 0 {
 		fmt.Printf("CHECK FAILED (%d failures)\n", len(failures))

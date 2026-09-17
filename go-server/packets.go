@@ -80,8 +80,11 @@ const (
 const (
 	EntityPlayer     = 0
 	EntityNPC        = 1
+	EntityItem       = 2
 	EntityMob        = 3
+	EntityChest      = 4
 	EntityProjectile = 5
+	EntityLootBag    = 8
 	EntityTree       = 10
 	EntityRock       = 11
 	EntityForaging   = 12
@@ -396,6 +399,67 @@ type RegionTile struct {
 	O    bool   `json:"o,omitempty"`
 	Cur  string `json:"cur,omitempty"`
 }
+
+// Container opcodes (Opcodes.Container: Batch0 Add1 Remove2 ...) + the
+// Inventory container type (Modules.ContainerType: Bank0 Inventory1 ...).
+const (
+	ContainerBatch  = 0
+	ContainerAdd    = 1
+	ContainerRemove = 2
+
+	ContainerTypeInventory = 1
+)
+
+// Experience opcodes (Opcodes.Experience: Sync0 Skill1).
+const (
+	ExperienceSync  = 0
+	ExperienceSkill = 1
+)
+
+// Skill opcodes (Opcodes.Skill: Batch0 Update1).
+const (
+	SkillBatch  = 0
+	SkillUpdate = 1
+)
+
+// slotData mirrors SlotData (common/types/slot.d.ts) as sent in Container
+// Add/Batch frames; containerBatch mirrors SerializedContainer.
+type slotData struct {
+	Index        int            `json:"index"`
+	Key          string         `json:"key"`
+	Count        int            `json:"count"`
+	Enchantments map[string]any `json:"enchantments"`
+}
+
+type containerBatch struct {
+	Slots []any `json:"slots"`
+}
+
+type containerData struct {
+	Type int             `json:"type"`
+	Data *containerBatch `json:"data,omitempty"`
+	Slot *slotData       `json:"slot,omitempty"`
+}
+
+// experienceData mirrors ExperiencePacketData (impl/experience.ts).
+type experienceData struct {
+	Instance string `json:"instance"`
+	Amount   *int   `json:"amount,omitempty"`
+	Level    *int   `json:"level,omitempty"`
+	Skill    *int   `json:"skill,omitempty"`
+}
+
+// skillData mirrors SkillData (impl/skill.ts).
+type skillData struct {
+	Type           int      `json:"type"`
+	Experience     int      `json:"experience"`
+	Level          *int     `json:"level,omitempty"`
+	Percentage     *float64 `json:"percentage,omitempty"`
+	NextExperience *int     `json:"nextExperience,omitempty"`
+	Combat         *bool    `json:"combat,omitempty"`
+}
+
+func floatp(v float64) *float64 { return &v }
 
 // pkt builds a no-opcode packet frame: [id, data].
 // The Map packet is the only 3-element frame: [4, base64, bufSize]
