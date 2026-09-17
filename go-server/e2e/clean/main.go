@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -117,7 +118,23 @@ func slotFolder(slot int) string {
 	}
 }
 
-const spriteBase = "/Users/appfuxion/repo/rpg-world-sim/packages/client/public/img/sprites"
+// spriteBaseDir resolves the client sprites dir portably: SPRITES_DIR env
+// wins, else a relative path (go-server CWD), else the legacy absolute path.
+func spriteBaseDir() string {
+	if p := os.Getenv("SPRITES_DIR"); p != "" {
+		return p
+	}
+	for _, c := range []string{
+		"../packages/client/public/img/sprites",
+		"../../../packages/client/public/img/sprites",
+		"packages/client/public/img/sprites",
+	} {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return "../packages/client/public/img/sprites"
+}
 
 func main() {
 	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
@@ -160,7 +177,7 @@ func main() {
 			}
 		}
 	}
-	check(welcome.Instance == "p1" && welcome.X == 100 && welcome.Y == 96,
+	check((welcome.Instance == "p1" || strings.HasPrefix(welcome.Instance, "p-")) && welcome.X == 100 && welcome.Y == 96,
 		fmt.Sprintf("hero Welcome p1 at 100,96 (got %s %d,%d)", welcome.Instance, welcome.X, welcome.Y))
 	check(mapElems == 3, fmt.Sprintf("map framing [4,b64,bufSize] (got %d elems)", mapElems))
 
@@ -279,6 +296,7 @@ func main() {
 
 	// 6+ equipment pieces, all with valid sprite keys.
 	if ok {
+		spriteBase := spriteBaseDir()
 		check(len(adv.Equipments) >= 6,
 			fmt.Sprintf("adventurer has 6+ equipment pieces (got %d)", len(adv.Equipments)))
 		for _, e := range adv.Equipments {

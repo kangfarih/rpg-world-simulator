@@ -11,13 +11,16 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	crand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -290,6 +293,21 @@ func worldPath() string {
 	if p := os.Getenv("WORLD_JSON"); p != "" {
 		return p
 	}
+	// Fresh-clone portable default: ../packages/server/data/map/world.json
+	// relative to the server working directory (go-server/). Fall back to
+	// the legacy absolute path only if the relative candidate is missing.
+	rel := filepath.Join("..", "packages", "server", "data", "map", "world.json")
+	if _, err := os.Stat(rel); err == nil {
+		return rel
+	}
+	for _, alt := range []string{
+		filepath.Join("..", "..", "packages", "server", "data", "map", "world.json"),
+		filepath.Join("packages", "server", "data", "map", "world.json"),
+	} {
+		if _, err := os.Stat(alt); err == nil {
+			return alt
+		}
+	}
 	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/map/world.json"
 }
 
@@ -473,13 +491,26 @@ func getRegionData(px, py int) map[int][]RegionTile {
 	return data
 }
 
+// newPlayerInstance mints a random per-connection player id (p-<12 hex).
+// Guest/scenario bots keep their stable scenario IDs (p2, p-warbot, ...);
+// only the Welcome self player is random per connection.
+func newPlayerInstance() string {
+	var b [6]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("p-%d", time.Now().UnixNano()%0xffffff)
+	}
+	return "p-" + hex.EncodeToString(b[:])
+}
+
 // welcomePlayer is the self player delivered via Welcome (PlayerData,
 // impl/player.ts:15-28). Key 'base' resolves to sprite player/base.
 // Orientation is the required PlayerData-level field (always emitted).
-func welcomePlayer() PlayerData {
+// The instance is random per connection (M2 registry); scenario bots keep
+// their stable IDs.
+func welcomePlayer(instance string) PlayerData {
 	return PlayerData{
 		EntityData: EntityData{
-			Instance:      "p1",
+			Instance:      instance,
 			Type:          EntityPlayer,
 			Key:           "base",
 			Name:          "hero",
@@ -1499,19 +1530,35 @@ func blocked(x, y int) bool {
 // updated by Started/Step/Stop reports) for teleport-back on reject, plus
 // the last resource target (Request/Started/Follow/Entity carry
 // targetInstance; Step does not) so Step can apply the same chop-approach
-// exception as Request.
+// exception as Request. lastStep + cheatScore implement the M2 speed
+// anticheat (movementSpeed ms/tile, 2-tile grace, teleport-back, >15
+// disconnect — cf. player.ts handleMovementRequest/Step + handler.ts:809).
 type session struct {
 	playerX, playerY int
 	target           string
+	lastStep         time.Time
+	movementSpeed    int // ms per tile (Welcome default 220)
+	cheatScore       int
 }
 
 // stopPlayer mirrors server stopMovement/teleport-back: halt the client
 // entity (connection.ts:461-463 entity.stop()) and snap it to the last
-// valid tile (Teleport [12,{instance,x,y}], connection.ts:478-501).
-func stopPlayer(conn *websocket.Conn, s *session) {
-	_ = send(conn, pktOp(PacketMovement, MovementStop, serverMovement{Instance: "p1"}))
-	_ = send(conn, pkt(PacketTeleport, teleportData{Instance: "p1", X: s.playerX, Y: s.playerY}))
+// valid tile (Teleport [12,{instance,x,y}], connection.ts:478-501),
+// plus the authoritative List.Positions reply (regions.ts
+// sendEntityPositions) so the client resyncs on mismatch.
+func stopPlayer(conn *websocket.Conn, s *session, instance string) {
+	_ = send(conn, pktOp(PacketMovement, MovementStop, serverMovement{Instance: instance}))
+	_ = send(conn, pkt(PacketTeleport, teleportData{Instance: instance, X: s.playerX, Y: s.playerY}))
+	_ = send(conn, pktOp(PacketList, ListPositions, map[string]any{
+		"positions": map[string]any{instance: map[string]any{"x": s.playerX, "y": s.playerY}},
+	}))
 }
+
+// List opcodes (Opcodes.List in opcodes.ts): Spawns0 Positions1.
+const (
+	ListSpawns    = 0
+	ListPositions = 1
+)
 
 // targetsResource reports whether any of the given target instances is the
 // resource occupying (x,y). Empty occupant never matches, so static
@@ -1529,6 +1576,58 @@ func targetsResource(x, y int, targets ...string) bool {
 	return false
 }
 
+// rejectLocked records one cheat/collision strike: teleport-back + Positions
+// reply; over 15 disconnects the conn (handler.ts cheatScore gate).
+// Returns true when the caller should drop the connection.
+func rejectLocked(conn *websocket.Conn, c *playerConn, reason string) bool {
+	c.sess.cheatScore++
+	n := c.sess.cheatScore
+	stopPlayer(conn, &c.sess, c.instance)
+	updateClientRegion(c)
+	log.Printf("anticheat: %s instance=%s score=%d", reason, c.instance, n)
+	if n > 15 {
+		log.Printf("anticheat: disconnecting %s (score %d > 15)", c.instance, n)
+		return true
+	}
+	return false
+}
+
+// checkSpeed enforces max tiles/sec vs movementSpeed with a 2-tile grace
+// (player.ts verifyMovement margin + handleMovementRequest diff>2 noclip).
+// Returns true when the step is too fast (caller rejects).
+// Divergence note: truth uses a 1.5s region grace with latency subtracted
+// from the interval; here we keep the coarser 2-tile + 2s idle leniency.
+func checkSpeed(s *session, tiles int) bool {
+	if s.movementSpeed <= 0 {
+		s.movementSpeed = 220
+	}
+	now := time.Now()
+	if s.lastStep.IsZero() {
+		s.lastStep = now
+		return false
+	}
+	// Grace: first step after idle (>2s) always passes (region-change rule).
+	if now.Sub(s.lastStep) > 2*time.Second {
+		s.lastStep = now
+		return false
+	}
+	if tiles < 1 {
+		tiles = 1
+	}
+	minInterval := time.Duration(s.movementSpeed) * time.Millisecond
+	// 5% margin like verifyMovement, per-tile with no +2 padding:
+	// allow tiles worth of interval before flagging.
+	allowance := time.Duration(float64(minInterval) * 0.95 * float64(tiles))
+	if now.Sub(s.lastStep) < allowance {
+		// Sliding window: advance lastStep even on reject so legit
+		// players paced at the legal rate never accumulate cheatScore.
+		s.lastStep = now
+		return true
+	}
+	s.lastStep = now
+	return false
+}
+
 // handleMovement enforces collisions the client grid cannot: resource-entity
 // tiles (walkable c:false, e.g. oak) plus a backstop for static collisions.
 // Request (the client already refuses static targets itself, handler.ts:56):
@@ -1538,10 +1637,12 @@ func targetsResource(x, y int, targets ...string) bool {
 // the client already walked locally, so an illegal next tile gets Stop +
 // Teleport-back like verifyCollision (player.ts:693-716) — except a step
 // onto the currently-targeted resource tile, which Request also allows.
-// Anything else stays silent.
-func handleMovement(conn *websocket.Conn, s *session, mv clientMovement) {
+// Request far jumps (>2 tiles, noclip) and too-fast Steps (speed check)
+// bump cheatScore with teleport-back; >15 disconnects. Anything else silent.
+func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool {
+	s := &c.sess
 	if mv.Opcode == nil {
-		return
+		return false
 	}
 	if mv.TargetInstance != "" {
 		s.target = mv.TargetInstance
@@ -1549,23 +1650,53 @@ func handleMovement(conn *websocket.Conn, s *session, mv clientMovement) {
 	switch *mv.Opcode {
 	case MovementRequest:
 		if mv.RequestX == nil || mv.RequestY == nil {
-			return
+			return false
+		}
+		dx := abs(*mv.RequestX - s.playerX)
+		dy := abs(*mv.RequestY - s.playerY)
+		if dx > 2 || dy > 2 {
+			// Noclip jump (player.ts handleMovementRequest diff>2).
+			return rejectLocked(conn, c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.playerX, s.playerY, *mv.RequestX, *mv.RequestY))
+		}
+		if checkSpeed(s, dx+dy) {
+			return rejectLocked(conn, c, "speed request")
 		}
 		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) {
-			stopPlayer(conn, s)
+			stopPlayer(conn, s, c.instance)
+			updateClientRegion(c)
 		}
 	case MovementStarted:
 		if mv.PlayerX != nil && mv.PlayerY != nil {
+			dx := abs(*mv.PlayerX - s.playerX)
+			dy := abs(*mv.PlayerY - s.playerY)
+			if dx > 2 || dy > 2 {
+				// Started mismatch: silent resync only (no cheatScore).
+				stopPlayer(conn, s, c.instance)
+				updateClientRegion(c)
+				return false
+			}
 			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
+			setEntityPos(c.instance, s.playerX, s.playerY)
+			updateClientRegion(c)
 		}
 	case MovementStep:
+		if mv.NextGridX != nil && mv.NextGridY != nil {
+			dx := abs(*mv.NextGridX - s.playerX)
+			dy := abs(*mv.NextGridY - s.playerY)
+			if dx+dy > 0 && checkSpeed(s, dx+dy) {
+				return rejectLocked(conn, c, "speed step")
+			}
+		}
 		if mv.PlayerX != nil && mv.PlayerY != nil {
 			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
+			setEntityPos(c.instance, s.playerX, s.playerY)
+			updateClientRegion(c)
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
 			blocked(*mv.NextGridX, *mv.NextGridY) &&
 			!targetsResource(*mv.NextGridX, *mv.NextGridY, mv.TargetInstance, s.target) {
-			stopPlayer(conn, s)
+			stopPlayer(conn, s, c.instance)
+			updateClientRegion(c)
 		}
 	case MovementFollow:
 		// Log-only: a Follow carrying a tree targetInstance is just the
@@ -1575,6 +1706,14 @@ func handleMovement(conn *websocket.Conn, s *session, mv clientMovement) {
 	case MovementEntity:
 		log.Printf("movement entity target=%s", mv.TargetInstance)
 	}
+	return false
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // handleTarget accepts the click-to-interact packet the client sends on
@@ -1583,7 +1722,7 @@ func handleMovement(conn *websocket.Conn, s *session, mv clientMovement) {
 // tree counts as an axe hit (explicit click-on-arrival): walking to the oak
 // (Request/Started/Step/Follow/Entity) is approach only and never chops.
 // The 600ms per-instance debounce stays as a safety net.
-func handleTarget(frame clientFrame) {
+func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 	if len(frame) < 2 {
 		return
 	}
@@ -1601,7 +1740,7 @@ func handleTarget(frame clientFrame) {
 	}
 	log.Printf("target opcode=%d instance=%s", opcode, instance)
 	if opcode == TargetObject && isTreeInstance(instance) {
-		chopOak(instance)
+		chopOak(c.instance, instance)
 	}
 }
 
@@ -1691,50 +1830,321 @@ func isTreeInstance(id string) bool {
 }
 
 // subs tracks live connections so the respawn timer can restore the tree even
-// if the chopping connection is gone. All WS writes go through writeMu because
-// gorilla/websocket forbids concurrent writers (timer goroutine + read loop).
+// if the chopping connection is gone. All WS writes flow through the central
+// 20Hz tick loop (one bulk write per conn per tick); gorilla/websocket still
+// forbids concurrent writers, guarded by writeMu.
 var (
 	writeMu sync.Mutex
 	subsMu  sync.Mutex
 	subs    = map[*websocket.Conn]struct{}{}
 )
 
-// send writes one bulk message and logs it.
-func send(conn *websocket.Conn, frames ...[]any) error {
+// Entity is the central registry record (M2): every spawned instance with
+// its current tile. Covers statics (oaks, showcase, bots, adventurer,
+// guest, rat, dummy) plus one entry per connected player.
+type Entity struct {
+	Instance string
+	X, Y     int
+}
+
+// Player is the per-connection record (M2): session + queue state.
+type playerConn struct {
+	conn     *websocket.Conn
+	instance string
+	sess     session
+	outbox   chan []any // queued S->C frames, flushed by the tick loop
+	regions  []int      // current 9-region interest set
+	dropped  int        // overflow drops (outbox full)
+}
+
+var (
+	entitiesMu sync.Mutex
+	entities   = map[string]*Entity{}
+
+	playersMu sync.Mutex
+	players   = map[*websocket.Conn]*playerConn{}
+)
+
+const outboxSize = 64
+
+// regionOf maps a tile to its region id.
+func regionOf(x, y int) int {
+	if sideLen <= 0 {
+		return 0
+	}
+	return (y/mapDivisionSize)*sideLen + (x / mapDivisionSize)
+}
+
+// setEntityPos upserts the registry position for an instance.
+func setEntityPos(instance string, x, y int) {
+	entitiesMu.Lock()
+	defer entitiesMu.Unlock()
+	if e, ok := entities[instance]; ok {
+		e.X, e.Y = x, y
+		return
+	}
+	entities[instance] = &Entity{Instance: instance, X: x, Y: y}
+}
+
+// entityPos returns the registry tile for an instance.
+func entityPos(instance string) (int, int, bool) {
+	entitiesMu.Lock()
+	defer entitiesMu.Unlock()
+	e, ok := entities[instance]
+	if !ok {
+		return 0, 0, false
+	}
+	return e.X, e.Y, true
+}
+
+// updateClientRegion recomputes a conn's 9-region interest set from its
+// authoritative player tile (surroundingRegions + tile→region math).
+func updateClientRegion(c *playerConn) {
+	loadWorld()
+	rid := regionOf(c.sess.playerX, c.sess.playerY)
+	playersMu.Lock()
+	c.regions = surroundingRegions(rid)
+	playersMu.Unlock()
+}
+
+// clientInterested reports whether conn's regions include the entity tile.
+func clientInterested(c *playerConn, x, y int) bool {
+	rid := regionOf(x, y)
+	playersMu.Lock()
+	regions := c.regions
+	playersMu.Unlock()
+	for _, r := range regions {
+		if r == rid {
+			return true
+		}
+	}
+	return false
+}
+
+// regionScoped reports whether a packet id is region-scoped (interest-routed)
+// vs global fan-out. Matches the M2 scope: Spawn/Movement/Animation/Combat/
+// Resource/Effect route by entity tile; everything else (banner, shutdown,
+// Welcome/Map/Teleport/Points/Heal/Despawn/List/Sync/Equipment...) fans out
+// or unicasts as before.
+func regionScoped(id int) bool {
+	switch id {
+	case PacketSpawn, PacketMovement, PacketAnimation, PacketCombat, PacketResource, PacketEffect:
+		return true
+	}
+	return false
+}
+
+// frameInstance extracts the entity instance from an S->C frame's data payload.
+func frameInstance(frame []any) string {
+	if len(frame) < 2 {
+		return ""
+	}
+	data := frame[len(frame)-1]
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return ""
+	}
+	var probe struct {
+		Instance string `json:"instance"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return ""
+	}
+	return probe.Instance
+}
+
+// enqueueTo queues frames for one conn (drop+count on overflow, size 64).
+func enqueueTo(conn *websocket.Conn, frames ...[]any) {
+	playersMu.Lock()
+	c, ok := players[conn]
+	playersMu.Unlock()
+	if !ok {
+		return
+	}
+	for _, f := range frames {
+		select {
+		case c.outbox <- f:
+		default:
+			playersMu.Lock()
+			c.dropped++
+			n := c.dropped
+			playersMu.Unlock()
+			log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
+		}
+	}
+}
+
+// enqueueGlobal queues frames for every live connection.
+func enqueueGlobal(frames ...[]any) {
+	playersMu.Lock()
+	conns := make([]*playerConn, 0, len(players))
+	for _, c := range players {
+		conns = append(conns, c)
+	}
+	playersMu.Unlock()
+	for _, c := range conns {
+		for _, f := range frames {
+			select {
+			case c.outbox <- f:
+			default:
+				playersMu.Lock()
+				c.dropped++
+				n := c.dropped
+				playersMu.Unlock()
+				log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
+			}
+		}
+	}
+}
+
+// sendDirect writes one bulk message immediately (5s deadline), bypassing
+// the tick outbox. Used only for the initial spawn burst (240 Spawn frames
+// exceed the 64-slot outbox); all steady-state traffic goes via send().
+func sendDirect(conn *websocket.Conn, frames ...[]any) error {
 	msg := bulk(frames...)
 	fmt.Printf("TX %s\n", msg)
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return conn.WriteMessage(websocket.TextMessage, msg)
 }
 
-// broadcast writes one bulk message to every live connection and logs it.
+// send queues unicast frames for one conn (flushed by the tick loop) and
+// logs the bulk. Keeps the original signature so call sites are unchanged.
+func send(conn *websocket.Conn, frames ...[]any) error {
+	msg := bulk(frames...)
+	fmt.Printf("TX %s\n", msg)
+	enqueueTo(conn, frames...)
+	return nil
+}
+
+// broadcast routes each frame: region-scoped packets only enqueue to conns
+// whose interest set includes the entity tile; global events fan out.
+// Queued into tick outboxes (never direct-written); shapes unchanged.
 func broadcast(frames ...[]any) {
 	msg := bulk(frames...)
 	fmt.Printf("TX %s\n", msg)
-	subsMu.Lock()
-	conns := make([]*websocket.Conn, 0, len(subs))
-	for c := range subs {
-		conns = append(conns, c)
-	}
-	subsMu.Unlock()
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	for _, c := range conns {
-		_ = c.WriteMessage(websocket.TextMessage, msg)
+	for _, f := range frames {
+		if len(f) == 0 {
+			continue
+		}
+		id, ok := f[0].(int)
+		if !ok {
+			enqueueGlobal(f)
+			continue
+		}
+		if !regionScoped(id) {
+			enqueueGlobal(f)
+			continue
+		}
+		inst := frameInstance(f)
+		x, y, found := entityPos(inst)
+		if !found {
+			enqueueGlobal(f)
+			continue
+		}
+		playersMu.Lock()
+		conns := make([]*playerConn, 0, len(players))
+		for _, c := range players {
+			conns = append(conns, c)
+		}
+		playersMu.Unlock()
+		for _, c := range conns {
+			if clientInterested(c, x, y) {
+				select {
+				case c.outbox <- f:
+				default:
+					playersMu.Lock()
+					c.dropped++
+					n := c.dropped
+					playersMu.Unlock()
+					log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
+				}
+			}
+		}
 	}
 }
 
-// chopOak registers one axe hit on the given tree instance: broadcast S
-// Animation (client shake + chop sound), decrement its hits; at 0 broadcast S
+// startTickLoop launches the central 20Hz flush loop (one ticker per
+// process): every 50ms each conn's queued frames flush as a single bulk
+// write (5s write deadline; dead conns dropped + Despawn broadcast).
+var tickOnce sync.Once
+
+func startTickLoop() {
+	tickOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(50 * time.Millisecond)
+			defer t.Stop()
+			for range t.C {
+				playersMu.Lock()
+				conns := make([]*playerConn, 0, len(players))
+				for _, c := range players {
+					conns = append(conns, c)
+				}
+				playersMu.Unlock()
+				for _, c := range conns {
+					var frames [][]any
+					for {
+						select {
+						case f := <-c.outbox:
+							frames = append(frames, f)
+						default:
+							goto drained
+						}
+					}
+				drained:
+					if len(frames) == 0 {
+						continue
+					}
+					msg := bulk(frames...)
+					fmt.Printf("TX %s\n", msg)
+					writeMu.Lock()
+					_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					err := c.conn.WriteMessage(websocket.TextMessage, msg)
+					writeMu.Unlock()
+					if err != nil {
+						log.Printf("tick write failed instance=%s: %v", c.instance, err)
+						removeClient(c.conn)
+					}
+				}
+			}
+		}()
+	})
+}
+
+// removeClient drops a dead conn: subs cleanup + registry removal +
+// Despawn broadcast for its player (reconnect path).
+func removeClient(conn *websocket.Conn) {
+	playersMu.Lock()
+	c, ok := players[conn]
+	if ok {
+		delete(players, conn)
+	}
+	playersMu.Unlock()
+	subsMu.Lock()
+	delete(subs, conn)
+	subsMu.Unlock()
+	if !ok {
+		return
+	}
+	entitiesMu.Lock()
+	delete(entities, c.instance)
+	entitiesMu.Unlock()
+	_ = conn.Close()
+	broadcast(pkt(PacketDespawn, despawnData{Instance: c.instance}))
+	log.Printf("client removed: instance=%s (despawn broadcast)", c.instance)
+}
+
+// chopOak registers one axe hit on the given tree instance: enqueue S
+// Animation (client shake + chop sound), decrement its hits; at 0 enqueue S
 // Resource{state:Depleted} (stump frame) and start its own respawn timer ->
-// broadcast S Resource{state:Default} + reset hits. Broadcast (not unicast)
-// matches resourceskill sendToRegion + entities onStateChange Regions push.
-// Unknown or depleted instances are ignored (logged); the per-instance 600ms
-// debounce stays as a safety net; each instance depletes/respawns
-// independently. ONLY handleTarget (TargetObject) calls this — walking to the
-// oak never chops.
-func chopOak(instance string) {
+// enqueue S Resource{state:Default} + reset hits. Enqueue (not direct write)
+// matches resourceskill sendToRegion + entities onStateChange Regions push;
+// the tick loop flushes. Unknown or depleted instances are ignored (logged);
+// the per-instance 600ms debounce stays as a safety net; each instance
+// depletes/respawns independently. ONLY handleTarget (TargetObject) calls
+// this — walking to the oak never chops.
+func chopOak(attacker, instance string) {
 	treesMu.Lock()
 	st, ok := trees[instance]
 	if !ok {
@@ -1762,7 +2172,7 @@ func chopOak(instance string) {
 	treesMu.Unlock()
 
 	broadcast(pkt(PacketAnimation, animationData{
-		Instance:         "p1",
+		Instance:         attacker,
 		Action:           ActionAttack,
 		ResourceInstance: instance,
 	}))
@@ -1789,17 +2199,255 @@ func chopOak(instance string) {
 // clientFrame is a generic C->S frame: [packetId, data?] (socket.ts send).
 type clientFrame []json.RawMessage
 
-func handleConn(conn *websocket.Conn) {
-	defer conn.Close()
+// handleList answers a C->S List request (packet 6, no payload used —
+// incoming.ts routes it to updateEntityList): S List Spawns lists every
+// entity instance in the requester's regions, S List Positions carries the
+// authoritative grid pos of each Character-like entity there (regions.ts
+// sendEntities/sendEntityPositions). The client diffs Spawns vs its spawned
+// set and asks for the missing ones via Who.
+func handleList(conn *websocket.Conn, c *playerConn) {
+	playersMu.Lock()
+	regions := append([]int(nil), c.regions...)
+	playersMu.Unlock()
+	regionSet := make(map[int]bool, len(regions))
+	for _, r := range regions {
+		regionSet[r] = true
+	}
+	entitiesMu.Lock()
+	var ids []string
+	positions := make(map[string]any)
+	for _, e := range entities {
+		if regionSet[regionOf(e.X, e.Y)] {
+			ids = append(ids, e.Instance)
+			positions[e.Instance] = map[string]any{"x": e.X, "y": e.Y}
+		}
+	}
+	entitiesMu.Unlock()
+	if ids == nil {
+		ids = []string{}
+	}
+	_ = send(conn, pktOp(PacketList, ListSpawns, map[string]any{"entities": ids}))
+	_ = send(conn, pktOp(PacketList, ListPositions, map[string]any{"positions": positions}))
+	log.Printf("list reply instance=%s entities=%d", c.instance, len(ids))
+}
 
+// handleWho answers C->S Who (packet 7, [ids]): one S Spawn per known live
+// entity (incoming.ts handleWho). Unknown ids are ignored (logged).
+func handleWho(conn *websocket.Conn, frame clientFrame) {
+	if len(frame) < 2 {
+		return
+	}
+	var ids []string
+	if err := json.Unmarshal(frame[1], &ids); err != nil {
+		log.Printf("who parse fail: %v", err)
+		return
+	}
+	for _, id := range ids {
+		payload, ok := spawnPayload(id)
+		if !ok {
+			log.Printf("who unknown instance=%s", id)
+			continue
+		}
+		_ = send(conn, pkt(PacketSpawn, payload))
+	}
+	log.Printf("who reply instances=%d", len(ids))
+}
+
+// handleSyncReq forwards a C->S Sync (packet 10, PlayerData) to the other
+// players whose interest includes the sender (other-player equip/appearance
+// broadcast, connection.ts handleSync). Unicast echo is skipped.
+func handleSyncReq(c *playerConn, frame clientFrame) {
+	if len(frame) < 2 {
+		return
+	}
+	var data map[string]any
+	if err := json.Unmarshal(frame[1], &data); err != nil {
+		return
+	}
+	inst, _ := data["instance"].(string)
+	if inst == "" {
+		inst = c.instance
+		data["instance"] = inst
+	}
+	x, y, found := entityPos(inst)
+	if !found {
+		x, y = c.sess.playerX, c.sess.playerY
+	}
+	raw, _ := json.Marshal(data)
+	var msg json.RawMessage = raw
+	playersMu.Lock()
+	conns := make([]*playerConn, 0, len(players))
+	for _, o := range players {
+		if o != c {
+			conns = append(conns, o)
+		}
+	}
+	playersMu.Unlock()
+	for _, o := range conns {
+		if clientInterested(o, x, y) {
+			select {
+			case o.outbox <- []any{PacketSync, msg}:
+			default:
+				playersMu.Lock()
+				o.dropped++
+				playersMu.Unlock()
+			}
+		}
+	}
+	log.Printf("sync forward instance=%s", inst)
+}
+
+// handleEquipmentReq records a C->S Equipment frame and emits the Sync
+// other-player broadcast (server handler.ts handleEquipment -> sync()).
+func handleEquipmentReq(c *playerConn, frame clientFrame) {
+	if len(frame) < 2 {
+		return
+	}
+	log.Printf("equipment instance=%s", c.instance)
+	// Re-announce appearance to region neighbours as a Sync packet.
+	ph := welcomePlayer(c.instance)
+	ph.X, ph.Y = c.sess.playerX, c.sess.playerY
+	broadcast(pkt(PacketSync, ph))
+}
+
+// spawnPayload rebuilds the Spawn payload for a known instance: live trees
+// honour depleted state; players echo their Welcome shape at the registry
+// pos; statics echo their scenario definition.
+func spawnPayload(instance string) (any, bool) {
+	x, y, found := entityPos(instance)
+	if !found {
+		return nil, false
+	}
+	treesMu.Lock()
+	_, isTree := trees[instance]
+	treesMu.Unlock()
+	if isTree {
+		treesMu.Lock()
+		depleted := trees[instance].depleted
+		treesMu.Unlock()
+		st := ResourceStateDefault
+		if depleted {
+			st = ResourceStateDepleted
+		}
+		for _, o := range oakSpawns {
+			if o.Instance == instance {
+				o := o
+				o.X, o.Y = x, y
+				o.State = intp(st)
+				return o, true
+			}
+		}
+	}
+	playersMu.Lock()
+	for _, c := range players {
+		if c.instance == instance {
+			playersMu.Unlock()
+			ph := welcomePlayer(instance)
+			ph.X, ph.Y = x, y
+			return ph, true
+		}
+	}
+	playersMu.Unlock()
+	if d, ok := staticPayload(instance); ok {
+		return d, true
+	}
+	// Last resort: minimal entity shape so the client can spawn something.
+	return EntityData{Instance: instance, Type: EntityMob, Key: "rat", Name: instance, X: x, Y: y}, true
+}
+
+// staticPayload returns the scenario Spawn definition for a static instance.
+func staticPayload(instance string) (any, bool) {
+	for _, f := range spawnFrames() {
+		if len(f) < 2 {
+			continue
+		}
+		raw, err := json.Marshal(f[1])
+		if err != nil {
+			continue
+		}
+		var probe struct {
+			Instance string `json:"instance"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			continue
+		}
+		if probe.Instance == instance {
+			var v any
+			if err := json.Unmarshal(raw, &v); err == nil {
+				return v, true
+			}
+			return f[1], true
+		}
+	}
+	return nil, false
+}
+
+// initEntities seeds the central registry with every static spawn (oaks,
+// showcase grid, demos, guest, bots, dummy, adventurer) so List/Who and
+// region routing resolve before any client connects.
+func initEntities() {
+	loadWorld()
+	gx, gy := 102, 98
+	if testMode {
+		gx, gy = 101, 96
+	}
+	setEntityPos("p2", gx, gy)
+	if !testMode && !cleanMode && !combatMode {
+		setEntityPos("m1", 104, 104)
+	}
+	for _, o := range oakSpawns {
+		setEntityPos(o.Instance, o.X, o.Y)
+	}
+	if testMode && !cleanMode && !combatMode {
+		for i, key := range showMobs {
+			_ = key
+			x, y := showPos(i)
+			setEntityPos(fmt.Sprintf("m-show-%d", i+1), x, y)
+		}
+		for i, key := range showNPCs {
+			_ = key
+			x, y := showPos(len(showMobs) + i)
+			setEntityPos(fmt.Sprintf("n-show-%d", i+1), x, y)
+		}
+		for _, p := range demoPlayers() {
+			setEntityPos(p.Instance, p.X, p.Y)
+		}
+	}
+	if cleanMode {
+		setEntityPos("p-adv-1", 102, 96)
+	}
+	if combatMode {
+		setEntityPos(combatBotInstance, combatBotX, combatBotY)
+		setEntityPos(combatArcherInstance, combatArcherX, combatArcherY)
+		setEntityPos(combatMageInstance, combatMageX, combatMageY)
+		setEntityPos(combatSupInstance, combatSupX, combatSupY)
+		setEntityPos(combatDummyInstance, combatDummyX, combatDummyY)
+	}
+	entitiesMu.Lock()
+	n := len(entities)
+	entitiesMu.Unlock()
+	log.Printf("entity registry seeded: %d statics", n)
+}
+
+func handleConn(conn *websocket.Conn) {
 	subsMu.Lock()
 	subs[conn] = struct{}{}
 	subsMu.Unlock()
-	defer func() {
-		subsMu.Lock()
-		delete(subs, conn)
-		subsMu.Unlock()
-	}()
+
+	// Per-connection player record: random Welcome instance + queued outbox.
+	inst := newPlayerInstance()
+	c := &playerConn{
+		conn:     conn,
+		instance: inst,
+		sess:     session{playerX: 100, playerY: 96, movementSpeed: 220},
+		outbox:   make(chan []any, outboxSize),
+	}
+	playersMu.Lock()
+	players[conn] = c
+	playersMu.Unlock()
+	setEntityPos(inst, 100, 96)
+	updateClientRegion(c)
+	defer removeClient(conn)
 
 	// S Connected [0,null]: client answers with Handshake{gVer}.
 	if err := send(conn, pkt(PacketConnected, nil)); err != nil {
@@ -1826,15 +2474,13 @@ func handleConn(conn *websocket.Conn) {
 			chunk := all[i:end]
 			raw, _ := json.Marshal(chunk)
 			total += len(raw)
-			if err := send(conn, chunk...); err != nil {
+			if err := sendDirect(conn, chunk...); err != nil {
 				log.Printf("write spawns chunk %d: %v", i/80, err)
 				return
 			}
 		}
 		log.Printf("spawns sent: %d frames in %d bulks, %d bytes JSON", len(all), (len(all)+79)/80, total)
 	}
-
-	sess := session{playerX: 100, playerY: 96} // Welcome spawn, updated by Step
 
 	for {
 		_, raw, err := conn.ReadMessage()
@@ -1870,7 +2516,7 @@ func handleConn(conn *websocket.Conn) {
 			case PacketHandshake: // C Handshake{gVer} -> S Handshake{type:client}
 				reply := HandshakeData{
 					Type:       "client",
-					Instance:   "p1",
+					Instance:   c.instance,
 					ServerID:   1,
 					ServerTime: time.Now().UnixMilli(),
 				}
@@ -1880,7 +2526,7 @@ func handleConn(conn *websocket.Conn) {
 				}
 			case PacketLogin: // C Login (opcode lives inside data) -> Welcome + Map only
 				if err := send(conn,
-					pkt(PacketWelcome, welcomePlayer()),
+					pkt(PacketWelcome, welcomePlayer(c.instance)),
 					buildMapFrame(),
 				); err != nil {
 					log.Printf("write welcome/map: %v", err)
@@ -1888,6 +2534,14 @@ func handleConn(conn *websocket.Conn) {
 				}
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
 				sendSpawns()
+			case PacketList: // C List request -> Spawns + Positions
+				handleList(conn, c)
+			case PacketWho: // C Who [newIds] -> Spawn each known
+				handleWho(conn, frame)
+			case PacketSync: // C Sync PlayerData -> forward to region neighbours
+				handleSyncReq(c, frame)
+			case PacketEquipment: // C Equipment -> Sync broadcast
+				handleEquipmentReq(c, frame)
 			case PacketMovement: // C [11,{opcode,...}] -> Stop/Teleport on blocked tiles
 				if len(frame) < 2 {
 					continue
@@ -1896,9 +2550,11 @@ func handleConn(conn *websocket.Conn) {
 				if err := json.Unmarshal(frame[1], &mv); err != nil {
 					continue
 				}
-				handleMovement(conn, &sess, mv)
+				if disconnect := handleMovement(conn, c, mv); disconnect {
+					return
+				}
 			case PacketTarget: // C Target [opcode, instance] -> chop on that oak
-				handleTarget(frame)
+				handleTarget(conn, c, frame)
 			case PacketCombat: // C Combat {instance,target} -> chop on that oak
 				handleCombatReq(frame)
 			case PacketAnimation: // C Animation {resourceInstance} -> chop on that oak
@@ -1911,6 +2567,8 @@ func handleConn(conn *websocket.Conn) {
 }
 
 func main() {
+	startTickLoop()
+	initEntities()
 	startShowcase()
 	if combatMode {
 		startCombat()

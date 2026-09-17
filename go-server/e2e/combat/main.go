@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -156,7 +157,7 @@ func main() {
 			}
 		}
 	}
-	check(welcome.Instance == "p1" && welcome.X == 100 && welcome.Y == 96,
+	check((welcome.Instance == "p1" || strings.HasPrefix(welcome.Instance, "p-")) && welcome.X == 100 && welcome.Y == 96,
 		fmt.Sprintf("hero Welcome p1 at 100,96 (got %s %d,%d)", welcome.Instance, welcome.X, welcome.Y))
 	check(mapElems == 3, fmt.Sprintf("map framing [4,b64,bufSize] (got %d elems)", mapElems))
 

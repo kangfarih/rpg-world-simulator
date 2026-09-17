@@ -149,7 +149,9 @@ func tally(counts map[int]int) {
 				ResourceInstance string `json:"resourceInstance"`
 			}
 			_ = json.Unmarshal(frameData(f), &a)
-			if a.Instance == "p1" && a.Action == 1 {
+			// Chop hits carry resourceInstance from any player instance
+			// (Welcome ids are random p-<rand> per connection since M2).
+			if a.Action == 1 && a.ResourceInstance != "" {
 				anim[a.ResourceInstance]++
 			}
 			if strings.HasPrefix(a.Instance, "m-show-") && a.Action == 1 {
