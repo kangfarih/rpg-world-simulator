@@ -74,13 +74,18 @@ const (
 	PacketAdminSync    = 60
 )
 
-// Entity types (packages/common/network/modules.ts). Object6 omitted on purpose.
+// Entity types (packages/common/network/modules.ts EntityType: Player0 NPC1
+// Item2 Mob3 Chest4 Projectile5 Object6 Pet7 LootBag8 Effect9 Tree10 Rock11
+// Foraging12 FishSpot13). Object6 omitted on purpose.
 const (
 	EntityPlayer     = 0
 	EntityNPC        = 1
 	EntityMob        = 3
 	EntityProjectile = 5
 	EntityTree       = 10
+	EntityRock       = 11
+	EntityForaging   = 12
+	EntityFishSpot   = 13
 )
 
 // Orientation (modules.ts): Up0 Down1 Left2 Right3.

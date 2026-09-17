@@ -1,11 +1,12 @@
 // Scripted WS check for SHOWCASE mode (TESTMAP=1, the default): CLONED 9 real
-// regions as base + center pond (104,104 rx4 ry3) overlay + 5 row oaks at
-// y=98 on forced grass + 232-entity static showcase grid (156 m-show-* Mobs
+// regions as base + center pond (104,104 rx4 ry3) overlay + 5-resource mixed
+// demo line at y=98 on forced grass (2 oaks + coalrock + shrimpspot +
+// blueberrybush) + 232-entity static showcase grid (156 m-show-* Mobs
 // + 76 n-show-* NPCs, x96-126 y110-138, forced grass) + 2 paperdoll demo
-// players + 5s rotating Attack/Idle anim broadcasts. Chop ONLY on Target
-// Object(3).
+// players + 5s rotating Attack/Idle anim broadcasts. Gather ONLY on Target
+// Object(3) (one click = one swing, probabilistic exhaust per swing).
 // Not part of the stub build (underscore dirs are ignored by the go tool).
-// Usage: go run ./_check (stub must run with TESTMAP=1, the default).
+// Usage: go run ./e2e/testmap (stub must run with TESTMAP=1, the default).
 package main
 
 import (
@@ -197,12 +198,6 @@ func stops() (stop, teleport int) {
 	return stop, teleport
 }
 
-func chop(conn *websocket.Conn, inst string, d time.Duration) {
-	send(conn, `[14,[3,"`+inst+`"]]`)
-	tally(drain(conn, d))
-	time.Sleep(200 * time.Millisecond)
-}
-
 type tile struct {
 	X    int             `json:"x"`
 	Y    int             `json:"y"`
@@ -313,7 +308,7 @@ func main() {
 			fmt.Sprintf("base kept near pond (%d,%d) (got data=%s ok=%v)", p[0], p[1], string(t.Data), ok))
 	}
 	for i, x := range []int{98, 100, 102, 104, 106} {
-		checkTile(x, 98, "3907", false, fmt.Sprintf("oak t-test-%d tile (%d,98)", i+1, x))
+		checkTile(x, 98, "3907", false, fmt.Sprintf("demo t-test-%d tile (%d,98)", i+1, x))
 	}
 	// Grid corners must be walkable grass too (no region expansion needed).
 	// Note: the last row holds only 8 slots (232 = 14x16 + 8), so the final
@@ -337,14 +332,20 @@ func main() {
 		_, ok := spawns[gone]
 		check(!ok, "legacy gone: "+gone)
 	}
-	wantTrees := map[string][2]int{
-		"t-test-1": {98, 98}, "t-test-2": {100, 98}, "t-test-3": {102, 98},
-		"t-test-4": {104, 98}, "t-test-5": {106, 98},
+	wantRes := map[string]struct {
+		x, y, typ int
+		key       string
+	}{
+		"t-test-1": {98, 98, 10, "oak"},
+		"t-test-2": {100, 98, 10, "oak"},
+		"t-test-3": {102, 98, 11, "coalrock"},
+		"t-test-4": {104, 98, 13, "shrimpspot"},
+		"t-test-5": {106, 98, 12, "blueberrybush"},
 	}
-	for inst, want := range wantTrees {
+	for inst, want := range wantRes {
 		got, ok := spawns[inst]
-		check(ok && got.x == want[0] && got.y == want[1] && got.key == "oak",
-			fmt.Sprintf("spawn %s at %v (got %+v)", inst, want, got))
+		check(ok && got.x == want.x && got.y == want.y && got.key == want.key && got.typ == want.typ,
+			fmt.Sprintf("spawn %s type=%d key=%s at %d,%d (got %+v)", inst, want.typ, want.key, want.x, want.y, got))
 	}
 
 	// Showcase grid: 156 mobs + 76 NPCs, alphabetical, exact grid slots.
@@ -482,9 +483,9 @@ func main() {
 	}
 
 	totalSpawns := len(spawns)
-	check(totalSpawns == 240, fmt.Sprintf("240 total spawns (p2+5 oaks+156+76+2 demos, got %d)", totalSpawns))
+	check(totalSpawns == 240, fmt.Sprintf("240 total spawns (p2+5 demo resources+156+76+2 demos, got %d)", totalSpawns))
 
-	// --- Collision: pond Step rejected, oak Step rejected, grass Step silent ---
+	// --- Collision: pond Step rejected, resource Step rejected, grass Step silent ---
 	drain(conn, 1*time.Second)
 	lastFrames = nil
 	send(conn, `[11,{"opcode":2,"playerX":100,"playerY":96,"nextGridX":104,"nextGridY":104}]`)
@@ -496,25 +497,40 @@ func main() {
 	_ = drain(conn, 2*time.Second)
 	st, tp = stops()
 	check(st >= 1 && tp >= 1,
-		fmt.Sprintf("oak Step rejected (stop=%d teleport=%d)", st, tp))
+		fmt.Sprintf("resource Step rejected (stop=%d teleport=%d)", st, tp))
 	send(conn, `[11,{"opcode":2,"playerX":100,"playerY":96,"nextGridX":101,"nextGridY":96}]`)
 	_ = drain(conn, 2*time.Second)
 	st, tp = stops()
 	check(st == 0 && tp == 0,
 		fmt.Sprintf("grass Step silent (stop=%d teleport=%d)", st, tp))
 
-	// --- Chop still works: Target Object = 1 hit; x3 -> depleted; extra ignored ---
+	// --- Gather works: Target Object = 1 swing each; loop each demo resource
+	// until its probabilistic exhaust depletes it (foraging depletes on the
+	// first swing). 800ms drains keep clear of the 600ms per-instance debounce.
+	swing := func(inst string) {
+		send(conn, `[14,[3,"`+inst+`"]]`)
+		tally(drain(conn, 800*time.Millisecond))
+	}
 	before := anim["t-test-1"]
-	chop(conn, "t-test-1", 2*time.Second)
+	swing("t-test-1")
 	check(anim["t-test-1"]-before == 1,
-		fmt.Sprintf("Target Object = 1 hit (got %d)", anim["t-test-1"]-before))
-	chop(conn, "t-test-1", 2*time.Second)
-	chop(conn, "t-test-1", 2*time.Second)
-	check(anim["t-test-1"]-before == 3, fmt.Sprintf("t-test-1 anim==3 total (got %d)", anim["t-test-1"]-before))
-	check(res1["t-test-1"] >= 1, "t-test-1 depleted emitted")
-	extra := anim["t-test-1"]
-	chop(conn, "t-test-1", 2*time.Second)
-	check(anim["t-test-1"]-extra == 0, "extra hit on depleted t-test-1 ignored")
+		fmt.Sprintf("Target Object = 1 swing (got %d)", anim["t-test-1"]-before))
+	for _, inst := range []string{"t-test-1", "t-test-2", "t-test-3", "t-test-4", "t-test-5"} {
+		for i := 0; i < 60 && res1[inst] == 0; i++ {
+			swing(inst)
+		}
+		check(res1[inst] >= 1, inst+" depleted via Target loop")
+	}
+	extra := anim["t-test-5"]
+	swing("t-test-5")
+	check(anim["t-test-5"]-extra == 0, "extra swing on depleted t-test-5 ignored")
+
+	// --- Respawn: 15s fallback table timers -> all 5 return to state 0 ---
+	fmt.Println("waiting for resource respawn (~15s fallback)...")
+	tally(drain(conn, 20*time.Second))
+	for _, inst := range []string{"t-test-1", "t-test-2", "t-test-3", "t-test-4", "t-test-5"} {
+		check(res0[inst] >= 1, inst+" respawned (state 0)")
+	}
 
 	// --- Showcase anims: wait for a 5s tick -> 10 atk + 5 idle ---
 	fmt.Println("waiting for showcase anim tick (~5s)...")

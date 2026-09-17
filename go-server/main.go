@@ -48,8 +48,8 @@ func bufferSize(jsonBytes []byte) int {
 
 // TESTMAP mode (default ON; TESTMAP=0/false/off/no or --testmap=false /
 // --notestmap selects the 9 real regions pure): CLONE of the 9 real regions
-// around spawn as the base map, plus overlays: center pond + 5-oak row +
-// showcase grid stamped over the base (see getTestRegionData).
+// around spawn as the base map, plus overlays: center pond + 5-resource demo
+// line + showcase grid stamped over the base (see getTestRegionData).
 //
 // Tile IDs (repo read-only recon):
 //   - grass testGrassTile=3907: base layer of the layered [3907,9787] grass
@@ -63,7 +63,7 @@ const (
 	testWaterTile = 29
 
 	// Center pond: ellipse centered (pondCX,pondCY) radii pondRX x pondRY.
-	// Covers x100-108, y101-107; oak row y=98 and spawns y96 stay on grass.
+	// Covers x100-108, y101-107; demo line y=98 and spawns y96 stay on grass.
 	pondCX, pondCY = 104, 104
 	pondRX, pondRY = 4, 3
 )
@@ -88,10 +88,10 @@ var testMode = func() bool {
 // fully-equipped adventurer showcase. Select with CLEAN=1/true/on/yes or
 // --clean (CLEAN=0/false/off/no or --clean=false/--noclean turns it off;
 // default OFF). It reuses the TESTMAP=0 pure path for tiles (getRegionData,
-// no pond/grass stamps) and additionally drops ALL test entities (oak row,
+// no pond/grass stamps) and additionally drops ALL test entities (demo line,
 // showcase grid, demos, guest p2, rat) and the showcase anim ticker — only
 // the Welcome hero + one adventurer Spawn + one Equipment Batch remain.
-// Collision/movement/chop handlers stay wired but dormant (no trees).
+// Collision/movement/gather handlers stay wired but dormant (no resources).
 var cleanMode = func() bool {
 	if v := os.Getenv("CLEAN"); v != "" {
 		switch v {
@@ -117,7 +117,7 @@ var cleanMode = func() bool {
 // beats on it. Select with COMBAT=1/true/on/yes or --combat (COMBAT=
 // 0/false/off/no or --combat=false/--nocombat turns it off; default OFF).
 // It reuses the TESTMAP=0 pure path for tiles (getRegionData, no pond/grass
-// stamps) and drops ALL test entities (oak row, showcase grid, demos,
+// stamps) and drops ALL test entities (demo line, showcase grid, demos,
 // guest p2, rat); only the Welcome hero + 4 bot Spawns + Boss Spawn remain.
 // The party brain (startCombat) ticks independently of clients; broadcasts
 // are no-ops with no subscribers.
@@ -149,7 +149,7 @@ func isTestWater(x, y int) bool {
 }
 
 // isTestGrass reports whether (x,y) is a forced-walkable overlay tile in
-// test mode: under each of the 5 oaks, under every showcase grid slot, and
+// test mode: under each of the 5 demo resources, under every showcase grid slot, and
 // under the 2 paperdoll demos. getTestRegionData stamps grass 3907 c:false
 // there (replacing any colliding base tile); tileBlocked mirrors it.
 func isTestGrass(x, y int) bool {
@@ -178,7 +178,7 @@ func isTestGrass(x, y int) bool {
 // getTestRegionData clones the 9 real regions around spawn (100,100) as the
 // base map, then stamps overlays over the base (replacing tiles, adding where
 // the base was empty): center pond (water 29 c:true), grass 3907 c:false
-// under each oak + every showcase grid slot + demo spots (so all 232 stand
+// under each demo resource + every showcase grid slot + demo spots (so all 232 stand
 // on walkable). RegionTile shape and [4,base64gzip,bufSize] framing are
 // identical to the real path.
 func getTestRegionData() map[int][]RegionTile {
@@ -531,9 +531,90 @@ func welcomePlayer(instance string) PlayerData {
 	}
 }
 
-// oakSpawns lists every cuttable Tree entity. TESTMAP mode: 5 oaks in a
-// horizontal row at y=98, x=98,100,102,104,106 — all on walkable test grass
-// (pond is y101-107, so no overlap), each blocking via the
+// M4 resource tables (packages/server/data/*.json, same shape as
+// ResourceInfo in common/types/resource.d.ts). Loaded once at boot via
+// resourceDataPath (relative ../packages/server/data like worldPath, WORLD_JSON
+// sibling envs override per table). Counts logged at boot.
+//   - trees.json    -> Tree entities     (type 10, client prefix trees/)
+//   - rocks.json    -> Rock entities     (type 11, prefix rocks/)
+//   - fishing.json  -> FishSpot entities (type 13, prefix fishspots/)
+//   - foraging.json -> Foraging entities (type 12, prefix bushes/)
+//
+// Every key in each table is spawnable; the TESTMAP demo line below uses one
+// key per type (all level-1 so the stub skill level 1 can harvest them).
+type resourceInfo struct {
+	Name             string `json:"name"`
+	LevelRequirement int    `json:"levelRequirement"`
+	Experience       int    `json:"experience"`
+	Difficulty       int    `json:"difficulty"`
+	Item             string `json:"item"`
+	RespawnTime      int    `json:"respawnTime"` // ms, optional per entry
+}
+
+var (
+	resourcesOnce   sync.Once
+	resourceTables  = map[string]map[string]*resourceInfo{}
+	resourceCounts  = map[string]int{}
+	resourceTableOK = false
+)
+
+func resourceDataPath(name string) string {
+	if p := os.Getenv("RES_" + name); p != "" {
+		return p
+	}
+	rel := filepath.Join("..", "packages", "server", "data", name+".json")
+	if _, err := os.Stat(rel); err == nil {
+		return rel
+	}
+	if alt := filepath.Join("..", "..", "packages", "server", "data", name+".json"); true {
+		if _, err := os.Stat(alt); err == nil {
+			return alt
+		}
+	}
+	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/" + name + ".json"
+}
+
+func loadResources() {
+	resourcesOnce.Do(func() {
+		for _, name := range []string{"trees", "rocks", "fishing", "foraging"} {
+			raw, err := os.ReadFile(resourceDataPath(name))
+			if err != nil {
+				log.Fatalf("read %s.json: %v", name, err)
+			}
+			var tbl map[string]*resourceInfo
+			if err := json.Unmarshal(raw, &tbl); err != nil {
+				log.Fatalf("parse %s.json: %v", name, err)
+			}
+			resourceTables[name] = tbl
+			resourceCounts[name] = len(tbl)
+		}
+		resourceTableOK = true
+		log.Printf("resources loaded: trees=%d rocks=%d fishing=%d foraging=%d",
+			resourceCounts["trees"], resourceCounts["rocks"],
+			resourceCounts["fishing"], resourceCounts["foraging"])
+	})
+}
+
+// resourceKind maps a TESTMAP/real spawn key to its table + entity type +
+// gathering skill. Skill names match Modules.Skills (lumberjacking, mining,
+// fishing, foraging).
+func resourceKind(entityType int) (table, skill string) {
+	switch entityType {
+	case EntityTree:
+		return "trees", "lumberjacking"
+	case EntityRock:
+		return "rocks", "mining"
+	case EntityFishSpot:
+		return "fishing", "fishing"
+	case EntityForaging:
+		return "foraging", "foraging"
+	}
+	return "", ""
+}
+
+// resourceSpawns lists every harvestable resource entity. TESTMAP mode: mixed
+// demo line at y=98 (x=98,100,102,104,106) — 2 oaks + 1 rock + 1 fishspot +
+// 1 bush — all level-1 (harvestable at stub skill 1), each blocking via the
 // resource-occupant rule. Real mode: the legacy demo oak t1 plus one per real
 // world.json `entities` oak marker nearest spawn (tileIndex->key,
 // map.ts forEachEntity -> entities.ts spawnTree; key "oak" renders trees/oak
@@ -541,23 +622,18 @@ func welcomePlayer(instance string) PlayerData {
 // with walkable neighbours (verified against `collisions`/`objects`), and each
 // blocks movement via the resource-occupant rule below (server map.isColliding
 // hasEntityAt + isResource, map.ts:246-254).
-var oakSpawns = func() []ResourceEntityData {
+var resourceSpawns = func() []ResourceEntityData {
 	if cleanMode || combatMode {
-		return nil // CLEAN/COMBAT: pure terrain, no trees to chop (handlers dormant).
+		return nil // CLEAN/COMBAT: pure terrain, no resources (handlers dormant).
 	}
 	if testMode {
-		xs := []int{98, 100, 102, 104, 106}
-		out := make([]ResourceEntityData, 0, len(xs))
-		for i, x := range xs {
-			out = append(out, ResourceEntityData{
-				EntityData: EntityData{
-					Instance: fmt.Sprintf("t-test-%d", i+1),
-					Type:     EntityTree, Key: "oak", Name: "Oak", X: x, Y: 98,
-				},
-				State: intp(0),
-			})
+		return []ResourceEntityData{
+			{EntityData: EntityData{Instance: "t-test-1", Type: EntityTree, Key: "oak", Name: "Oak", X: 98, Y: 98}, State: intp(0)},
+			{EntityData: EntityData{Instance: "t-test-2", Type: EntityTree, Key: "oak", Name: "Oak", X: 100, Y: 98}, State: intp(0)},
+			{EntityData: EntityData{Instance: "t-test-3", Type: EntityRock, Key: "coalrock", Name: "Coal", X: 102, Y: 98}, State: intp(0)},
+			{EntityData: EntityData{Instance: "t-test-4", Type: EntityFishSpot, Key: "shrimpspot", Name: "Shrimp Fishing Spot", X: 104, Y: 98}, State: intp(0)},
+			{EntityData: EntityData{Instance: "t-test-5", Type: EntityForaging, Key: "blueberrybush", Name: "Blueberry Bush", X: 106, Y: 98}, State: intp(0)},
 		}
-		return out
 	}
 	return []ResourceEntityData{
 		{EntityData: EntityData{Instance: "t1", Type: EntityTree, Key: "oak", Name: "Oak", X: 105, Y: 100}, State: intp(0)},
@@ -578,7 +654,7 @@ var oakSpawns = func() []ResourceEntityData {
 // roam broadcasts) so the formation holds for screenshots. Alphabetical
 // within each group (mobs first at indices 0-155, NPCs at 156-231), spacing
 // 2 tiles from origin (showOX,showOY): extent x96-126, y110-138 — all inside
-// test region 50 (x96-143 y96-143), clear of the pond (y101-107) and the oak
+// test region 50 (x96-143 y96-143), clear of the pond (y101-107) and the demo
 // row (y=98), every tile walkable grass (c:false in test mode).
 const (
 	showOX, showOY     = 96, 110
@@ -684,7 +760,7 @@ func startShowcase() {
 }
 
 // demoPlayers spawns 2 paperdoll demo players just north of the grid (grass,
-// clear of pond/oak row). Weapon/helmet keys verified in server items.json
+// clear of pond/demo line). Weapon/helmet keys verified in server items.json
 // (ironsword/ironhelmet, goldsword/goldhelmet) and sprites PNGs.
 func demoPlayers() []PlayerData {
 	mk := func(inst, name string, x, y int, weapon, helmet string) PlayerData {
@@ -1316,7 +1392,7 @@ func startCombat() {
 	})
 }
 
-// spawnFrames returns Spawn frames: guest p2, every oak, the 232-entity
+// spawnFrames returns Spawn frames: guest p2, every resource, the 232-entity
 // showcase grid (156 m-show-* Mobs + 76 n-show-* NPCs, Type Mob=3 / NPC=1 so
 // the client resolves sprites mobs/<key> / npcs/<key> via the entities.ts
 // prefix rule), and 2 paperdoll demo players. Levels/HP are flat defaults
@@ -1413,16 +1489,16 @@ func spawnFrames() [][]any {
 			frames = append(frames, pkt(PacketSpawn, p))
 		}
 	}
-	treesMu.Lock()
-	defer treesMu.Unlock()
-	for _, oak := range oakSpawns {
-		oak := oak
-		if st, ok := trees[oak.Instance]; ok && st.depleted {
-			oak.State = intp(ResourceStateDepleted)
+	resMu.Lock()
+	defer resMu.Unlock()
+	for _, res := range resourceSpawns {
+		res := res
+		if st, ok := resources[res.Instance]; ok && st.depleted {
+			res.State = intp(ResourceStateDepleted)
 		} else {
-			oak.State = intp(ResourceStateDefault)
+			res.State = intp(ResourceStateDefault)
 		}
-		frames = append(frames, pkt(PacketSpawn, oak))
+		frames = append(frames, pkt(PacketSpawn, res))
 	}
 	return frames
 }
@@ -1431,7 +1507,7 @@ func spawnFrames() [][]any {
 // world.json `collisions`, flagged c:true by buildTile above). The client
 // blocks those itself: grid defaults to 1, loadRegionTileData clears only on
 // !tile.c (map.ts:169-172), and handleRequestPath refuses colliding targets
-// (player/handler.ts:56). ENTITY trees (our oak t1) instead stand on a
+// (player/handler.ts:56). ENTITY resources (our demo line) instead stand on a
 // WALKABLE tile (c:false); nothing in the tile grid blocks them. The real
 // server blocks them in map.isColliding via the entity grid — hasEntityAt +
 // isResource (map.ts:246-254) — and enforces it in setPosition/verifyCollision
@@ -1443,10 +1519,10 @@ func spawnFrames() [][]any {
 // resourceEntities are the blocking entity-grid occupants: instance -> x,y.
 // Only RESOURCES block (server isColliding checks entity.isResource());
 // players/mobs are Characters and never block movement. Derived from
-// oakSpawns at init so tiles and entities can never drift apart.
+// resourceSpawns at init so tiles and entities can never drift apart.
 var resourceEntities = func() map[string][2]int {
-	m := make(map[string][2]int, len(oakSpawns))
-	for _, o := range oakSpawns {
+	m := make(map[string][2]int, len(resourceSpawns))
+	for _, o := range resourceSpawns {
 		m[o.Instance] = [2]int{o.X, o.Y}
 	}
 	return m
@@ -1458,7 +1534,7 @@ var resourceEntities = func() map[string][2]int {
 // blocking here to match the c flag buildTile emits (client refuses those
 // requests itself anyway). Dynamic areas/doors/noclip are out of scope.
 // In test mode the same real-terrain rule applies on top of the cloned base,
-// with overlays: pond water always blocks, forced-grass tiles (oaks, showcase
+// with overlays: pond water always blocks, forced-grass tiles (demo resources, showcase
 // grid, demos) always walk.
 func tileBlocked(x, y int) bool {
 	if testMode && !cleanMode && !combatMode {
@@ -1529,7 +1605,7 @@ func blocked(x, y int) bool {
 // session tracks one connection's player grid pos (from Welcome spawn,
 // updated by Started/Step/Stop reports) for teleport-back on reject, plus
 // the last resource target (Request/Started/Follow/Entity carry
-// targetInstance; Step does not) so Step can apply the same chop-approach
+// targetInstance; Step does not) so Step can apply the same gather-approach
 // exception as Request. lastStep + cheatScore implement the M2 speed
 // anticheat (movementSpeed ms/tile, 2-tile grace, teleport-back, >15
 // disconnect — cf. player.ts handleMovementRequest/Step + handler.ts:809).
@@ -1629,7 +1705,7 @@ func checkSpeed(s *session, tiles int) bool {
 }
 
 // handleMovement enforces collisions the client grid cannot: resource-entity
-// tiles (walkable c:false, e.g. oak) plus a backstop for static collisions.
+// tiles (walkable c:false, e.g. demo oak) plus a backstop for static collisions.
 // Request (the client already refuses static targets itself, handler.ts:56):
 // reject only when the destination is blocked AND the player is not
 // targeting the occupying resource (targeted approaches path adjacent via
@@ -1699,9 +1775,9 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 			updateClientRegion(c)
 		}
 	case MovementFollow:
-		// Log-only: a Follow carrying a tree targetInstance is just the
-		// client pathing adjacent to the oak (approach). The single axe
-		// hit comes from the explicit click-on-arrival Target packet.
+		// Log-only: a Follow carrying a resource targetInstance is just the
+		// client pathing adjacent to the resource (approach). The single
+		// gather swing comes from the explicit click-on-arrival Target packet.
 		log.Printf("movement follow target=%s", mv.TargetInstance)
 	case MovementEntity:
 		log.Printf("movement entity target=%s", mv.TargetInstance)
@@ -1719,9 +1795,9 @@ func abs(v int) int {
 // handleTarget accepts the click-to-interact packet the client sends on
 // arrival: [14, [opcode, instance, x?, y?]] (player/handler.ts handleStopPathing
 // -> getTargetType returns Object(3) for resources). ONLY Object(3) on a known
-// tree counts as an axe hit (explicit click-on-arrival): walking to the oak
-// (Request/Started/Step/Follow/Entity) is approach only and never chops.
-// The 600ms per-instance debounce stays as a safety net.
+// resource counts as a gather swing (explicit click-on-arrival): walking to
+// the resource (Request/Started/Step/Follow/Entity) is approach only and
+// never gathers. The 600ms per-instance debounce stays as a safety net.
 func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 	if len(frame) < 2 {
 		return
@@ -1739,13 +1815,13 @@ func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 		return
 	}
 	log.Printf("target opcode=%d instance=%s", opcode, instance)
-	if opcode == TargetObject && isTreeInstance(instance) {
-		chopOak(c.instance, instance)
+	if opcode == TargetObject && isResourceInstance(instance) {
+		hitResource(c.instance, instance)
 	}
 }
 
-// handleCombatReq is log-only: combat frames never chop (only Target Object
-// counts as an axe hit).
+// handleCombatReq is log-only: combat frames never gather (only Target Object
+// counts as a gather swing).
 func handleCombatReq(frame clientFrame) {
 	var data json.RawMessage
 	switch {
@@ -1770,8 +1846,8 @@ func handleCombatReq(frame clientFrame) {
 	log.Printf("combat instance=%s target=%s", cd.Instance, cd.Target)
 }
 
-// handleAnimationReq is log-only: animation echoes never chop (only Target
-// Object counts as an axe hit).
+// handleAnimationReq is log-only: animation echoes never gather (only Target
+// Object counts as a gather swing).
 func handleAnimationReq(frame clientFrame) {
 	if len(frame) < 2 {
 		return
@@ -1786,47 +1862,119 @@ func handleAnimationReq(frame clientFrame) {
 	log.Printf("animation instance=%s resourceInstance=%s", ad.Instance, ad.ResourceInstance)
 }
 
-// treeState tracks the chop/shake/depleted/respawn cycle for ONE tree
-// instance. Real server flow (resourceskill.ts interact loop): each successful
-// hit sends S Animation{instance:player, action:Attack, resourceInstance}
-// (client shakes the tree + plays the chop sound, connection.ts
-// handleAnimation) via player.sendToRegion (resourceskill.ts:104-110), and
+// resourceState tracks the hit/shake/depleted/respawn cycle for ONE resource
+// instance (any of Tree/Rock/FishSpot/Foraging). Real server flow
+// (resourceskill.ts interact loop, SKILL_LOOP=1000ms): each loop tick sends S
+// Animation{instance:player, action:Attack, resourceInstance} (client shakes
+// the resource + plays the gather sound, connection.ts handleAnimation) via
+// player.sendToRegion (resourceskill.ts:104-110); each tick rolls
+// canExhaustResource and on success awards item + XP, then shouldDeplete()
+// depletes (always, except fishing spots which use a 1/10 random depletion).
 // deplete() fires onStateChange -> Regions push of S Resource{instance,
 // state:Depleted} (entities.ts:212-220, resource.ts:36-48) — both REGION
 // broadcasts, never unicast. Respawn re-sends state Default the same way.
-// Stub tuning (documented): 3 hits, 15 s respawn per instance, independent of
-// all other instances. lastHit implements the per-instance 600ms debounce as
-// a safety net against duplicate Target arrivals for one physical click.
+// Stub mapping (documented divergences): one C Target Object(3) click = one
+// loop tick (no 1s auto-loop; the client only sends Target on click); the
+// canExhaust roll runs per swing with stub skill/tool levels (M5 adds real
+// Skills/inventory — XP is a log hook only); fishing spots deplete on first
+// success like all types (no 1/10 randomDepletion). Respawn per instance from
+// the table respawnTime (ms) with 15s fallback (RESOURCE_RESPAWN is 30s
+// upstream; M4_RESPAWN_MS env overrides all for fast tests). lastHit
+// implements the per-instance 600ms debounce as a safety net against
+// duplicate Target arrivals for one physical click.
 const (
-	oakMaxHits  = 3
-	oakRespawn  = 15 * time.Second
-	oakDebounce = 600 * time.Millisecond
+	resourceRespawnFallback = 15 * time.Second
+	resourceDebounce        = 600 * time.Millisecond
 )
 
-type treeState struct {
-	hits     int
+type resourceState struct {
+	swings   int
 	depleted bool
 	timer    *time.Timer
 	lastHit  time.Time
 }
 
 var (
-	treesMu sync.Mutex
-	trees   = func() map[string]*treeState {
-		m := make(map[string]*treeState, len(oakSpawns))
-		for _, o := range oakSpawns {
-			m[o.Instance] = &treeState{hits: oakMaxHits}
+	resMu     sync.Mutex
+	resources = func() map[string]*resourceState {
+		m := make(map[string]*resourceState, len(resourceSpawns))
+		for _, o := range resourceSpawns {
+			m[o.Instance] = &resourceState{}
 		}
 		return m
 	}()
 )
 
-// isTreeInstance reports whether id is a known cuttable tree instance.
-func isTreeInstance(id string) bool {
-	treesMu.Lock()
-	defer treesMu.Unlock()
-	_, ok := trees[id]
+// isResourceInstance reports whether id is a known harvestable resource.
+func isResourceInstance(id string) bool {
+	resMu.Lock()
+	defer resMu.Unlock()
+	_, ok := resources[id]
 	return ok
+}
+
+// stubSkillLevel is the M5-placeholder gathering level per skill
+// (resourceskill.ts `level`; real server gates resource.data.levelRequirement
+// > level with a notify). Env M4_SKILL_<NAME> overrides one skill, M4_SKILL
+// overrides all; default 1 (harvests the all-level-1 demo line, denies
+// high-level tables with a log).
+func stubSkillLevel(skill string) int {
+	if v := os.Getenv("M4_SKILL_" + skill); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	if v := os.Getenv("M4_SKILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 1
+}
+
+// stubToolLevel is the M5-placeholder equipped-tool tier per skill
+// (weapon.lumberjacking/mining/fishing from items.json; foraging needs no
+// tool — harvest() passes none). Defaults match the basic tier-1 tools:
+// bronzeaxe/ironaxe lumberjacking 1, bronzepickaxe mining 1, fishingpole
+// fishing 1. Env M4_TOOL_<SKILL>=0 simulates the wrong/missing tool (deny +
+// log, like the INVALID_WEAPON notify in lumberjacking/mining/fishing impl).
+func stubToolLevel(skill string) int {
+	if v := os.Getenv("M4_TOOL_" + skill); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 1
+}
+
+// resourceRespawnDelay resolves the respawn timer for one table entry:
+// M4_RESPAWN_MS env wins (fast tests), then the entry respawnTime (ms),
+// then the 15s fallback.
+func resourceRespawnDelay(info *resourceInfo) time.Duration {
+	if v := os.Getenv("M4_RESPAWN_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	if info != nil && info.RespawnTime > 0 {
+		return time.Duration(info.RespawnTime) * time.Millisecond
+	}
+	return resourceRespawnFallback
+}
+
+// canExhaustResource mirrors resourceskill.ts canExhaustResource verbatim:
+// probability = difficulty - weaponLevel*skillLevel, clamped to >= 2, success
+// iff randomInt(0, probability) == 2 (Utils.randomInt is inclusive, so
+// P = 1/(probability+1)). Foraging overrides to always true (foraging.ts).
+func canExhaustResource(skill string, weaponLevel, skillLevel int, info *resourceInfo) bool {
+	if skill == "foraging" {
+		return true
+	}
+	probability := info.Difficulty - weaponLevel*skillLevel
+	if probability < 2 {
+		probability = 2
+	}
+	return rand.Intn(probability+1) == 2
 }
 
 // subs tracks live connections so the respawn timer can restore the tree even
@@ -2135,65 +2283,105 @@ func removeClient(conn *websocket.Conn) {
 	log.Printf("client removed: instance=%s (despawn broadcast)", c.instance)
 }
 
-// chopOak registers one axe hit on the given tree instance: enqueue S
-// Animation (client shake + chop sound), decrement its hits; at 0 enqueue S
-// Resource{state:Depleted} (stump frame) and start its own respawn timer ->
-// enqueue S Resource{state:Default} + reset hits. Enqueue (not direct write)
-// matches resourceskill sendToRegion + entities onStateChange Regions push;
-// the tick loop flushes. Unknown or depleted instances are ignored (logged);
-// the per-instance 600ms debounce stays as a safety net; each instance
+// hitResource registers one gather swing on the given resource instance:
+// level gate (deny + log, like the INVALID_LEVEL notify), tool gate (deny +
+// log, like the INVALID_WEAPON notify; foraging needs no tool), then enqueue
+// S Animation (client shake + gather sound) and roll canExhaustResource — on
+// success log the XP hook (M5 awards real Skill XP) and enqueue S
+// Resource{state:Depleted} (exhausted frame) + start its own respawn timer ->
+// enqueue S Resource{state:Default}. Enqueue (not direct write) matches
+// resourceskill sendToRegion + entities onStateChange Regions push; the tick
+// loop flushes. Unknown or depleted instances are ignored (logged); the
+// per-instance 600ms debounce stays as a safety net; each instance
 // depletes/respawns independently. ONLY handleTarget (TargetObject) calls
-// this — walking to the oak never chops.
-func chopOak(attacker, instance string) {
-	treesMu.Lock()
-	st, ok := trees[instance]
+// this — walking to the resource (Request/Step/Follow/Entity) never gathers,
+// and Combat/Animation echoes never gather either.
+func hitResource(attacker, instance string) {
+	loadResources()
+	resMu.Lock()
+	st, ok := resources[instance]
+	resMu.Unlock()
 	if !ok {
-		treesMu.Unlock()
 		return
 	}
+	var desc *ResourceEntityData
+	for i := range resourceSpawns {
+		if resourceSpawns[i].Instance == instance {
+			desc = &resourceSpawns[i]
+			break
+		}
+	}
+	if desc == nil {
+		return
+	}
+	table, skill := resourceKind(desc.Type)
+	info := resourceTables[table][desc.Key]
+	if info == nil {
+		log.Printf("resource %s (%s) has no table entry, swing ignored", instance, desc.Key)
+		return
+	}
+	skillLevel := stubSkillLevel(skill)
+	if info.LevelRequirement > skillLevel {
+		log.Printf("resource %s denied: %s level %d < required %d (key %s)",
+			instance, skill, skillLevel, info.LevelRequirement, desc.Key)
+		return
+	}
+	toolLevel := 0
+	if skill != "foraging" {
+		toolLevel = stubToolLevel(skill)
+		if toolLevel <= 0 {
+			log.Printf("resource %s denied: missing %s tool for %s (key %s)",
+				instance, skill, desc.Key, desc.Key)
+			return
+		}
+	}
+	resMu.Lock()
 	if st.depleted {
-		log.Printf("oak %s chop ignored (depleted)", instance)
-		treesMu.Unlock()
+		log.Printf("resource %s swing ignored (depleted)", instance)
+		resMu.Unlock()
 		return
 	}
 	now := time.Now()
-	if !st.lastHit.IsZero() && now.Sub(st.lastHit) < oakDebounce {
-		log.Printf("oak %s chop debounced (%v since last hit)", instance, now.Sub(st.lastHit))
-		treesMu.Unlock()
+	if !st.lastHit.IsZero() && now.Sub(st.lastHit) < resourceDebounce {
+		log.Printf("resource %s swing debounced (%v since last hit)", instance, now.Sub(st.lastHit))
+		resMu.Unlock()
 		return
 	}
 	st.lastHit = now
-	st.hits--
-	hits := st.hits
-	depleted := hits <= 0
-	if depleted {
-		st.depleted = true
-	}
-	treesMu.Unlock()
+	st.swings++
+	swings := st.swings
+	resMu.Unlock()
 
 	broadcast(pkt(PacketAnimation, animationData{
 		Instance:         attacker,
 		Action:           ActionAttack,
 		ResourceInstance: instance,
 	}))
-	log.Printf("oak %s chopped (chop sound), hits left=%d", instance, hits)
 
-	if !depleted {
+	if !canExhaustResource(skill, toolLevel, skillLevel, info) {
+		log.Printf("resource %s swung (%s sound), no exhaust (swing %d, key %s)",
+			instance, skill, swings, desc.Key)
 		return
 	}
+	log.Printf("resource %s exhausted: +%d %s xp (M5 hook, key %s item %s)",
+		instance, info.Experience, skill, desc.Key, info.Item)
+	resMu.Lock()
+	st.depleted = true
+	delay := resourceRespawnDelay(info)
+	resMu.Unlock()
 	broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDepleted}))
-	log.Printf("oak %s depleted -> stump frame, respawn in %v", instance, oakRespawn)
-	treesMu.Lock()
-	st.timer = time.AfterFunc(oakRespawn, func() {
-		treesMu.Lock()
-		st.hits = oakMaxHits
+	log.Printf("resource %s depleted -> exhausted frame, respawn in %v", instance, delay)
+	resMu.Lock()
+	st.timer = time.AfterFunc(delay, func() {
+		resMu.Lock()
+		st.swings = 0
 		st.depleted = false
 		st.timer = nil
-		treesMu.Unlock()
+		resMu.Unlock()
 		broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDefault}))
-		log.Printf("oak %s respawned (state 0, hits reset to %d)", instance, oakMaxHits)
+		log.Printf("resource %s respawned (state 0)", instance)
 	})
-	treesMu.Unlock()
+	resMu.Unlock()
 }
 
 // clientFrame is a generic C->S frame: [packetId, data?] (socket.ts send).
@@ -2310,7 +2498,7 @@ func handleEquipmentReq(c *playerConn, frame clientFrame) {
 	broadcast(pkt(PacketSync, ph))
 }
 
-// spawnPayload rebuilds the Spawn payload for a known instance: live trees
+// spawnPayload rebuilds the Spawn payload for a known instance: live resources
 // honour depleted state; players echo their Welcome shape at the registry
 // pos; statics echo their scenario definition.
 func spawnPayload(instance string) (any, bool) {
@@ -2318,18 +2506,18 @@ func spawnPayload(instance string) (any, bool) {
 	if !found {
 		return nil, false
 	}
-	treesMu.Lock()
-	_, isTree := trees[instance]
-	treesMu.Unlock()
-	if isTree {
-		treesMu.Lock()
-		depleted := trees[instance].depleted
-		treesMu.Unlock()
+	resMu.Lock()
+	_, isRes := resources[instance]
+	resMu.Unlock()
+	if isRes {
+		resMu.Lock()
+		depleted := resources[instance].depleted
+		resMu.Unlock()
 		st := ResourceStateDefault
 		if depleted {
 			st = ResourceStateDepleted
 		}
-		for _, o := range oakSpawns {
+		for _, o := range resourceSpawns {
 			if o.Instance == instance {
 				o := o
 				o.X, o.Y = x, y
@@ -2382,11 +2570,12 @@ func staticPayload(instance string) (any, bool) {
 	return nil, false
 }
 
-// initEntities seeds the central registry with every static spawn (oaks,
+// initEntities seeds the central registry with every static spawn (resources,
 // showcase grid, demos, guest, bots, dummy, adventurer) so List/Who and
 // region routing resolve before any client connects.
 func initEntities() {
 	loadWorld()
+	loadResources()
 	gx, gy := 102, 98
 	if testMode {
 		gx, gy = 101, 96
@@ -2395,7 +2584,7 @@ func initEntities() {
 	if !testMode && !cleanMode && !combatMode {
 		setEntityPos("m1", 104, 104)
 	}
-	for _, o := range oakSpawns {
+	for _, o := range resourceSpawns {
 		setEntityPos(o.Instance, o.X, o.Y)
 	}
 	if testMode && !cleanMode && !combatMode {
@@ -2553,7 +2742,7 @@ func handleConn(conn *websocket.Conn) {
 				if disconnect := handleMovement(conn, c, mv); disconnect {
 					return
 				}
-			case PacketTarget: // C Target [opcode, instance] -> chop on that oak
+			case PacketTarget: // C Target [opcode, instance] -> gather on that resource
 				handleTarget(conn, c, frame)
 			case PacketCombat: // C Combat {instance,target} -> chop on that oak
 				handleCombatReq(frame)
