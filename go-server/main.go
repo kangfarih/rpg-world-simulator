@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -866,10 +867,21 @@ func cleanEquipmentBatch() []any {
 //     every 12s party buff (Effect Add DefenseBuff/StrengthSuperBuff on all
 //     4 bots).
 //
-// Ranged flavour: real ranged attacks spawn Projectile entities (type 5) and
-// apply damage on impact; the stub collapses flight into the instant Combat
-// Hit pipeline (same splat + Points HP bar) with hit.ranged=true, matching
-// Hit.serialize. No Equipment Batch is sent: Batch equips game.player (the
+// Ranged combat is real (M3 slice 1): archer/mage autos, Volley arrows and
+// Storm bolts spawn Projectile entities (type 5, ownerInstance +
+// targetInstance + hit, arrow/greenbolt keys from items.json) that travel
+// distance*90ms like projectile.ts, then impact into the Combat Hit +
+// (Storm Fireball) Effect + Points pipeline with hit.ranged=true, matching
+// Hit.serialize. A kill mid-flight drops the impact (no phantom damage on
+// the respawned life); a kill at launch fizzles the cast.
+// Damage uses the formulas.ts port (see the M3 block above for divergences):
+// autos roll (bonus+20)*1.25 [+5 player] [*slash 1.1] via rand^accuracy with
+// 5% natural crits (ceilings war 37/52, archer 41/59, mage 62/91); Sunder 40
+// / Volley 3x30 / Storm 45 stay fixed ability power under the shared 1s GCD.
+// Leash demo: one rat mob (m-rat-1, 104,94, mobs.json rat profile) chases
+// the nearest player within 6 tiles, leashes home beyond 10, respawns 10s
+// after death; the BossDummy tracks its nearest attacker (log-only, no
+// retaliate). No Equipment Batch is sent: Batch equips game.player (the
 // hero), while inline Spawn equipments are applied per-entity via
 // player.load -> equip.
 const (
@@ -914,6 +926,176 @@ const (
 )
 
 const combatGlobalCD = time.Second // 1s GLOBAL CD shared across skills
+
+// M3 slice 1 — real combat core (formula port, projectiles, aggro/leash).
+//
+// Damage formula port of packages/server/src/info/formulas.ts getDamage /
+// getMaxDamage (melee/archery/magic): maxDamage = (damageBonus + skillLevel)
+// * 1.25 [+50% on crit] [+5 player bonus] [*attack-style multiplier], rolled
+// with randomWeightedInt(0, max, accuracy) = floor(rand^accuracy * (max+1))
+// and clamped to the target's remaining HP. Accuracy mirrors the truth
+// (MAX_ACCURACY 0.45 + bonus term + level term + target defense term +
+// stat-weight term, -0.15 on crit).
+// Documented divergences: (a) no potion/buff/terror accuracy or damage
+// modifiers (support buffs are FX-only); (b) target is the stub BossDummy
+// (Lv1, zero defense stats, defense level 1, damage reduction 1.0) instead
+// of the golem-38 profile; (c) accuracy clamped to [0.7, 2.0] so demo DPS
+// stays playable (faithful high-level accuracy would skew most hits to
+// single digits); (d) no triangle-advantage step (dummy has no defense
+// identity); (e) infinite arrows/mana (no inventory yet); (f) crit is a
+// flat 5% roll (base rate; no critical-enchantment gear on the bots).
+// Bot profiles below use items.json values: goldsword (str bonus 3,
+// acc 6, slash 10), woodenbow+arrow (archery bonus 2+7=9, archery stat 2),
+// naturestaff (magic bonus 26, magic stat 36).
+type combatBotStat struct {
+	weapon        string
+	attackStyle   string // "slash" or "" (none)
+	damageBonus   int
+	accuracyBonus int
+	accuracyLevel int
+	damageLevel   int
+	archer        bool
+	magic         bool
+	crush         int
+	slash         int
+	stab          int
+	magicStat     int
+	archery       int
+}
+
+var combatBotStats = map[string]*combatBotStat{
+	combatBotInstance: {
+		weapon: "goldsword", attackStyle: "slash",
+		damageBonus: 3, accuracyBonus: 6, accuracyLevel: 20, damageLevel: 20,
+		crush: 6, slash: 10, stab: 7,
+	},
+	combatArcherInstance: {
+		weapon:      "woodenbow",
+		damageBonus: 9, accuracyBonus: 9, accuracyLevel: 20, damageLevel: 20,
+		archer: true, crush: 1, slash: 2, stab: 1, archery: 2,
+	},
+	combatMageInstance: {
+		weapon:      "naturestaff",
+		damageBonus: 26, accuracyBonus: 26, accuracyLevel: 20, damageLevel: 20,
+		magic: true, crush: 2, slash: 4, stab: 4, magicStat: 36,
+	},
+}
+
+// combatWeaponAttackRate is the data-driven attackRate lookup (player
+// getAttackRate reads weapon.attackRate; bows fall back to
+// ARCHER_ATTACK_RANGE-adjacent class cadences). items.json carries no
+// attackRate for goldsword/woodenbow/naturestaff, so all three fall back to
+// the class defaults: warrior 1200ms, archer 1600ms, mage 2000ms.
+var combatWeaponAttackRate = map[string]int{}
+
+func combatAutoRate(bot string) time.Duration {
+	if ms := combatWeaponAttackRate[combatBotStats[bot].weapon]; ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	switch bot {
+	case combatArcherInstance:
+		return combatArcherAutoMs * time.Millisecond
+	case combatMageInstance:
+		return combatMageAutoMs * time.Millisecond
+	default:
+		return combatAutoMs * time.Millisecond
+	}
+}
+
+func combatMaxDamageFloat(bot string, critical bool) float64 {
+	st := combatBotStats[bot]
+	dmg := float64(st.damageBonus+st.damageLevel) * 1.25
+	if critical {
+		dmg *= 1.5
+	}
+	dmg += 5 // player bonus
+	switch st.attackStyle {
+	case "slash":
+		dmg *= 1.1
+	case "crush":
+		dmg *= 1.05
+	case "shared":
+		dmg *= 1.03
+	}
+	if dmg < 0 {
+		dmg = 0
+	}
+	return dmg
+}
+
+// combatAccuracyWeight ports getAccuracyWeight for a zero-defense dummy:
+// archers/mages use their own school ((stat-0)/3, floored at 1), melee sums
+// the positive schools. Resulting maxDamage ceilings: war 37 (crit 52),
+// archer 41 (crit 59), mage 62 (crit 91).
+func combatAccuracyWeight(bot string) float64 {
+	st := combatBotStats[bot]
+	if st.archer {
+		if st.archery > 0 {
+			return math.Max(float64(st.archery)/3, 1)
+		}
+		return 1
+	}
+	if st.magic {
+		if st.magicStat > 0 {
+			return math.Max(float64(st.magicStat)/3, 1)
+		}
+		return 1
+	}
+	total := 0.0
+	for _, v := range []int{st.crush, st.slash, st.stab, st.magicStat, st.archery} {
+		if v > 0 {
+			total += float64(v) / 3
+		}
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total
+}
+
+func combatAccuracy(bot string, critical bool) float64 {
+	st := combatBotStats[bot]
+	acc := ModulesMaxAccuracy
+	if bonus := float64(st.accuracyBonus); bonus <= 70 {
+		acc += 1 - bonus/70
+	}
+	acc += float64(ModulesMaxLevel-st.accuracyLevel+1) * 0.01
+	acc += 1 * 0.0175 // dummy defense level 1
+	acc += -(math.Sqrt(combatAccuracyWeight(bot)) / 22.36) + 1
+	if critical {
+		acc -= 0.15
+	}
+	if acc < 0.7 {
+		acc = 0.7
+	}
+	if acc > 2.0 {
+		acc = 2.0
+	}
+	return acc
+}
+
+// combatRollLocked rolls one formula hit for bot (caller holds combatMu;
+// clamped to remaining HP like the truth). combatRollCrit is the base 5%
+// crit chance (no gear bonus on the bots).
+func combatRollLocked(bot string, critical bool) int {
+	max := combatMaxDamageFloat(bot, critical)
+	dmg := int(math.Floor(math.Pow(rand.Float64(), combatAccuracy(bot, critical)) * (max + 1)))
+	if dmg > combatHP {
+		dmg = combatHP
+	}
+	if dmg < 0 {
+		dmg = 0
+	}
+	return dmg
+}
+
+func combatRollCrit() bool { return rand.Float64() < 0.05 }
+
+// Modules constants mirrored from packages/common/network/modules.ts.
+const (
+	ModulesMaxAccuracy = 0.45
+	ModulesMaxLevel    = 120
+)
 
 // dummyMaxHP/dummyRespawnDelay are env-overridable for fast scripted checks
 // (DUMMY_HP/DUMMY_RESPAWN seconds); defaults are the spec values (BossDummy
@@ -1099,23 +1281,80 @@ func combatSpawns() [][]any {
 	if d, ok := dummyData(); ok {
 		frames = append(frames, pkt(PacketSpawn, d))
 	}
+	ratMu.Lock()
+	dead := ratDead
+	var rat EntityData
+	if !dead {
+		rat = ratData()
+	}
+	ratMu.Unlock()
+	if !dead {
+		frames = append(frames, pkt(PacketSpawn, rat))
+	}
 	return frames
 }
 
-// strikeBossLocked applies dmg to the boss and broadcasts the full damage
-// pipeline (server combat.ts sendAttack + character.handleHitPoints shape):
-// Animation Attack (bot swing) + Combat Hit (damage splat via client
-// handleCombat -> info.create -> Splat float + hurt flash + health bars) +
-// Points (boss HP bar via client handlePoints -> setHitPoints). Ranged bots
-// set hit.ranged (their real-server path spawns Projectile entities; flight
-// is collapsed here into the instant pipeline). Skill strikes additionally
-// carry skills (splat skill icon) + an Effect Add impact (Boulder for Sunder,
-// Fireball for Storm). Caller holds combatMu; no-op when boss dead.
-// At 0 HP the boss despawns (mob death path: Despawn, not the player Death
-// scroll packet) and a respawn timer restores full HP + re-spawns it.
-func strikeBossLocked(attacker string, dmg, typ int, skills []string, ranged bool, effect int) {
+// combatGen invalidates in-flight projectiles across a boss death: a
+// projectile launched before the kill never damages the respawned boss
+// (truth: target.hit on a dead target is a no-op via the isDead guard).
+var combatGen int
+
+// bossTarget/bossAttackers is the slice-1 aggro demo: the dummy tracks its
+// attackers and retargets the nearest one (mob handler.ts handleHit adds the
+// attacker; combat picks findNearestTarget). No retaliate yet — the boss
+// never emits Combat packets, the target switch is log-observable only.
+var (
+	bossTarget    string
+	bossAttackers = map[string]bool{}
+)
+
+func botTile(instance string) (int, int) {
+	switch instance {
+	case combatArcherInstance:
+		return combatArcherX, combatArcherY
+	case combatMageInstance:
+		return combatMageX, combatMageY
+	case combatSupInstance:
+		return combatSupX, combatSupY
+	default:
+		return combatBotX, combatBotY
+	}
+}
+
+func bossAggroNote(attacker string) {
+	bossAttackers[attacker] = true
+	best, bestD := attacker, -1
+	for a := range bossAttackers {
+		ax, ay := botTile(a)
+		dx, dy := ax-combatDummyX, ay-combatDummyY
+		if dx < 0 {
+			dx = -dx
+		}
+		if dy < 0 {
+			dy = -dy
+		}
+		if d := dx + dy; bestD < 0 || d < bestD {
+			best, bestD = a, d
+		}
+	}
+	if best != bossTarget {
+		bossTarget = best
+		log.Printf("combat: boss aggro -> %s (nearest attacker, no retaliate)", best)
+	}
+}
+
+// applyBossHitLocked is the shared damage pipeline (server combat.ts
+// sendAttack + character.handleHitPoints shape): optional Animation,
+// Combat Hit splat, optional Effect impact, then Points (boss HP bar).
+// Caller holds combatMu; no-op when boss dead. At 0 HP the boss despawns
+// (mob death path: Despawn[13], not the player Death[29] scroll packet)
+// and a respawn timer restores full HP + re-spawns it.
+func applyBossHitLocked(attacker string, dmg, typ int, skills []string, ranged bool, effect int, withAnim bool) {
 	if combatDead {
 		return
+	}
+	if attacker != "" {
+		bossAggroNote(attacker)
 	}
 	combatHP -= dmg
 	if combatHP < 0 {
@@ -1125,9 +1364,11 @@ func strikeBossLocked(attacker string, dmg, typ int, skills []string, ranged boo
 	if ranged {
 		hit.Ranged = boolp(true)
 	}
-	broadcast(pkt(PacketAnimation, animationData{
-		Instance: attacker, Action: ActionAttack,
-	}))
+	if withAnim {
+		broadcast(pkt(PacketAnimation, animationData{
+			Instance: attacker, Action: ActionAttack,
+		}))
+	}
 	broadcast(pktOp(PacketCombat, CombatHit, combatData{
 		Instance: attacker, Target: combatDummyInstance, Hit: hit,
 	}))
@@ -1143,10 +1384,85 @@ func strikeBossLocked(attacker string, dmg, typ int, skills []string, ranged boo
 	log.Printf("combat: %s hit boss type=%d dmg=%d hp=%d/%d", attacker, typ, dmg, combatHP, dummyMaxHP)
 	if combatHP <= 0 {
 		combatDead = true
+		combatGen++
+		bossTarget = ""
+		bossAttackers = map[string]bool{}
 		broadcast(pkt(PacketDespawn, despawnData{Instance: combatDummyInstance}))
 		log.Printf("combat: boss died -> despawned, respawn in %v", dummyRespawnDelay)
 		time.AfterFunc(dummyRespawnDelay, combatRespawn)
 	}
+}
+
+func strikeBossLocked(attacker string, dmg, typ int, skills []string, ranged bool, effect int) {
+	applyBossHitLocked(attacker, dmg, typ, skills, ranged, effect, true)
+}
+
+// Projectile entity registry for in-flight ranged shots (Who/List
+// resolution between Spawn and impact Despawn).
+var (
+	projMu       sync.Mutex
+	projSeq      int
+	projPayloads = map[string]EntityData{}
+)
+
+func projKey(owner string) string {
+	if owner == combatMageInstance {
+		return "greenbolt" // naturestaff projectileName (items.json)
+	}
+	return "arrow" // arrow item projectileName (woodenbow has none)
+}
+
+// spawnRangedStrikeLocked ports combat.ts sendRangedAttack + entities
+// spawnProjectile: the swing Animation + a Projectile Spawn (type 5,
+// ownerInstance + targetInstance + hit) go out instantly, then damage lands
+// on impact after distance*90ms of travel (projectile.ts), when the Combat
+// Hit + Effect + Points pipeline fires. A stale/mid-flight kill drops the
+// impact (instant-fallback: no phantom damage on the new life).
+func spawnRangedStrikeLocked(owner string, dmg, typ int, skills []string, effect int) {
+	if combatDead {
+		log.Printf("combat: %s ranged fizzles (boss dead)", owner)
+		return
+	}
+	bossAggroNote(owner)
+	gen := combatGen
+	ox, oy := botTile(owner)
+	dist := int(math.Ceil(math.Hypot(float64(combatDummyX-ox), float64(combatDummyY-oy))))
+	if dist < 1 {
+		dist = 1
+	}
+	travel := time.Duration(dist*90) * time.Millisecond
+	hit := HitData{Type: typ, Damage: dmg, Skills: skills, Ranged: boolp(true)}
+	projSeq++
+	inst := fmt.Sprintf("pr-%d", projSeq)
+	key := projKey(owner)
+	p := EntityData{
+		Instance: inst, Type: EntityProjectile, Key: key, Name: key,
+		X: ox, Y: oy, OwnerInstance: owner, TargetInstance: combatDummyInstance,
+		Hit: &hit,
+	}
+	projMu.Lock()
+	projPayloads[inst] = p
+	projMu.Unlock()
+	setEntityPos(inst, ox, oy)
+	broadcast(pkt(PacketAnimation, animationData{Instance: owner, Action: ActionAttack}))
+	broadcast(pkt(PacketSpawn, p))
+	log.Printf("combat: %s launched %s (%s) travel=%v dmg=%d", owner, inst, key, travel, dmg)
+	time.AfterFunc(travel, func() {
+		combatMu.Lock()
+		defer combatMu.Unlock()
+		entitiesMu.Lock()
+		delete(entities, inst)
+		entitiesMu.Unlock()
+		projMu.Lock()
+		delete(projPayloads, inst)
+		projMu.Unlock()
+		broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
+		if combatDead || gen != combatGen {
+			log.Printf("combat: %s impact dropped (target died mid-flight, fallback)", inst)
+			return
+		}
+		applyBossHitLocked(owner, dmg, typ, skills, true, effect, false)
+	})
 }
 
 // trySkill consumes one bot's 1s GLOBAL skill CD and runs fn. Returns false
@@ -1164,23 +1480,40 @@ func trySkill(bot string, fn func()) bool {
 	return true
 }
 
-// Autos NEVER consult the skill GCD; each class ticks at its own speed.
+// Autos NEVER consult the skill GCD; each class ticks at its own
+// data-driven rate (combatAutoRate). Damage uses the M3 formula port with a
+// 5% natural crit; archer/mage autos fly as real projectiles.
 func combatAuto() {
 	combatMu.Lock()
 	defer combatMu.Unlock()
-	strikeBossLocked(combatBotInstance, combatAutoMin+rand.Intn(combatAutoMax-combatAutoMin+1), HitsNormal, nil, false, -1)
+	crit := combatRollCrit()
+	typ := HitsNormal
+	if crit {
+		typ = HitsCritical
+	}
+	strikeBossLocked(combatBotInstance, combatRollLocked(combatBotInstance, crit), typ, nil, false, -1)
 }
 
 func archerAuto() {
 	combatMu.Lock()
 	defer combatMu.Unlock()
-	strikeBossLocked(combatArcherInstance, combatArcherAutoMin+rand.Intn(combatArcherAutoMax-combatArcherAutoMin+1), HitsNormal, nil, true, -1)
+	crit := combatRollCrit()
+	typ := HitsNormal
+	if crit {
+		typ = HitsCritical
+	}
+	spawnRangedStrikeLocked(combatArcherInstance, combatRollLocked(combatArcherInstance, crit), typ, nil, -1)
 }
 
 func mageAuto() {
 	combatMu.Lock()
 	defer combatMu.Unlock()
-	strikeBossLocked(combatMageInstance, combatMageAutoMin+rand.Intn(combatMageAutoMax-combatMageAutoMin+1), HitsNormal, nil, true, -1)
+	crit := combatRollCrit()
+	typ := HitsNormal
+	if crit {
+		typ = HitsCritical
+	}
+	spawnRangedStrikeLocked(combatMageInstance, combatRollLocked(combatMageInstance, crit), typ, nil, -1)
 }
 
 // combatSunder attempts one Sunder (Critical + Boulder, 40 dmg). Returns
@@ -1199,8 +1532,8 @@ func combatSunder() bool {
 	})
 }
 
-// combatVolley attempts one Volley: 3x Critical 30 arrow hits (skills
-// ["volley"]) under a single GCD consumption. Returns false on GCD reject.
+// combatVolley attempts one Volley: 3x Critical 30 arrow projectiles
+// (skills ["volley"]) under a single GCD consumption. Returns false on GCD reject.
 func combatVolley() bool {
 	combatMu.Lock()
 	defer combatMu.Unlock()
@@ -1210,13 +1543,13 @@ func combatVolley() bool {
 			return
 		}
 		for i := 0; i < combatVolleyHits; i++ {
-			strikeBossLocked(combatArcherInstance, combatVolleyDamage, HitsCritical, []string{"volley"}, true, -1)
+			spawnRangedStrikeLocked(combatArcherInstance, combatVolleyDamage, HitsCritical, []string{"volley"}, -1)
 		}
 	})
 }
 
-// combatStorm attempts one Storm (Critical 45 + Fireball, skills ["storm"]).
-// Returns false on GCD reject.
+// combatStorm attempts one Storm (Critical 45 greenbolt projectile + Fireball
+// on impact, skills ["storm"]). Returns false on GCD reject.
 func combatStorm() bool {
 	combatMu.Lock()
 	defer combatMu.Unlock()
@@ -1225,7 +1558,7 @@ func combatStorm() bool {
 			log.Printf("combat: storm fizzles (boss dead)")
 			return
 		}
-		strikeBossLocked(combatMageInstance, combatStormDamage, HitsCritical, []string{"storm"}, true, EffectFireball)
+		spawnRangedStrikeLocked(combatMageInstance, combatStormDamage, HitsCritical, []string{"storm"}, EffectFireball)
 	})
 }
 
@@ -1327,6 +1660,171 @@ func stormSkillTick() {
 	combatStorm()
 }
 
+// Leash-demo rat (M3 slice 1 aggro/AI proof): one rat mob at (104,94),
+// mobs.json movementSpeed 450, that chases the nearest player within 6
+// tiles (mob.ts canAggro/isNear shape, aggroRange demo value 6), leashes
+// back to spawn beyond 10 tiles (mob.ts sendToSpawn/outsideRoaming shape),
+// and respawns 10s after death (rat respawnDelay in mobs.json is 10s).
+// Slice 1 keeps the party scene stable: the rat never attacks and nothing
+// targets it (no damage source yet), so death/respawn below is implemented
+// but idle until later slices add real damage.
+const (
+	combatRatInstance = "m-rat-1"
+	combatRatX        = 104
+	combatRatY        = 94
+	combatRatMaxHP    = 20 // mobs.json rat hitPoints
+	combatRatAggro    = 6
+	combatRatLeash    = 10
+	combatRatTickMs   = 500
+)
+
+var combatRatRespawnDelay = 10 * time.Second
+
+var (
+	ratMu   sync.Mutex
+	ratX    = combatRatX
+	ratY    = combatRatY
+	ratHP   = combatRatMaxHP
+	ratDead bool
+)
+
+func ratData() EntityData {
+	return EntityData{
+		Instance: combatRatInstance, Type: EntityMob, Key: "rat", Name: "Rat",
+		X: ratX, Y: ratY, Orientation: intp(OrientationDown),
+		Level: intp(1), HitPoints: intp(ratHP), MaxHitPoints: intp(combatRatMaxHP),
+		MovementSpeed: intp(450), AttackRange: intp(1),
+	}
+}
+
+func ratTeleportLocked() {
+	ratX, ratY = combatRatX, combatRatY
+	setEntityPos(combatRatInstance, ratX, ratY)
+	broadcast(pkt(PacketTeleport, teleportData{Instance: combatRatInstance, X: ratX, Y: ratY}))
+	log.Printf("combat: rat leashed back to spawn %d,%d", ratX, ratY)
+}
+
+// ratKillLocked/despawn + 10s respawn (mob handler.ts handleDeath shape:
+// Despawn now, Spawn at full HP later). No caller in slice 1 (nothing
+// damages the rat yet); kept for the M3 damage slices.
+func ratKillLocked() {
+	if ratDead {
+		return
+	}
+	ratDead = true
+	ratHP = 0
+	broadcast(pkt(PacketDespawn, despawnData{Instance: combatRatInstance}))
+	log.Printf("combat: rat died -> despawned, respawn in %v", combatRatRespawnDelay)
+	time.AfterFunc(combatRatRespawnDelay, ratRespawn)
+}
+
+func ratRespawn() {
+	ratMu.Lock()
+	ratHP = combatRatMaxHP
+	ratDead = false
+	ratX, ratY = combatRatX, combatRatY
+	payload := ratData()
+	ratMu.Unlock()
+	setEntityPos(combatRatInstance, combatRatX, combatRatY)
+	broadcast(pkt(PacketSpawn, payload))
+	log.Printf("combat: rat respawned full HP=%d", combatRatMaxHP)
+}
+
+func cheby(ax, ay, bx, by int) int {
+	dx := ax - bx
+	if dx < 0 {
+		dx = -dx
+	}
+	dy := ay - by
+	if dy < 0 {
+		dy = -dy
+	}
+	if dx > dy {
+		return dx
+	}
+	return dy
+}
+
+// ratTick is the 500ms AI loop: leash home beyond 10 tiles, else chase the
+// nearest player (connected heroes + 4 bots) within 6 tiles one step per
+// tick via Movement Move, holding at attack range 1 without attacking.
+func ratTick() {
+	ratMu.Lock()
+	defer ratMu.Unlock()
+	if ratDead {
+		return
+	}
+	if cheby(ratX, ratY, combatRatX, combatRatY) > combatRatLeash {
+		ratTeleportLocked()
+		return
+	}
+	px, py, ok := nearestPlayerTile(ratX, ratY)
+	if !ok || cheby(ratX, ratY, px, py) > combatRatAggro {
+		return
+	}
+	if cheby(ratX, ratY, combatRatX, combatRatY) > combatRatLeash {
+		ratTeleportLocked()
+		return
+	}
+	if cheby(ratX, ratY, px, py) <= 1 {
+		return
+	}
+	dx, dy := 0, 0
+	if px > ratX {
+		dx = 1
+	} else if px < ratX {
+		dx = -1
+	}
+	if py > ratY {
+		dy = 1
+	} else if py < ratY {
+		dy = -1
+	}
+	nx, ny := ratX+dx, ratY+dy
+	if blocked(nx, ny) {
+		if !blocked(ratX+dx, ratY) {
+			nx, ny = ratX+dx, ratY
+		} else if !blocked(ratX, ratY+dy) {
+			nx, ny = ratX, ratY+dy
+		} else {
+			return
+		}
+	}
+	ratX, ratY = nx, ny
+	setEntityPos(combatRatInstance, ratX, ratY)
+	broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
+		Instance: combatRatInstance, X: intp(ratX), Y: intp(ratY),
+	}))
+	log.Printf("combat: rat chases nearest player -> %d,%d", ratX, ratY)
+}
+
+// nearestPlayerTile returns the tile of the closest player (live heroes +
+// the 4 party bots) to (x,y).
+func nearestPlayerTile(x, y int) (int, int, bool) {
+	type pt struct{ x, y int }
+	cands := []pt{
+		{combatBotX, combatBotY},
+		{combatArcherX, combatArcherY},
+		{combatMageX, combatMageY},
+		{combatSupX, combatSupY},
+	}
+	playersMu.Lock()
+	for _, c := range players {
+		cands = append(cands, pt{c.sess.playerX, c.sess.playerY})
+	}
+	playersMu.Unlock()
+	best, bx, by := -1, 0, 0
+	for _, c := range cands {
+		if d := cheby(x, y, c.x, c.y); best < 0 || d < best {
+			best, bx, by = d, c.x, c.y
+		}
+	}
+	if best < 0 {
+		return 0, 0, false
+	}
+	return bx, by, true
+}
+
 func combatRespawn() {
 	combatMu.Lock()
 	combatHP = dummyMaxHP
@@ -1340,7 +1838,9 @@ func combatRespawn() {
 
 // startCombat launches the party brain (once): warrior auto 1200ms + Sunder
 // 5s, archer auto 1600ms + Volley 6s, mage auto 2000ms + Storm 7s, support
-// heal 6s + buff 12s. Broadcasts are no-ops with no subscribers.
+// heal 6s + buff 12s, rat AI 500ms. Auto cadences resolve via
+// combatAutoRate (weapon attackRate where items.json carries one, else the
+// class defaults above). Broadcasts are no-ops with no subscribers.
 func startCombat() {
 	combatOnce.Do(func() {
 		combatMu.Lock()
@@ -1351,16 +1851,21 @@ func startCombat() {
 			combatBotHP[b] = combatBotMaxHP[b]
 		}
 		combatMu.Unlock()
+		ratMu.Lock()
+		ratX, ratY = combatRatX, combatRatY
+		ratHP = combatRatMaxHP
+		ratDead = false
+		ratMu.Unlock()
 		go func() {
-			warAutoT := time.NewTicker(combatAutoMs * time.Millisecond)
+			warAutoT := time.NewTicker(combatAutoRate(combatBotInstance))
 			defer warAutoT.Stop()
 			skillT := time.NewTicker(combatSkillMs * time.Millisecond)
 			defer skillT.Stop()
-			archAutoT := time.NewTicker(combatArcherAutoMs * time.Millisecond)
+			archAutoT := time.NewTicker(combatAutoRate(combatArcherInstance))
 			defer archAutoT.Stop()
 			volleyT := time.NewTicker(combatArcherSkillMs * time.Millisecond)
 			defer volleyT.Stop()
-			mageAutoT := time.NewTicker(combatMageAutoMs * time.Millisecond)
+			mageAutoT := time.NewTicker(combatAutoRate(combatMageInstance))
 			defer mageAutoT.Stop()
 			stormT := time.NewTicker(combatMageSkillMs * time.Millisecond)
 			defer stormT.Stop()
@@ -1368,6 +1873,8 @@ func startCombat() {
 			defer healT.Stop()
 			buffT := time.NewTicker(combatBuffMs * time.Millisecond)
 			defer buffT.Stop()
+			ratT := time.NewTicker(combatRatTickMs * time.Millisecond)
+			defer ratT.Stop()
 			for {
 				select {
 				case <-warAutoT.C:
@@ -1386,6 +1893,8 @@ func startCombat() {
 					combatHeal()
 				case <-buffT.C:
 					combatBuffTick()
+				case <-ratT.C:
+					ratTick()
 				}
 			}
 		}()
@@ -2506,6 +3015,14 @@ func spawnPayload(instance string) (any, bool) {
 	if !found {
 		return nil, false
 	}
+	projMu.Lock()
+	if p, ok := projPayloads[instance]; ok {
+		projMu.Unlock()
+		p := p
+		p.X, p.Y = x, y
+		return p, true
+	}
+	projMu.Unlock()
 	resMu.Lock()
 	_, isRes := resources[instance]
 	resMu.Unlock()
@@ -2611,6 +3128,7 @@ func initEntities() {
 		setEntityPos(combatMageInstance, combatMageX, combatMageY)
 		setEntityPos(combatSupInstance, combatSupX, combatSupY)
 		setEntityPos(combatDummyInstance, combatDummyX, combatDummyY)
+		setEntityPos(combatRatInstance, combatRatX, combatRatY)
 	}
 	entitiesMu.Lock()
 	n := len(entities)

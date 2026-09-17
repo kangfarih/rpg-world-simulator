@@ -1,8 +1,10 @@
 // Scripted WS check for COMBAT party mode (COMBAT=1): pure original 9
 // regions, 4 bots (WarBot gold warrior, ArchBot woodenbow archer, MageBot
 // naturestaff mage, SupBot unarmed support) + BossDummy (golem, 5000 HP)
-// spawns; autos at class speeds + Sunder/Volley/Storm skills (per-bot 1s
-// GCD); support stays silent at full HP (heal skipped — the dummy never
+// + leash-demo rat (m-rat-1) spawns; M3 formula autos at class speeds
+// (war 0-37, archer 0-41, mage 0-62, 5% crits to 52/59/91) + Sunder/Volley/
+// Storm skills (per-bot 1s GCD); ranged damage lands via real Projectile
+// Spawn (type 5) + delayed impact; support stays silent at full HP
 // retaliates, so no Heal/Healing-FX/bot-Points overheal spam; heal amount
 // clamps to missing HP with an Idle anim when it does fire) + party buffs
 // (Effect Add DefenseBuff/StrengthSuperBuff); per-class Spawn attackRange
@@ -202,18 +204,20 @@ func main() {
 		Key  string `json:"key"`
 	}
 	type spawn struct {
-		Instance     string  `json:"instance"`
-		Type         int     `json:"type"`
-		Key          string  `json:"key"`
-		Name         string  `json:"name"`
-		X            int     `json:"x"`
-		Y            int     `json:"y"`
-		Orientation  int     `json:"orientation"`
-		Level        int     `json:"level"`
-		HitPoints    int     `json:"hitPoints"`
-		MaxHitPoints int     `json:"maxHitPoints"`
-		AttackRange  int     `json:"attackRange"`
-		Equipments   []equip `json:"equipments"`
+		Instance       string  `json:"instance"`
+		Type           int     `json:"type"`
+		Key            string  `json:"key"`
+		Name           string  `json:"name"`
+		X              int     `json:"x"`
+		Y              int     `json:"y"`
+		Orientation    int     `json:"orientation"`
+		Level          int     `json:"level"`
+		HitPoints      int     `json:"hitPoints"`
+		MaxHitPoints   int     `json:"maxHitPoints"`
+		AttackRange    int     `json:"attackRange"`
+		OwnerInstance  string  `json:"ownerInstance"`
+		TargetInstance string  `json:"targetInstance"`
+		Equipments     []equip `json:"equipments"`
 	}
 	spawns := map[string]spawn{}
 	for _, s := range lastFrames {
@@ -231,14 +235,29 @@ func main() {
 	lastFrames = nil
 
 	_, dummyAlive := spawns["m-dummy"]
+	// In-flight projectile Spawns (type 5, pr-*) may land inside the Ready
+	// burst while the brain ticks — they are not scenario spawns.
+	for id, sp := range spawns {
+		if sp.Type == 5 {
+			delete(spawns, id)
+		}
+	}
 	if dummyAlive {
-		check(len(spawns) == 5, fmt.Sprintf("exactly 5 Spawn frames (got %d)", len(spawns)))
+		check(len(spawns) == 6, fmt.Sprintf("exactly 6 Spawn frames (4 bots + dummy + rat, got %d)", len(spawns)))
 	} else {
 		// Fast-HP race: the checker connected during the respawn gap, so
-		// only the 4 bots spawn now — the dummy shape is verified when it
-		// respawns below.
-		check(len(spawns) == 4, fmt.Sprintf("boss dead at connect: 4 bot Spawns, dummy respawns later (got %d)", len(spawns)))
+		// only the 4 bots + rat spawn now — the dummy shape is verified
+		// when it respawns below.
+		check(len(spawns) == 5, fmt.Sprintf("boss dead at connect: 4 bot + rat Spawns, dummy respawns later (got %d)", len(spawns)))
 		fmt.Println("  info: boss dead at connect — dummy shape verified via respawn")
+	}
+	rat, rok := spawns["m-rat-1"]
+	check(rok, "Rat m-rat-1 spawned (leash demo)")
+	if rok {
+		check(rat.Type == 3 && rat.Key == "rat",
+			fmt.Sprintf("Rat Mob rat (got type=%d key=%s at %d,%d)", rat.Type, rat.Key, rat.X, rat.Y))
+		check(rat.HitPoints == 20 && rat.MaxHitPoints == 20,
+			fmt.Sprintf("Rat full HP 20/20 (got %d/%d)", rat.HitPoints, rat.MaxHitPoints))
 	}
 	bot, ok := spawns["p-warbot"]
 	check(ok, "WarBot p-warbot spawned")
@@ -320,9 +339,10 @@ func main() {
 		check(!dup, "overlay gone: "+gone)
 	}
 
-	// --- Combat window: 15s of live party brain ---
-	fmt.Println("waiting 15s for combat window...")
-	window := drain(15 * time.Second)
+	// --- Combat window: collect live party-brain traffic until every
+	// class/skill has been observed (one 300-HP life is ~12s and may not
+	// contain a Storm tick, so keep collecting across the respawn gap).
+	fmt.Println("collecting combat window (up to 120s, across respawns)...")
 
 	type hit struct {
 		Type   int      `json:"type"`
@@ -341,12 +361,35 @@ func main() {
 		MaxHitPoints int    `json:"maxHitPoints"`
 	}
 	autos := map[string]int{}
+	autoCrits := map[string]int{}
+	// M3 formula ceilings: (bonus+20)*1.25 [+5 player] [*slash 1.1],
+	// crit x1.5 — war 37/52, archer 41/59, mage 62/91.
+	autoMax := map[string][2]int{
+		"p-warbot": {37, 52},
+		"p-archer": {41, 59},
+		"p-mage":   {62, 91},
+	}
+	autoOK := func(inst string, h hit) bool {
+		max, ok := autoMax[inst]
+		if !ok {
+			return false
+		}
+		if h.Type == 0 {
+			return h.Damage >= 0 && h.Damage <= max[0]
+		}
+		if h.Type == 6 {
+			return h.Damage >= 0 && h.Damage <= max[1]
+		}
+		return false
+	}
 	var sunderTimes, volleyTimes, stormTimes []time.Duration
 	var anims int
 	var supportAtkAnims int
 	var boulders, fireballs int
 	var hpFirst, hpLast = -1, -1
 	var combatHits int
+	var projectiles int
+	var projBad int
 	var supportAttacks int
 	var heals int
 	var healTargets = map[string]int{}
@@ -355,170 +398,208 @@ func main() {
 	var botPoints = map[string]int{}
 	var windowDeaths int
 	rangedOK := true
-	for _, s := range lastFrames {
-		var id int
-		_ = json.Unmarshal(s.f[0], &id)
-		switch id {
-		case 15:
-			if len(s.f) < 3 {
-				continue
-			}
-			var opcode int
-			_ = json.Unmarshal(s.f[1], &opcode)
-			if opcode != 1 {
-				continue
-			}
-			var c combat
-			if json.Unmarshal(frameData(s.f), &c) != nil {
-				continue
-			}
-			if c.Target != "m-dummy" {
-				continue
-			}
-			if c.Instance == "p-support" {
-				supportAttacks++
-				continue
-			}
-			combatHits++
-			isSkill := false
-			for _, sk := range c.Hit.Skills {
-				switch sk {
-				case "sunder":
-					isSkill = true
-					if c.Hit.Type == 6 && c.Hit.Damage == 40 {
-						sunderTimes = append(sunderTimes, s.t)
-					} else {
-						check(false, fmt.Sprintf("sunder shape type=6 dmg=40 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
-					}
-				case "volley":
-					isSkill = true
-					if c.Hit.Type == 6 && c.Hit.Damage == 30 {
-						volleyTimes = append(volleyTimes, s.t)
-					} else {
-						check(false, fmt.Sprintf("volley shape type=6 dmg=30 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
-					}
-					if c.Hit.Ranged == nil || !*c.Hit.Ranged {
-						rangedOK = false
-					}
-				case "storm":
-					isSkill = true
-					if c.Hit.Type == 6 && c.Hit.Damage == 45 {
-						stormTimes = append(stormTimes, s.t)
-					} else {
-						check(false, fmt.Sprintf("storm shape type=6 dmg=45 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
-					}
-					if c.Hit.Ranged == nil || !*c.Hit.Ranged {
-						rangedOK = false
-					}
+	processed := 0
+	process := func() {
+		for _, s := range lastFrames[processed:] {
+			var id int
+			_ = json.Unmarshal(s.f[0], &id)
+			switch id {
+			case 5:
+				var sp spawn
+				if json.Unmarshal(frameData(s.f), &sp) != nil {
+					continue
 				}
-			}
-			if !isSkill {
-				switch c.Instance {
-				case "p-warbot":
-					if c.Hit.Type == 0 && c.Hit.Damage >= 15 && c.Hit.Damage <= 25 {
-						autos[c.Instance]++
-					} else {
-						check(false, fmt.Sprintf("unexpected war auto type=%d dmg=%d", c.Hit.Type, c.Hit.Damage))
-					}
-				case "p-archer":
-					if c.Hit.Type == 0 && c.Hit.Damage >= 12 && c.Hit.Damage <= 20 {
-						autos[c.Instance]++
-					} else {
-						check(false, fmt.Sprintf("unexpected archer auto type=%d dmg=%d", c.Hit.Type, c.Hit.Damage))
-					}
-					if c.Hit.Ranged == nil || !*c.Hit.Ranged {
-						rangedOK = false
-					}
-				case "p-mage":
-					if c.Hit.Type == 0 && c.Hit.Damage >= 18 && c.Hit.Damage <= 28 {
-						autos[c.Instance]++
-					} else {
-						check(false, fmt.Sprintf("unexpected mage auto type=%d dmg=%d", c.Hit.Type, c.Hit.Damage))
-					}
-					if c.Hit.Ranged == nil || !*c.Hit.Ranged {
-						rangedOK = false
-					}
-				default:
-					check(false, fmt.Sprintf("combat from unknown instance %s", c.Instance))
+				if sp.Type != 5 {
+					continue
 				}
-			}
-		case 16:
-			var a struct {
-				Instance string `json:"instance"`
-				Action   int    `json:"action"`
-			}
-			if json.Unmarshal(frameData(s.f), &a) == nil && a.Action == 1 {
-				anims++
-				if a.Instance == "p-support" {
-					supportAtkAnims++
-				}
-			}
-		case 13:
-			var d struct {
-				Instance string `json:"instance"`
-			}
-			if json.Unmarshal(frameData(s.f), &d) == nil && d.Instance == "m-dummy" {
-				windowDeaths++
-			}
-		case 17:
-			var p points
-			if json.Unmarshal(frameData(s.f), &p) == nil {
-				if p.Instance == "m-dummy" {
-					if hpFirst < 0 {
-						hpFirst = p.HitPoints
-					}
-					hpLast = p.HitPoints
+				// In-flight projectile: owner archer/mage, target dummy.
+				if (sp.OwnerInstance == "p-archer" || sp.OwnerInstance == "p-mage") &&
+					sp.TargetInstance == "m-dummy" {
+					projectiles++
 				} else {
-					botPoints[p.Instance]++
+					projBad++
+				}
+			case 15:
+				if len(s.f) < 3 {
+					continue
+				}
+				var opcode int
+				_ = json.Unmarshal(s.f[1], &opcode)
+				if opcode != 1 {
+					continue
+				}
+				var c combat
+				if json.Unmarshal(frameData(s.f), &c) != nil {
+					continue
+				}
+				if c.Target != "m-dummy" {
+					continue
+				}
+				if c.Instance == "p-support" {
+					supportAttacks++
+					continue
+				}
+				combatHits++
+				isSkill := false
+				for _, sk := range c.Hit.Skills {
+					switch sk {
+					case "sunder":
+						isSkill = true
+						if c.Hit.Type == 6 && c.Hit.Damage == 40 {
+							sunderTimes = append(sunderTimes, s.t)
+						} else {
+							check(false, fmt.Sprintf("sunder shape type=6 dmg=40 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
+						}
+					case "volley":
+						isSkill = true
+						if c.Hit.Type == 6 && c.Hit.Damage == 30 {
+							volleyTimes = append(volleyTimes, s.t)
+						} else {
+							check(false, fmt.Sprintf("volley shape type=6 dmg=30 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
+						}
+						if c.Hit.Ranged == nil || !*c.Hit.Ranged {
+							rangedOK = false
+						}
+					case "storm":
+						isSkill = true
+						if c.Hit.Type == 6 && c.Hit.Damage == 45 {
+							stormTimes = append(stormTimes, s.t)
+						} else {
+							check(false, fmt.Sprintf("storm shape type=6 dmg=45 (got type=%d dmg=%d)", c.Hit.Type, c.Hit.Damage))
+						}
+						if c.Hit.Ranged == nil || !*c.Hit.Ranged {
+							rangedOK = false
+						}
+					}
+				}
+				if !isSkill {
+					switch c.Instance {
+					case "p-warbot":
+						if autoOK(c.Instance, c.Hit) {
+							autos[c.Instance]++
+							if c.Hit.Type == 6 {
+								autoCrits[c.Instance]++
+							}
+						} else {
+							check(false, fmt.Sprintf("unexpected war auto type=%d dmg=%d (want 0:0-37 or 6:0-52)", c.Hit.Type, c.Hit.Damage))
+						}
+					case "p-archer":
+						if autoOK(c.Instance, c.Hit) {
+							autos[c.Instance]++
+							if c.Hit.Type == 6 {
+								autoCrits[c.Instance]++
+							}
+						} else {
+							check(false, fmt.Sprintf("unexpected archer auto type=%d dmg=%d (want 0:0-41 or 6:0-59)", c.Hit.Type, c.Hit.Damage))
+						}
+						if c.Hit.Ranged == nil || !*c.Hit.Ranged {
+							rangedOK = false
+						}
+					case "p-mage":
+						if autoOK(c.Instance, c.Hit) {
+							autos[c.Instance]++
+							if c.Hit.Type == 6 {
+								autoCrits[c.Instance]++
+							}
+						} else {
+							check(false, fmt.Sprintf("unexpected mage auto type=%d dmg=%d (want 0:0-62 or 6:0-91)", c.Hit.Type, c.Hit.Damage))
+						}
+						if c.Hit.Ranged == nil || !*c.Hit.Ranged {
+							rangedOK = false
+						}
+					default:
+						check(false, fmt.Sprintf("combat from unknown instance %s", c.Instance))
+					}
+				}
+			case 16:
+				var a struct {
+					Instance string `json:"instance"`
+					Action   int    `json:"action"`
+				}
+				if json.Unmarshal(frameData(s.f), &a) == nil && a.Action == 1 {
+					anims++
+					if a.Instance == "p-support" {
+						supportAtkAnims++
+					}
+				}
+			case 13:
+				var d struct {
+					Instance string `json:"instance"`
+				}
+				if json.Unmarshal(frameData(s.f), &d) == nil && d.Instance == "m-dummy" {
+					windowDeaths++
+				}
+			case 17:
+				var p points
+				if json.Unmarshal(frameData(s.f), &p) == nil {
+					if p.Instance == "m-dummy" {
+						if hpFirst < 0 {
+							hpFirst = p.HitPoints
+						}
+						hpLast = p.HitPoints
+					} else {
+						botPoints[p.Instance]++
+					}
+				}
+			case 27:
+				var h struct {
+					Instance string `json:"instance"`
+					Type     string `json:"type"`
+					Amount   int    `json:"amount"`
+				}
+				if json.Unmarshal(frameData(s.f), &h) == nil {
+					if h.Type == "hitpoints" && h.Amount >= 1 && h.Amount <= 40 {
+						heals++
+						healTargets[h.Instance]++
+					} else {
+						check(false, fmt.Sprintf("unexpected heal %+v", h))
+					}
+				}
+			case 47:
+				if len(s.f) < 3 {
+					continue
+				}
+				var opcode int
+				_ = json.Unmarshal(s.f[1], &opcode)
+				var e struct {
+					Instance string `json:"instance"`
+					Effect   int    `json:"effect"`
+				}
+				if opcode == 0 && json.Unmarshal(frameData(s.f), &e) == nil {
+					switch {
+					case e.Instance == "m-dummy" && e.Effect == 9:
+						boulders++
+					case e.Instance == "m-dummy" && e.Effect == 6:
+						fireballs++
+					case e.Effect == 5:
+						healingFX++
+					case e.Effect == 21 || e.Effect == 25:
+						buffFX[e.Instance]++
+					}
 				}
 			}
-		case 27:
-			var h struct {
-				Instance string `json:"instance"`
-				Type     string `json:"type"`
-				Amount   int    `json:"amount"`
-			}
-			if json.Unmarshal(frameData(s.f), &h) == nil {
-				if h.Type == "hitpoints" && h.Amount >= 1 && h.Amount <= 40 {
-					heals++
-					healTargets[h.Instance]++
-				} else {
-					check(false, fmt.Sprintf("unexpected heal %+v", h))
-				}
-			}
-		case 47:
-			if len(s.f) < 3 {
-				continue
-			}
-			var opcode int
-			_ = json.Unmarshal(s.f[1], &opcode)
-			var e struct {
-				Instance string `json:"instance"`
-				Effect   int    `json:"effect"`
-			}
-			if opcode == 0 && json.Unmarshal(frameData(s.f), &e) == nil {
-				switch {
-				case e.Instance == "m-dummy" && e.Effect == 9:
-					boulders++
-				case e.Instance == "m-dummy" && e.Effect == 6:
-					fireballs++
-				case e.Effect == 5:
-					healingFX++
-				case e.Effect == 21 || e.Effect == 25:
-					buffFX[e.Instance]++
-				}
-			}
+			processed = len(lastFrames)
 		}
 	}
-	fmt.Printf("  info: window=%v combatHits=%d autos=%v anims=%d sunders=%d volleys=%d storms=%d boulders=%d fireballs=%d hp=%d->%d heals=%d healTargets=%v healingFX=%d buffFX=%v botPoints=%v\n",
-		window, combatHits, autos, anims, len(sunderTimes), len(volleyTimes), len(stormTimes), boulders, fireballs, hpFirst, hpLast, heals, healTargets, healingFX, buffFX, botPoints)
+	t0 := time.Now()
+	drain(15 * time.Second)
+	process()
+	for time.Since(t0) < 120*time.Second && !(autos["p-warbot"] >= 5 && autos["p-archer"] >= 4 && autos["p-mage"] >= 3 && len(sunderTimes) >= 1 && len(volleyTimes) >= 3 && len(stormTimes) >= 1) {
+		drain(5 * time.Second)
+		process()
+	}
+	window := time.Since(t0)
+	fmt.Printf("  info: window=%v combatHits=%d autos=%v autoCrits=%v projectiles=%d projBad=%d anims=%d sunders=%d volleys=%d storms=%d boulders=%d fireballs=%d hp=%d->%d heals=%d healTargets=%v healingFX=%d buffFX=%v botPoints=%v\n",
+		window, combatHits, autos, autoCrits, projectiles, projBad, anims, len(sunderTimes), len(volleyTimes), len(stormTimes), boulders, fireballs, hpFirst, hpLast, heals, healTargets, healingFX, buffFX, botPoints)
 	lastFrames = nil
 
 	check(supportAttacks == 0, fmt.Sprintf("support never attacks boss (got %d)", supportAttacks))
 	check(autos["p-warbot"] >= 5, fmt.Sprintf("warrior autos ~1200ms (got %d in 15s)", autos["p-warbot"]))
 	check(autos["p-archer"] >= 4, fmt.Sprintf("archer autos ~1600ms (got %d in 15s)", autos["p-archer"]))
 	check(autos["p-mage"] >= 3, fmt.Sprintf("mage autos ~2000ms (got %d in 15s)", autos["p-mage"]))
-	check(rangedOK, "archer/mage hits carry ranged=true (projectile path)")
+	check(rangedOK, "archer/mage hits carry ranged=true (projectile impact path)")
+	check(projectiles >= 1, fmt.Sprintf("real projectiles fly (Spawn type 5 owner archer/mage -> m-dummy, got %d)", projectiles))
+	check(projBad == 0, fmt.Sprintf("no stray projectiles (got %d)", projBad))
 	check((hpFirst >= 0 && hpLast >= 0 && hpLast < hpFirst) || windowDeaths > 0,
 		fmt.Sprintf("boss HP drops via Points or dies mid-window (got %d->%d deaths=%d)", hpFirst, hpLast, windowDeaths))
 	check(combatHits >= 10, fmt.Sprintf("splat packets observed (Combat Hit ≥10, got %d)", combatHits))
