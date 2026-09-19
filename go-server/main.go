@@ -1281,14 +1281,8 @@ func combatSpawns() [][]any {
 	if d, ok := dummyData(); ok {
 		frames = append(frames, pkt(PacketSpawn, d))
 	}
-	ratMu.Lock()
-	dead := ratDead
-	var rat EntityData
-	if !dead {
-		rat = ratData()
-	}
-	ratMu.Unlock()
-	if !dead {
+	// M9: the rat is an engine mob — spawn frame reflects its live state.
+	if rat := m9RatEntity(); rat != nil {
 		frames = append(frames, pkt(PacketSpawn, rat))
 	}
 	return frames
@@ -1682,150 +1676,11 @@ const (
 
 var combatRatRespawnDelay = 10 * time.Second
 
-var (
-	ratMu   sync.Mutex
-	ratX    = combatRatX
-	ratY    = combatRatY
-	ratHP   = combatRatMaxHP
-	ratDead bool
-)
-
-func ratData() EntityData {
-	return EntityData{
-		Instance: combatRatInstance, Type: EntityMob, Key: "rat", Name: "Rat",
-		X: ratX, Y: ratY, Orientation: intp(OrientationDown),
-		Level: intp(1), HitPoints: intp(ratHP), MaxHitPoints: intp(combatRatMaxHP),
-		MovementSpeed: intp(450), AttackRange: intp(1),
-	}
-}
-
-func ratTeleportLocked() {
-	ratX, ratY = combatRatX, combatRatY
-	setEntityPos(combatRatInstance, ratX, ratY)
-	broadcast(pkt(PacketTeleport, teleportData{Instance: combatRatInstance, X: ratX, Y: ratY}))
-	log.Printf("combat: rat leashed back to spawn %d,%d", ratX, ratY)
-}
-
-// ratKillLocked/despawn + 10s respawn (mob handler.ts handleDeath shape:
-// Despawn now, Spawn at full HP later). No caller in slice 1 (nothing
-// damages the rat yet); kept for the M3 damage slices.
-func ratKillLocked() {
-	if ratDead {
-		return
-	}
-	ratDead = true
-	ratHP = 0
-	broadcast(pkt(PacketDespawn, despawnData{Instance: combatRatInstance}))
-	log.Printf("combat: rat died -> despawned, respawn in %v", combatRatRespawnDelay)
-	time.AfterFunc(combatRatRespawnDelay, ratRespawn)
-}
-
-func ratRespawn() {
-	ratMu.Lock()
-	ratHP = combatRatMaxHP
-	ratDead = false
-	ratX, ratY = combatRatX, combatRatY
-	payload := ratData()
-	ratMu.Unlock()
-	setEntityPos(combatRatInstance, combatRatX, combatRatY)
-	broadcast(pkt(PacketSpawn, payload))
-	log.Printf("combat: rat respawned full HP=%d", combatRatMaxHP)
-}
-
-func cheby(ax, ay, bx, by int) int {
-	dx := ax - bx
-	if dx < 0 {
-		dx = -dx
-	}
-	dy := ay - by
-	if dy < 0 {
-		dy = -dy
-	}
-	if dx > dy {
-		return dx
-	}
-	return dy
-}
-
-// ratTick is the 500ms AI loop: leash home beyond 10 tiles, else chase the
-// nearest player (connected heroes + 4 bots) within 6 tiles one step per
-// tick via Movement Move, holding at attack range 1 without attacking.
-func ratTick() {
-	ratMu.Lock()
-	defer ratMu.Unlock()
-	if ratDead {
-		return
-	}
-	if cheby(ratX, ratY, combatRatX, combatRatY) > combatRatLeash {
-		ratTeleportLocked()
-		return
-	}
-	px, py, ok := nearestPlayerTile(ratX, ratY)
-	if !ok || cheby(ratX, ratY, px, py) > combatRatAggro {
-		return
-	}
-	if cheby(ratX, ratY, combatRatX, combatRatY) > combatRatLeash {
-		ratTeleportLocked()
-		return
-	}
-	if cheby(ratX, ratY, px, py) <= 1 {
-		return
-	}
-	dx, dy := 0, 0
-	if px > ratX {
-		dx = 1
-	} else if px < ratX {
-		dx = -1
-	}
-	if py > ratY {
-		dy = 1
-	} else if py < ratY {
-		dy = -1
-	}
-	nx, ny := ratX+dx, ratY+dy
-	if blocked(nx, ny) {
-		if !blocked(ratX+dx, ratY) {
-			nx, ny = ratX+dx, ratY
-		} else if !blocked(ratX, ratY+dy) {
-			nx, ny = ratX, ratY+dy
-		} else {
-			return
-		}
-	}
-	ratX, ratY = nx, ny
-	setEntityPos(combatRatInstance, ratX, ratY)
-	broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
-		Instance: combatRatInstance, X: intp(ratX), Y: intp(ratY),
-	}))
-	log.Printf("combat: rat chases nearest player -> %d,%d", ratX, ratY)
-}
-
-// nearestPlayerTile returns the tile of the closest player (live heroes +
-// the 4 party bots) to (x,y).
-func nearestPlayerTile(x, y int) (int, int, bool) {
-	type pt struct{ x, y int }
-	cands := []pt{
-		{combatBotX, combatBotY},
-		{combatArcherX, combatArcherY},
-		{combatMageX, combatMageY},
-		{combatSupX, combatSupY},
-	}
-	playersMu.Lock()
-	for _, c := range players {
-		cands = append(cands, pt{c.sess.playerX, c.sess.playerY})
-	}
-	playersMu.Unlock()
-	best, bx, by := -1, 0, 0
-	for _, c := range cands {
-		if d := cheby(x, y, c.x, c.y); best < 0 || d < best {
-			best, bx, by = d, c.x, c.y
-		}
-	}
-	if best < 0 {
-		return 0, 0, false
-	}
-	return bx, by, true
-}
+// M9: the leash-demo rat's AI moved to the engine (m9.go). The legacy
+// per-instance rat state (ratMu/ratX/ratHP/ratTick/teleport/kill/respawn)
+// and the nearestPlayerTile helper are retired; combatSpawns() reads the
+// live engine mob instead (m9RatEntity), and the rat keeps its demo
+// semantics (forced chase, no strikes) via m9Overrides in m9AdoptExisting.
 
 func combatRespawn() {
 	combatMu.Lock()
@@ -1853,11 +1708,8 @@ func startCombat() {
 			combatBotHP[b] = combatBotMaxHP[b]
 		}
 		combatMu.Unlock()
-		ratMu.Lock()
-		ratX, ratY = combatRatX, combatRatY
-		ratHP = combatRatMaxHP
-		ratDead = false
-		ratMu.Unlock()
+		// M9: the leash-demo rat lives in the engine now (m9AdoptExisting at
+		// boot); no per-instance reset or 500ms AI ticker here.
 		go func() {
 			warAutoT := time.NewTicker(combatAutoRate(combatBotInstance))
 			defer warAutoT.Stop()
@@ -1875,8 +1727,6 @@ func startCombat() {
 			defer healT.Stop()
 			buffT := time.NewTicker(combatBuffMs * time.Millisecond)
 			defer buffT.Stop()
-			ratT := time.NewTicker(combatRatTickMs * time.Millisecond)
-			defer ratT.Stop()
 			for {
 				select {
 				case <-warAutoT.C:
@@ -1895,8 +1745,6 @@ func startCombat() {
 					combatHeal()
 				case <-buffT.C:
 					combatBuffTick()
-				case <-ratT.C:
-					ratTick()
 				}
 			}
 		}()
@@ -2110,7 +1958,7 @@ func resourceAt(x, y int) string {
 // blocked reports whether (x,y) rejects movement: static collision or a
 // resource-entity occupant (server map.isColliding:246-254).
 func blocked(x, y int) bool {
-	return tileBlocked(x, y) || resourceAt(x, y) != ""
+	return tileBlocked(x, y) || resourceAt(x, y) != "" || m10ChestItemsAt(x, y)
 }
 
 // session tracks one connection's player grid pos (from Welcome spawn,
@@ -2231,6 +2079,9 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 	if mv.Opcode == nil {
 		return false
 	}
+	// M6: any movement closes the store UI and revokes bank access
+	// (stores.ts storeOpen=none + player.ts canAccessContainer=false on move).
+	clearContainerAccess(c)
 	if mv.TargetInstance != "" {
 		s.target = mv.TargetInstance
 	}
@@ -2280,6 +2131,9 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 			setEntityPos(c.instance, s.playerX, s.playerY)
 			updateClientRegion(c)
 			m5TrackPos(c)
+			m8OnPositionUpdate(c)  // M8: lobby area enter/exit callbacks
+			m9OnPlayerMoved(c)     // M9: aggro scan on position update (Node detectAggro)
+			m10OnPositionUpdate(c) // M10: detectAreas parity (pvp/overlay/camera/music)
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
 			blocked(*mv.NextGridX, *mv.NextGridY) &&
@@ -2336,9 +2190,28 @@ func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 		m5Pickup(c, instance)
 		return
 	}
+	// M6: Target Talk(0) on an NPC -> store open / bank / talk text.
+	if opcode == TargetTalk && isNPCInstance(instance) {
+		m6HandleNPCTarget(c, instance)
+		return
+	}
+	// M10: Target Talk(0) on a chest entity -> openChest (player/incoming.ts
+	// handleTarget Talk branch: isChest() -> chest.openChest(player)).
+	if opcode == TargetTalk && !isNPCInstance(instance) {
+		if chest := m10ChestFor(instance); chest != nil {
+			m10OpenChest(c, chest)
+			return
+		}
+	}
 	if opcode == TargetObject && isResourceInstance(instance) {
 		hitResource(c.instance, instance)
 	}
+}
+
+// isNPCInstance reports whether the instance resolves to an npcs.json NPC
+// (showcase n-show-N keys map positionally onto showNPCs).
+func isNPCInstance(instance string) bool {
+	return m6ResolveNPCKey(nil, instance) != ""
 }
 
 // handleCombatReq routes one hero swing at a killable mob (M5); anything
@@ -2365,7 +2238,9 @@ func handleCombatReq(c *playerConn, frame clientFrame) {
 		return
 	}
 	log.Printf("combat instance=%s target=%s", cd.Instance, cd.Target)
-	if cd.Target == combatDummyInstance || cd.Target == combatRatInstance || cd.Target == "m1" {
+	// M9: any engine-registered mob is attackable; the legacy BossDummy
+	// path stays for the COMBAT party scene.
+	if m9MobFor(cd.Target) != nil || cd.Target == combatDummyInstance {
 		handlePlayerAttack(c, cd.Target)
 	}
 }
@@ -2528,6 +2403,22 @@ type playerConn struct {
 	outbox   chan []any // queued S->C frames, flushed by the tick loop
 	regions  []int      // current 9-region interest set
 	dropped  int        // overflow drops (outbox full)
+
+	// M6 store/bank/NPC-talk session state (stores.ts/handler.ts parity).
+	storeOpen          string // key of the currently open store ("" = none)
+	canAccessContainer bool   // banker-granted bank access (cleared on move)
+	talkNPC            string // last plain-NPC key talked to (talkIndex reset)
+	talkIndex          int    // current npc.talk() index for talkNPC
+
+	// M7 chat session state (player.chat parity).
+	rank int        // Modules.Ranks value (seeded for e2e only)
+	chat *chatState // rate limiter + global cooldown + rank cache
+
+	// M8 minigame session state (player.minigame/team/coursing* parity).
+	m8Game   string // "coursing"|"teamwar" when playing (player.minigame)
+	m8Team   int    // Team enum value for the active game
+	m8Score  int    // coursingScore mirror (score packets + persistence)
+	m8Target string // coursingTarget (pointer entity)
 }
 
 var (
@@ -2601,7 +2492,8 @@ func clientInterested(c *playerConn, x, y int) bool {
 // or unicasts as before.
 func regionScoped(id int) bool {
 	switch id {
-	case PacketSpawn, PacketMovement, PacketAnimation, PacketCombat, PacketResource, PacketEffect:
+	case PacketSpawn, PacketMovement, PacketAnimation, PacketCombat, PacketResource, PacketEffect,
+		PacketChat, PacketDeath, PacketRespawn: // M9: Death/Respawn ride region scoping
 		return true
 	}
 	return false
@@ -2803,6 +2695,12 @@ func removeClient(conn *websocket.Conn) {
 	entitiesMu.Lock()
 	delete(entities, c.instance)
 	entitiesMu.Unlock()
+	// M8: leave the minigame (disconnect() kicks to lobby position).
+	m8OnDisconnect(c)
+	// M9: drop HP state + release any mob targeting this player.
+	m9PlayerLeave(c)
+	// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
+	m10ForgetPlayer(c.instance)
 	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
 	m5SaveSync(c.username)
 	_ = conn.Close()
@@ -2892,6 +2790,16 @@ func hitResource(attacker, instance string) {
 	}
 	log.Printf("resource %s exhausted: +%d %s xp (M5 hook, key %s item %s)",
 		instance, info.Experience, skill, desc.Key, info.Item)
+	// M6 (resourceskill.ts:114-118 order): the table item lands in the
+	// inventory BEFORE the skill XP — a full inventory would swallow the XP.
+	if ci := connByInstance(attacker); ci != nil && info.Item != "" {
+		idx := m5AddItem(ci.username, info.Item, 1)
+		_ = send(ci.conn, pktOp(PacketContainer, ContainerAdd, containerData{
+			Type: ContainerTypeInventory,
+			Slot: &slotData{Index: idx, Key: info.Item, Count: 1, Enchantments: map[string]any{}},
+		}))
+		markDirty(ci.username)
+	}
 	// M5: table experience lands on the real gathering skill.
 	m5GatherXP(attacker, skill, info.Experience)
 	resMu.Lock()
@@ -3014,19 +2922,6 @@ func handleSyncReq(c *playerConn, frame clientFrame) {
 	log.Printf("sync forward instance=%s", inst)
 }
 
-// handleEquipmentReq records a C->S Equipment frame and emits the Sync
-// other-player broadcast (server handler.ts handleEquipment -> sync()).
-func handleEquipmentReq(c *playerConn, frame clientFrame) {
-	if len(frame) < 2 {
-		return
-	}
-	log.Printf("equipment instance=%s", c.instance)
-	// Re-announce appearance to region neighbours as a Sync packet.
-	ph := welcomePlayer(c.instance)
-	ph.X, ph.Y = c.sess.playerX, c.sess.playerY
-	broadcast(pkt(PacketSync, ph))
-}
-
 // spawnPayload rebuilds the Spawn payload for a known instance: live resources
 // honour depleted state; players echo their Welcome shape at the registry
 // pos; statics echo their scenario definition.
@@ -3073,6 +2968,9 @@ func spawnPayload(instance string) (any, bool) {
 			playersMu.Unlock()
 			ph := welcomePlayer(instance)
 			ph.X, ph.Y = x, y
+			// M10: Spawn PlayerData.pvp mirrors the live PVP state
+			// (player.ts serialize).
+			ph.Pvp = m10PVPState(instance)
 			return ph, true
 		}
 	}
@@ -3257,7 +3155,11 @@ func handleConn(conn *websocket.Conn) {
 				}
 			case PacketLogin: // C Login (opcode lives inside data) -> Welcome + Map only
 				var login struct {
-					Username string `json:"username"`
+					Username  string `json:"username"`
+					SeedGold  int    `json:"seedGold,omitempty"`
+					SeedArrow int    `json:"seedArrow,omitempty"`
+					SeedRank  int    `json:"seedRank,omitempty"`
+					SeedPos   []int  `json:"seedPos,omitempty"`
 				}
 				if len(frame) >= 2 {
 					_ = json.Unmarshal(frame[1], &login)
@@ -3265,6 +3167,51 @@ func handleConn(conn *websocket.Conn) {
 				// M5: Welcome from DB when the login username is known, else
 				// fresh; Container/Skill batches restore visible state.
 				ph, extra := m5LoginWelcome(c, login.Username)
+				// M6 e2e hook (TESTMAP only): seedGold tops the account up to N
+				// gold before the Container batch is built, giving the harness a
+				// deterministic wallet (Node e2e accounts start pre-loaded).
+				if login.SeedGold > 0 && testMode && !cleanMode && !combatMode {
+					m6SeedGold(c.username, login.SeedGold)
+					extra = append(extra, pktOp(PacketContainer, ContainerBatch, containerData{
+						Type: ContainerTypeInventory,
+						Data: &containerBatch{Slots: m6InvSlots(c.username)},
+					}))
+				}
+				// M6 equipment e2e hook (TESTMAP only): seedArrow appends a
+				// fresh arrow stack so the harness gets a deterministic slot
+				// index (arrows are Equipment.Arrows-equippable).
+				if login.SeedArrow > 0 && testMode && !cleanMode && !combatMode {
+					arrowIdx := m6SeedItem(c.username, "arrow", login.SeedArrow)
+					extra = append(extra, pktOp(PacketContainer, ContainerAdd, containerData{
+						Type: ContainerTypeInventory,
+						Slot: &slotData{Index: arrowIdx, Key: "arrow", Count: login.SeedArrow, Enchantments: map[string]any{}},
+					}))
+				}
+				// M7 e2e hook (TESTMAP only): seedRank grants a rank so the
+				// harness can exercise the mod/admin command tables without
+				// persistent account plumbing.
+				if login.SeedRank > 0 && testMode && !cleanMode && !combatMode {
+					chatStateFor(c).rank = login.SeedRank
+					c.rank = login.SeedRank
+				}
+				// M8 e2e hook (TESTMAP only): seedPos teleports the freshly
+				// logged-in player to a tile (usually inside a minigame lobby
+				// area) so the harness skips the long walk from spawn.
+				if len(login.SeedPos) == 2 && testMode && !cleanMode && !combatMode {
+					x, y := login.SeedPos[0], login.SeedPos[1]
+					c.sess.playerX, c.sess.playerY = x, y
+					setEntityPos(c.instance, x, y)
+					updateClientRegion(c)
+					markDirty(c.username)
+					ph.X, ph.Y = x, y
+					extra = append(extra, pkt(PacketTeleport, teleportData{Instance: c.instance, X: x, Y: y}))
+					// M8: the position change may cross a lobby area boundary
+					// (onEnter parity for the seeded tile).
+					m8OnPositionUpdate(c)
+					// M10: seed area state (pvp/overlay/camera/song) so the
+					// Welcome Spawn carries the right pvp flag.
+					m10OnPositionUpdate(c)
+				}
 				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
 				if err := send(conn, frames...); err != nil {
 					log.Printf("write welcome/map: %v", err)
@@ -3278,8 +3225,21 @@ func handleConn(conn *websocket.Conn) {
 				handleWho(conn, frame)
 			case PacketSync: // C Sync PlayerData -> forward to region neighbours
 				handleSyncReq(c, frame)
-			case PacketEquipment: // C Equipment -> Sync broadcast
-				handleEquipmentReq(c, frame)
+			case PacketChat: // C Chat [text] -> sanitize, commands, region bubble (M7)
+				m7HandleChat(c, frame)
+			case PacketMinigame: // C Minigame {m8test|m9test|m10test} -> test hooks (M8-M10 TESTMAP)
+				m8HandleTest(c, frame)
+				m10HandleTest(c, frame)
+				if len(frame) >= 2 {
+					var probe map[string]json.RawMessage
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m9test"] != nil {
+						m9TestHandler(c, frame[1])
+					}
+				}
+			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
+				m6HandleEquipment(c, frame)
+			case PacketRespawn: // C Respawn [] -> player.respawn (M9)
+				m9HandleRespawn(c)
 			case PacketMovement: // C [11,{opcode,...}] -> Stop/Teleport on blocked tiles
 				if len(frame) < 2 {
 					continue
@@ -3291,8 +3251,12 @@ func handleConn(conn *websocket.Conn) {
 				if disconnect := handleMovement(conn, c, mv); disconnect {
 					return
 				}
-			case PacketTarget: // C Target [opcode, instance] -> gather on that resource
+			case PacketTarget: // C Target [opcode, instance] -> gather / loot / NPC talk
 				handleTarget(conn, c, frame)
+			case PacketStore: // C Store {opcode,key,index,count} -> Buy/Sell/Select (M6)
+				m6HandleStore(c, frame)
+			case PacketContainer: // C Container {opcode,...} -> bank moves/swap/drop (M6)
+				m6HandleContainer(c, frame)
 			case PacketCombat: // C Combat {instance,target} -> hero swing on killables
 				handleCombatReq(c, frame)
 			case PacketAnimation: // C Animation {resourceInstance} -> chop on that oak
@@ -3306,6 +3270,11 @@ func handleConn(conn *websocket.Conn) {
 
 func main() {
 	m5Init()
+	m6StartStoreTicker() // M6: stores.json registry + 20s stock refresh
+	m8LoadGames()        // M8: world.json minigame areas + 1s tick engines
+	m10LoadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
+	m10InjectTestAreas() // M10: TESTMAP synthetic area bands for the e2e
+	m9Engine()           // M9: mob AI engine (mobs.json/spawns.json, 500ms tick)
 	startTickLoop()
 	initEntities()
 	startShowcase()

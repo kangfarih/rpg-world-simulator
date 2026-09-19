@@ -34,6 +34,17 @@ CLEAN=1 go run . &         # restart server first
 go run ./e2e/clean         # clean check
 ```
 
+Milestone harnesses (each against a TESTMAP=1 server; use a fresh DB per
+run, e.g. `DB_PATH=/tmp/e2e.db`, since logins restore persisted positions):
+
+```sh
+go run ./e2e/m6                 # stores/bank/NPC/persistence
+go run ./e2e/m7                 # chat + rank-gated commands
+go run ./e2e/m8                 # minigames lobby/queue/score
+M9_MOBDMG=10 go run ./e2e/m9    # mob AI aggro/death/leash/kill
+go run ./e2e/m10                # areas music/overlay/pvp/camera + chest flow
+```
+
 ## Docs
 
 See `docs/`: `SPEC.md`, `CLIENT-ASSETS.md`, `GO-SERVER-PLAN.md`,
