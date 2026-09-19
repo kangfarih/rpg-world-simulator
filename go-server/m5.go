@@ -385,6 +385,8 @@ type m5State struct {
 	Level  int
 	HP     int
 	Inv    []m5Slot
+	Bank   []m5Slot
+	Equip  []m5Slot // length ModulesEquipmentCount; Count 0 = empty slot
 	Skills map[int]*m5Skill
 }
 
@@ -451,6 +453,13 @@ func m5StateFor(key string) *m5State {
 	}
 	if st.Skills == nil {
 		st.Skills = map[int]*m5Skill{}
+	}
+	// Equipment is a fixed 12-slot array (Modules.Equipment): nil or short
+	// slices would panic on slot indexing, so normalize lazily here.
+	if len(st.Equip) != ModulesEquipmentCount {
+		eq := make([]m5Slot, ModulesEquipmentCount)
+		copy(eq, st.Equip)
+		st.Equip = eq
 	}
 	return st
 }
@@ -669,6 +678,16 @@ func m5TrackPos(c *playerConn) {
 	markDirty(c.username)
 }
 
+// m5RegisterLoot adds a pre-built loot entry to the registry without any
+// timers (M10 chest drops: persistent items with no blink/expiry — Node
+// chest items never expire on their own). Pickup routing is shared.
+func m5RegisterLoot(inst, key string, count, x, y int, owner string) {
+	lootMu.Lock()
+	loots[inst] = &m5Loot{Instance: inst, Bag: false, Items: []m5Drop{{Key: key, Count: count}}, X: x, Y: y, Owner: owner}
+	lootMu.Unlock()
+	setEntityPos(inst, x, y)
+}
+
 // m5IsLoot reports whether id is a live loot entity.
 func m5IsLoot(id string) bool {
 	lootMu.Lock()
@@ -718,11 +737,30 @@ func m5MobMaxHP(instance, mobKey string) int {
 // handlePlayerAttack routes one hero swing at the combat rat, the boss dummy,
 // or the plain-mode rat. Damage pipeline mirrors applyBossHitLocked
 // (Animation + Combat Hit + Points); mob death uses the Despawn path.
+// M9: engine-registered mobs (m-rat-1, m1, any m9test spawn) take the
+// mob.ts/handler.ts path (Points + retaliate + engine respawn) instead of
+// the legacy per-instance blocks.
 func handlePlayerAttack(c *playerConn, target string) {
 	if target == "" || c == nil {
 		return
 	}
 	dmg := 8 + rand.Intn(5)
+	// M9: engine mobs first — Points/retaliate/death/respawn/loot live in
+	// the engine now (m9PlayerHit -> m9KillMob -> m5SpawnLoot).
+	if m := m9MobFor(target); m != nil {
+		if m.dead {
+			log.Printf("m5: %s swings at dead %s (ignored)", c.instance, target)
+			return
+		}
+		broadcast(pkt(PacketAnimation, animationData{Instance: c.instance, Action: ActionAttack}))
+		broadcast(pktOp(PacketCombat, CombatHit, combatData{
+			Instance: c.instance, Target: target,
+			Hit: HitData{Type: HitsNormal, Damage: dmg},
+		}))
+		m9PlayerHit(m, c, dmg)
+		m5AwardCombatXP(c, c.username, dmg, false, false)
+		return
+	}
 	switch target {
 	case combatDummyInstance:
 		combatMu.Lock()
@@ -738,72 +776,10 @@ func handlePlayerAttack(c *playerConn, target string) {
 		if died {
 			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.instance)
 		}
-	case combatRatInstance:
-		ratMu.Lock()
-		if ratDead {
-			ratMu.Unlock()
-			log.Printf("m5: %s swings at dead rat (ignored)", c.instance)
-			return
-		}
-		cx, cy := ratX, ratY
-		ratHP -= dmg
-		if ratHP < 0 {
-			ratHP = 0
-		}
-		hp := ratHP
-		broadcast(pkt(PacketAnimation, animationData{Instance: c.instance, Action: ActionAttack}))
-		broadcast(pktOp(PacketCombat, CombatHit, combatData{
-			Instance: c.instance, Target: combatRatInstance,
-			Hit: HitData{Type: HitsNormal, Damage: dmg},
-		}))
-		broadcast(pkt(PacketPoints, pointsData{
-			Instance: combatRatInstance, HitPoints: intp(hp), MaxHitPoints: intp(combatRatMaxHP),
-		}))
-		log.Printf("m5: %s hit rat dmg=%d hp=%d/%d", c.instance, dmg, hp, combatRatMaxHP)
-		if hp <= 0 {
-			ratKillLocked()
-		}
-		ratMu.Unlock()
-		m5AwardCombatXP(c, c.username, dmg, false, false)
-		if hp <= 0 {
-			m5SpawnLoot("rat", cx, cy, c.instance)
-		}
-	case "m1":
-		mobHPMu.Lock()
-		hp, ok := mobHP[target]
-		if !ok {
-			hp = m5MobMaxHP(target, "rat")
-		}
-		if hp <= 0 {
-			mobHPMu.Unlock()
-			return
-		}
-		hp -= dmg
-		if hp < 0 {
-			hp = 0
-		}
-		mobHP[target] = hp
-		mobHPMu.Unlock()
-		broadcast(pkt(PacketAnimation, animationData{Instance: c.instance, Action: ActionAttack}))
-		broadcast(pktOp(PacketCombat, CombatHit, combatData{
-			Instance: c.instance, Target: target,
-			Hit: HitData{Type: HitsNormal, Damage: dmg},
-		}))
-		broadcast(pkt(PacketPoints, pointsData{
-			Instance: target, HitPoints: intp(hp), MaxHitPoints: intp(m5MobMaxHP(target, "rat")),
-		}))
-		m5AwardCombatXP(c, c.username, dmg, false, false)
-		if hp <= 0 {
-			x, y, _ := entityPos(target)
-			entitiesMu.Lock()
-			delete(entities, target)
-			entitiesMu.Unlock()
-			broadcast(pkt(PacketDespawn, despawnData{Instance: target}))
-			m5SpawnLoot("rat", x, y, c.instance)
-			log.Printf("m5: m1 died (no respawn in plain mode)")
-		}
 	default:
-		log.Printf("m5: %s attacks %s (not killable in slice 1)", c.instance, target)
+		// M9: engine-registered mobs were handled above; anything else is
+		// not killable (legacy note kept from slice 1).
+		log.Printf("m5: %s attacks %s (not killable)", c.instance, target)
 	}
 }
 
@@ -840,6 +816,8 @@ func m5Init() {
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS players(instance TEXT PRIMARY KEY, name TEXT, x INT, y INT, level INT, hp INT, data TEXT)`,
 		`CREATE TABLE IF NOT EXISTS inventory(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
+		`CREATE TABLE IF NOT EXISTS bank(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
+		`CREATE TABLE IF NOT EXISTS equipment(player TEXT, type INT, item TEXT, count INT, PRIMARY KEY(player, type))`,
 		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
@@ -883,6 +861,8 @@ func m5Snapshot(key string) *m5State {
 	}
 	cp := &m5State{X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Skills: map[int]*m5Skill{}}
 	cp.Inv = append(cp.Inv, st.Inv...)
+	cp.Bank = append(cp.Bank, st.Bank...)
+	cp.Equip = append(cp.Equip, st.Equip...)
 	for id, s := range st.Skills {
 		cp.Skills[id] = &m5Skill{Level: s.Level, XP: s.XP}
 	}
@@ -890,12 +870,23 @@ func m5Snapshot(key string) *m5State {
 }
 
 func writePlayer(key string, st *m5State) {
-	extra, _ := json.Marshal(map[string]any{"equip": []any{}})
+	extra := map[string]any{"equip": []any{}}
+	if len(st.Equip) > 0 {
+		eqs := make([]any, 0, len(st.Equip))
+		for t, e := range st.Equip {
+			if e.Key == "" || e.Count < 1 {
+				continue
+			}
+			eqs = append(eqs, map[string]any{"type": t, "key": e.Key, "count": e.Count})
+		}
+		extra["equip"] = eqs
+	}
+	extraRaw, _ := json.Marshal(extra)
 	if _, err := dbConn.Exec(
 		`INSERT INTO players(instance,name,x,y,level,hp,data) VALUES(?,?,?,?,?,?,?) `+
 			`ON CONFLICT(instance) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y,`+
 			`level=excluded.level,hp=excluded.hp,data=excluded.data`,
-		key, key, st.X, st.Y, st.Level, st.HP, string(extra)); err != nil {
+		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw)); err != nil {
 		log.Printf("m5: save players %s: %v", key, err)
 		return
 	}
@@ -907,6 +898,31 @@ func writePlayer(key string, st *m5State) {
 		if _, err := dbConn.Exec(
 			`INSERT INTO inventory(player,slot,item,count) VALUES(?,?,?,?)`, key, i, s.Key, s.Count); err != nil {
 			log.Printf("m5: save inventory %s: %v", key, err)
+			return
+		}
+	}
+	if _, err := dbConn.Exec(`DELETE FROM bank WHERE player=?`, key); err != nil {
+		log.Printf("m5: clear bank %s: %v", key, err)
+		return
+	}
+	for i, s := range st.Bank {
+		if _, err := dbConn.Exec(
+			`INSERT INTO bank(player,slot,item,count) VALUES(?,?,?,?)`, key, i, s.Key, s.Count); err != nil {
+			log.Printf("m5: save bank %s: %v", key, err)
+			return
+		}
+	}
+	if _, err := dbConn.Exec(`DELETE FROM equipment WHERE player=?`, key); err != nil {
+		log.Printf("m5: clear equipment %s: %v", key, err)
+		return
+	}
+	for t, e := range st.Equip {
+		if e.Key == "" || e.Count < 1 {
+			continue
+		}
+		if _, err := dbConn.Exec(
+			`INSERT INTO equipment(player,type,item,count) VALUES(?,?,?,?)`, key, t, e.Key, e.Count); err != nil {
+			log.Printf("m5: save equipment %s: %v", key, err)
 			return
 		}
 	}
@@ -928,27 +944,38 @@ func flushDirty() {
 	if dbConn == nil {
 		return
 	}
+	// Lock discipline: never hold dbMu and pstateMu at the same time
+	// (m5Snapshot needs pstateMu). Snapshot first, then write under dbMu.
 	dbMu.Lock()
-	defer dbMu.Unlock()
+	keys := make([]string, 0, len(dirty))
 	for key := range dirty {
-		if st := m5Snapshot(key); st != nil {
+		keys = append(keys, key)
+	}
+	dbMu.Unlock()
+	for _, key := range keys {
+		st := m5Snapshot(key)
+		dbMu.Lock()
+		if st != nil {
 			writePlayer(key, st)
 		}
 		delete(dirty, key)
+		dbMu.Unlock()
 	}
 }
 
 // m5SaveSync flushes one player immediately (disconnect path).
+// Lock discipline: never hold dbMu and pstateMu at the same time.
 func m5SaveSync(key string) {
 	if dbConn == nil || key == "" {
 		return
 	}
+	st := m5Snapshot(key)
 	dbMu.Lock()
-	defer dbMu.Unlock()
-	if st := m5Snapshot(key); st != nil {
+	if st != nil {
 		writePlayer(key, st)
 	}
 	delete(dirty, key)
+	dbMu.Unlock()
 }
 
 // m5Load restores a player row (Welcome from DB when the instance is known).
@@ -981,6 +1008,44 @@ func m5Load(key string) (*m5State, bool) {
 		st.Inv = append(st.Inv, m5Slot{Key: k, Count: c})
 	}
 	rows.Close()
+	brows, err := dbConn.Query(`SELECT item,count FROM bank WHERE player=? ORDER BY slot`, key)
+	if err != nil {
+		return nil, false
+	}
+	for brows.Next() {
+		var k string
+		var c int
+		if err := brows.Scan(&k, &c); err != nil {
+			continue
+		}
+		st.Bank = append(st.Bank, m5Slot{Key: k, Count: c})
+	}
+	brows.Close()
+	if erows, err := dbConn.Query(`SELECT type,item,count FROM equipment WHERE player=?`, key); err == nil {
+		st.Equip = make([]m5Slot, ModulesEquipmentCount)
+		for erows.Next() {
+			var t int
+			var k string
+			var c int
+			if err := erows.Scan(&t, &k, &c); err != nil {
+				continue
+			}
+			if t < 0 || t >= ModulesEquipmentCount {
+				continue
+			}
+			st.Equip[t] = m5Slot{Key: k, Count: c}
+		}
+		erows.Close()
+	} else {
+		st.Equip = nil // pre-equipment DB: Welcome still works, table lazily created
+	}
+	// Normalize the fixed 12-slot equipment array even when the row is
+	// missing (pre-equipment DBs): slot indexing must never panic.
+	if len(st.Equip) != ModulesEquipmentCount {
+		eq := make([]m5Slot, ModulesEquipmentCount)
+		copy(eq, st.Equip)
+		st.Equip = eq
+	}
 	srows, err := dbConn.Query(`SELECT skill,level,xp FROM skills WHERE player=?`, key)
 	if err != nil {
 		return nil, false
@@ -996,7 +1061,7 @@ func m5Load(key string) (*m5State, bool) {
 	pstateMu.Lock()
 	pstates[key] = st
 	pstateMu.Unlock()
-	log.Printf("m5: loaded %s (pos %d,%d level %d inv %d skills %d)", key, st.X, st.Y, st.Level, len(st.Inv), len(st.Skills))
+	log.Printf("m5: loaded %s (pos %d,%d level %d inv %d bank %d skills %d)", key, st.X, st.Y, st.Level, len(st.Inv), len(st.Bank), len(st.Skills))
 	return st, true
 }
 
@@ -1053,6 +1118,30 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		extra = append(extra, pktOp(PacketSkill, SkillBatch, map[string]any{
 			"skills": skills, "cheater": false,
 		}))
+	}
+	if len(st.Bank) > 0 {
+		bslots := make([]any, 0, len(st.Bank))
+		for i, s := range st.Bank {
+			bslots = append(bslots, map[string]any{
+				"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+			})
+		}
+		extra = append(extra, pktOp(PacketContainer, ContainerBatch, containerData{
+			Type: ContainerTypeBank, Data: &containerBatch{Slots: bslots},
+		}))
+	}
+	// Equipment restore: Batch frame with the equipped entries (client
+	// player.equip each -> sprites + profile). Empty slots are omitted,
+	// matching Node's DB loader (skips falsy keys).
+	eqs := make([]any, 0, len(st.Equip))
+	for t, e := range st.Equip {
+		if e.Key == "" || e.Count < 1 {
+			continue
+		}
+		eqs = append(eqs, m6EquipmentData(t, e.Key, e.Count, true))
+	}
+	if len(eqs) > 0 {
+		extra = append(extra, pktOp(PacketEquipment, EquipmentBatch, equipBatchData{Equipments: eqs}))
 	}
 	return ph, extra
 }

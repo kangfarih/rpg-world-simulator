@@ -68,10 +68,13 @@ const (
 	PacketCrafting     = 54
 	PacketInterface    = 55
 	PacketLootBag      = 56
-	PacketCountdown    = 57
-	PacketPet          = 58
-	PacketResource     = 59
-	PacketAdminSync    = 60
+
+	// M9 mob AI: welcomePlayer()'s live HP mirrors for Spawn/Respawn frames.
+	// (kept here so the frame shapes stay with the packet constants)
+	PacketCountdown = 57
+	PacketPet       = 58
+	PacketResource  = 59
+	PacketAdminSync = 60
 )
 
 // Entity types (packages/common/network/modules.ts EntityType: Player0 NPC1
@@ -125,6 +128,13 @@ type serverMovement struct {
 	Instance string `json:"instance"`
 	X        *int   `json:"x,omitempty"`
 	Y        *int   `json:"y,omitempty"`
+}
+
+// M9 respawn frame (respawn.ts RespawnPacketData): [32,{x,y}] to the
+// respawning client only.
+type respawnData struct {
+	X int `json:"x"`
+	Y int `json:"y"`
 }
 
 // teleportData mirrors TeleportPacketData (common/network/impl/teleport.ts):
@@ -258,6 +268,28 @@ const (
 	EquipmentStyle   = 3
 )
 
+// Modules.Equipment size (modules.ts:132-145 -- Helmet0..Boots11, 12 slots).
+const ModulesEquipmentCount = 12
+
+// equipBatchData mirrors SerializedEquipment (impl/equipment.ts): the
+// Equipment Batch payload {data:{equipments:[...]}}. Each entry is an
+// EquipmentData (impl/equipment.ts): {type, key, count, enchantments} plus
+// the clientInfo extras (name/poisonous/stats) for Equip echoes; the client
+// applies each via player.equip (connection.ts handleEquipment Batch).
+type equipBatchData struct {
+	Equipments []any `json:"equipments"`
+}
+
+// clientEquipment mirrors the C->S Equipment frame payload:
+// [8,{opcode,type|style}] (client menu.ts handleProfileUnequip sends
+// {opcode:2,type} / handleProfileAttackStyle {opcode:3,style}; server
+// incoming.ts handleEquipment reads opcode + type/style).
+type clientEquipment struct {
+	Opcode int  `json:"opcode,omitempty"`
+	Type   *int `json:"type,omitempty"`
+	Style  *int `json:"style,omitempty"`
+}
+
 // Resource states (Modules.ResourceState: Default0 Depleted1).
 const (
 	ResourceStateDefault  = 0
@@ -266,7 +298,9 @@ const (
 
 // Target opcodes (Opcodes.Target: Talk0 Attack1 None2 Object3). Resources use
 // Object: client player/handler.ts getTargetType returns Object for resources.
+// NPCs use Talk: getTargetType returns Talk for NPCs (M6 talk routing).
 const (
+	TargetTalk   = 0
 	TargetAttack = 1
 	TargetObject = 3
 )
@@ -400,13 +434,18 @@ type RegionTile struct {
 	Cur  string `json:"cur,omitempty"`
 }
 
-// Container opcodes (Opcodes.Container: Batch0 Add1 Remove2 ...) + the
-// Inventory container type (Modules.ContainerType: Bank0 Inventory1 ...).
+// Container opcodes (Opcodes.Container: Batch0 Add1 Remove2 Select3 Swap4)
+// + container types (Modules.ContainerType: Bank0 Inventory1 Trade2
+// LootBag3). Select is the bank deposit/withdraw move (client bank.ts
+// selectCallback -> menu.ts handleBankSelect [21,3,{type:0,...}]).
 const (
 	ContainerBatch  = 0
 	ContainerAdd    = 1
 	ContainerRemove = 2
+	ContainerSelect = 3
+	ContainerSwap   = 4
 
+	ContainerTypeBank      = 0
 	ContainerTypeInventory = 1
 )
 
@@ -415,6 +454,94 @@ const (
 	ExperienceSync  = 0
 	ExperienceSkill = 1
 )
+
+// Store opcodes (Opcodes.Store: Open0 Close1 Buy2 Sell3 Update4 Select5).
+const (
+	StoreOpen   = 0
+	StoreClose  = 1
+	StoreBuy    = 2
+	StoreSell   = 3
+	StoreUpdate = 4
+	StoreSelect = 5
+)
+
+// NPC opcodes (Opcodes.NPC: Talk0 Store1 Bank2 Enchant3 Countdown4).
+const (
+	NPCTalk  = 0
+	NPCStore = 1
+	NPCBank  = 2
+)
+
+// Notification opcodes (Opcodes.Notification: Ok0 YesNo1 Text2 Popup3).
+const (
+	NotificationText = 2
+)
+
+// Modules.Constants (modules.ts:621-629) used by the M6 slice.
+const (
+	ModulesInventorySize = 25
+	ModulesBankSize      = 420
+	ModulesMaxStack      = 2147483647
+	StoreRefreshInterval = 20 // seconds, STORE_UPDATE_FREQUENCY
+)
+
+// storeItemData mirrors SerializedStoreItem (impl/store.ts:27-33).
+type storeItemData struct {
+	Key   string `json:"key"`
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+	Price int    `json:"price"`
+	Index *int   `json:"index,omitempty"`
+}
+
+// storePacketData mirrors StorePacketData (impl/store.ts:36-42).
+type storePacketData struct {
+	Key      *string         `json:"key,omitempty"`
+	Currency *string         `json:"currency,omitempty"`
+	Item     *storeItemData  `json:"item,omitempty"`
+	Items    []storeItemData `json:"items,omitempty"`
+}
+
+// npcPacketData mirrors NPCPacketData (impl/npc.ts:8-12): Bank carries the
+// serialized bank container {slots:[...]}.
+type npcPacketData struct {
+	Instance *string    `json:"instance,omitempty"`
+	Text     *string    `json:"text,omitempty"`
+	Slots    []slotData `json:"slots,omitempty"`
+}
+
+// notificationPacketData mirrors NotificationPacketData
+// (impl/notification.ts:5-11); notify() sends opcode Text.
+type notificationPacketData struct {
+	Title   *string `json:"title,omitempty"`
+	Message string  `json:"message"`
+	Colour  *string `json:"colour,omitempty"`
+	Source  *string `json:"source,omitempty"`
+}
+
+// clientStore mirrors the C->S Store frame payload: [40,{opcode,key,index,
+// count}] (client menu.ts handleStoreSelect + socket.send [Packets.Store,
+// data] -> server incoming.ts handleStore).
+type clientStore struct {
+	Opcode *int   `json:"opcode,omitempty"`
+	Key    string `json:"key,omitempty"`
+	Index  *int   `json:"index,omitempty"`
+	Count  *int   `json:"count,omitempty"`
+}
+
+// clientContainer mirrors the C->S Container frame payload:
+// [21,{opcode,type,fromContainer?,fromIndex,toContainer?,value}]
+// (client menu.ts handleBankSelect / inventory drop + swap; server
+// incoming.ts handleContainer reads type/fromContainer/fromIndex/toContainer/
+// value).
+type clientContainer struct {
+	Opcode        *int `json:"opcode,omitempty"`
+	Type          *int `json:"type,omitempty"`
+	FromContainer *int `json:"fromContainer,omitempty"`
+	FromIndex     *int `json:"fromIndex,omitempty"`
+	ToContainer   *int `json:"toContainer,omitempty"`
+	Value         *int `json:"value,omitempty"`
+}
 
 // Skill opcodes (Opcodes.Skill: Batch0 Update1).
 const (
