@@ -269,6 +269,19 @@ func main() {
 	check(arrowIdx >= 0, fmt.Sprintf("seedArrow -> arrow stack at inventory slot %d", arrowIdx))
 	lastFrames = nil
 
+	// --- M11 claim release: NPC talk order is quest -> achievement -> store
+	// (handler.handleTalkToNPC parity), and forestnpc fronts the foresting
+	// quest plus the ratinfestation achievement until both finish — they
+	// would swallow the forester store leg below. Finish both server-side.
+	for _, rel := range []string{
+		`[46,{"m11test":"setstage","key":"foresting","stage":3}]`,
+		`[46,{"m11test":"setach","key":"ratinfestation","stage":21}]`,
+	} {
+		send(conn, rel)
+		drain(700 * time.Millisecond)
+	}
+	lastFrames = nil
+
 	// --- Walk to the showcase NPC grid (agent = n-show-1) and talk. ---
 	fmt.Println("walking to agent (n-show-1)...")
 	walkTo(conn, agentX, agentY) // agent tile; adjacent counts (lenient talk gate)

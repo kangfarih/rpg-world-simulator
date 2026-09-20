@@ -109,6 +109,7 @@ type m5DropJSON struct {
 	Chance      int    `json:"chance"`
 	Count       int    `json:"count"`
 	Quest       string `json:"quest"`
+	Status      string `json:"status"`
 	Achievement string `json:"achievement"`
 }
 
@@ -168,14 +169,15 @@ func loadM5Tables() {
 
 // m5RollEntry ports mob.getRandomItem: pick one entry uniformly, fix counts
 // for gold/flask/arrow/feather, then roll chance vs DROP_PROBABILITY.
-// Quest/achievement-gated entries are skipped (no quest engine in slice 1).
+// Quest/achievement-gated entries roll only when the gate passes (M11:
+// m11DropGated activates the codersglitch skeleton talisman etc.); gated
+// entries never selected uniformly — Node filters them from the pool first
+// (fullfillsQuest), so the gate check happens before the uniform pick.
 func m5RollEntry(entries []m5DropJSON, level int) (key string, count int, ok bool) {
-	avail := entries[:0:0]
-	for _, e := range entries {
-		if e.Quest == "" && e.Achievement == "" {
-			avail = append(avail, e)
-		}
-	}
+	// Gate filtering moved to m5RollEntryGated (M11: quest/achievement gates
+	// evaluate against the killer's progression, mob.getRandomItem receives
+	// the player). This function rolls uniformly over the entries given.
+	avail := entries
 	if len(avail) == 0 {
 		return "", 0, false
 	}
@@ -215,6 +217,14 @@ type m5Drop struct {
 // drop table. Empty result falls back to coins + log so every kill in the
 // slice is observable (spec-authorized fallback).
 func m5GetDrops(mobKey string) []m5Drop {
+	return m5GetDropsFor(mobKey, "")
+}
+
+// m5GetDropsFor ports mob.getDrops with a killer context: M11 quest gates
+// evaluate against the killer's progression (mob.getDrops takes the player).
+// Empty result falls back to coins + log so every kill in the slice is
+// observable (spec-authorized fallback).
+func m5GetDropsFor(mobKey, username string) []m5Drop {
 	loadM5Tables()
 	prof := m5Mobs[mobKey]
 	level := 1
@@ -224,7 +234,7 @@ func m5GetDrops(mobKey string) []m5Drop {
 		if level < 1 {
 			level = 1
 		}
-		if k, c, ok := m5RollEntry(prof.Drops, level); ok {
+		if k, c, ok := m5RollEntryGated(username, prof.Drops, level); ok {
 			out = append(out, m5Drop{Key: k, Count: c})
 		}
 		for _, t := range prof.DropTables {
@@ -233,7 +243,7 @@ func m5GetDrops(mobKey string) []m5Drop {
 				log.Printf("m5: mob %s has invalid drop table %s", mobKey, t)
 				continue
 			}
-			if k, c, ok := m5RollEntry(entries, level); ok {
+			if k, c, ok := m5RollEntryGated(username, entries, level); ok {
 				out = append(out, m5Drop{Key: k, Count: c})
 			}
 		}
@@ -246,6 +256,22 @@ func m5GetDrops(mobKey string) []m5Drop {
 		log.Printf("m5: %s rolls empty -> fallback coins+log", mobKey)
 	}
 	return out
+}
+
+// m5RollEntryGated filters quest/achievement-gated entries by the killer's
+// progression (mob.getRandomItem receives the player), then rolls uniformly
+// over the survivors (m5RollEntry body). Empty username = gates closed.
+func m5RollEntryGated(username string, entries []m5DropJSON, level int) (string, int, bool) {
+	if username != "" {
+		filtered := entries[:0:0]
+		for _, e := range entries {
+			if m11DropGated(username, e.Quest, e.Achievement, e.Status) {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+	return m5RollEntry(entries, level)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +335,7 @@ func m5NearWalkable(x, y int) (int, int) {
 // m5SpawnLoot drops the roll at the corpse: single -> Item, multi -> LootBag
 // (take-all on Target/Step; lootbag menu Open flow deferred, logged).
 func m5SpawnLoot(mobKey string, cx, cy int, owner string) {
-	drops := m5GetDrops(mobKey)
+	drops := m5GetDropsFor(mobKey, owner)
 	lx, ly := m5NearWalkable(cx, cy)
 	lootMu.Lock()
 	lootSeq++
@@ -326,7 +352,15 @@ func m5SpawnLoot(mobKey string, cx, cy int, owner string) {
 		payload = EntityData{Instance: inst, Type: EntityItem, Key: drops[0].Key, Name: drops[0].Key, X: lx, Y: ly, Count: intp(drops[0].Count)}
 	}
 	broadcast(pkt(PacketSpawn, payload))
-	log.Printf("m5: loot %s spawned (%s x%d) at %d,%d owner=%s bag=%v", inst, drops[0].Key, drops[0].Count, lx, ly, owner, bag)
+	// M11: multi-drop bags log their contents (Node logs the roll set; the
+	// bag itself only carries the keys server-side, so the log is the only
+	// observable record — e2e asserts on this line).
+	keys := make([]string, 0, len(drops))
+	for _, d := range drops {
+		keys = append(keys, d.Key)
+	}
+	log.Printf("m5: loot %s spawned (%s x%d) at %d,%d owner=%s bag=%v items=%v",
+		inst, drops[0].Key, drops[0].Count, lx, ly, owner, bag, keys)
 	l.blinkT = time.AfterFunc(lootBlinkDelay, func() { m5BlinkLoot(inst) })
 	l.destroyT = time.AfterFunc(lootDespawnDelay, func() { m5DestroyLoot(inst, "expired") })
 }
@@ -747,6 +781,9 @@ func handlePlayerAttack(c *playerConn, target string) {
 	dmg := 8 + rand.Intn(5)
 	// M9: engine mobs first — Points/retaliate/death/respawn/loot live in
 	// the engine now (m9PlayerHit -> m9KillMob -> m5SpawnLoot).
+	// M11_HERODMG debug accelerator (mirrors M9_MOBDMG): keeps the e2e's
+	// 140-HP mobs in a few-swing kill range.
+	dmg = int(float64(dmg) * m11HeroDamageMult())
 	if m := m9MobFor(target); m != nil {
 		if m.dead {
 			log.Printf("m5: %s swings at dead %s (ignored)", c.instance, target)

@@ -1011,6 +1011,14 @@ func m6HandleNPCTarget(c *playerConn, instance string) {
 	info := m6NPCs[npcKey]
 	log.Printf("m6: %s talks to %s (%s)", c.instance, npcKey, info.Name)
 
+	// M11: quest/achievement NPCs swallow the interaction before any role
+	// handling (handler.handleTalkToNPC order: quest talkCallback →
+	// achievement talkCallback → store → banker/enchanter → default talk).
+	// Without this, store NPCs fronting quests (forestnpc) never reach the
+	// quest/achievement dialogue.
+	if m11Talk(c, npcKey) {
+		return
+	}
 	// NPC is a store.
 	if info.Store != "" {
 		m6OpenStore(c, info.Store)

@@ -2703,6 +2703,8 @@ func removeClient(conn *websocket.Conn) {
 	m10ForgetPlayer(c.instance)
 	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
 	m5SaveSync(c.username)
+	// M11: quest/achievement rows persist on disconnect (same path).
+	m11PersistQuests(c.username)
 	_ = conn.Close()
 	broadcast(pkt(PacketDespawn, despawnData{Instance: c.instance}))
 	log.Printf("client removed: instance=%s (despawn broadcast)", c.instance)
@@ -2802,6 +2804,9 @@ func hitResource(attacker, instance string) {
 	}
 	// M5: table experience lands on the real gathering skill.
 	m5GatherXP(attacker, skill, info.Experience)
+	// M11: quest resource stages fire on exhaust (quest.ts resourceCallback
+	// from resourceskill.ts:131 — after the item + XP land).
+	m11Resource(connByInstance(attacker), skill, desc.Key)
 	resMu.Lock()
 	st.depleted = true
 	delay := resourceRespawnDelay(info)
@@ -3213,6 +3218,12 @@ func handleConn(conn *websocket.Conn) {
 					m10OnPositionUpdate(c)
 				}
 				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
+				// M11: restore + batch quest/achievement state after the login
+				// extras (handler.ts:69-70 onLoaded → handleQuests/
+				// handleAchievements Batch frames; m5Load precedent).
+				m11EnsureTables()
+				m11LoadQuests(c.username)
+				frames = append(frames, m11LoginBatches(c.username)...)
 				if err := send(conn, frames...); err != nil {
 					log.Printf("write welcome/map: %v", err)
 					return
@@ -3235,9 +3246,16 @@ func handleConn(conn *websocket.Conn) {
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m9test"] != nil {
 						m9TestHandler(c, frame[1])
 					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m11test"] != nil {
+						m11HandleTest(c, frame[1])
+					}
 				}
 			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
 				m6HandleEquipment(c, frame)
+			case PacketQuest: // C Quest {key} -> accept the start prompt (M11)
+				if len(frame) >= 2 {
+					m11HandleAccept(c, frame[1])
+				}
 			case PacketRespawn: // C Respawn [] -> player.respawn (M9)
 				m9HandleRespawn(c)
 			case PacketMovement: // C [11,{opcode,...}] -> Stop/Teleport on blocked tiles
@@ -3271,6 +3289,7 @@ func handleConn(conn *websocket.Conn) {
 func main() {
 	m5Init()
 	m6StartStoreTicker() // M6: stores.json registry + 20s stock refresh
+	m11EnsureTables()    // M11: quests/achievements SQLite tables (schema up-front)
 	m8LoadGames()        // M8: world.json minigame areas + 1s tick engines
 	m10LoadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
 	m10InjectTestAreas() // M10: TESTMAP synthetic area bands for the e2e

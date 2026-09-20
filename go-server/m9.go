@@ -711,6 +711,7 @@ func m9KillMob(m *m9Mob, killer *playerConn) {
 		m5SpawnLoot(m.key, x, y, killer.username)
 	}
 	m10KillHooks(m, killer) // M10: chest-area onEmpty (reward chest spawn)
+	m11Kill(killer, m.key)  // M11: quest kill stages + achievement progress
 	time.AfterFunc(m.respawnDelay(), func() { m9Respawn(m) })
 }
 

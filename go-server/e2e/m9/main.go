@@ -322,9 +322,13 @@ func main() {
 	send(c1, `[46,{"m9test":"tp","x":100,"y":76}]`)
 	drain(600 * time.Millisecond)
 	leashed := waitMobEcho(c1, "m9test", func(hp, maxHP, x, y int, tgt string) bool {
-		return tgt == "" && x == 126 && y == 96
+		// After the drop the mob resumes roaming its spawn band
+		// (roamDistance 6), so require the target cleared AND the mob
+		// back within that band of spawn 126,96 — an exact-tile wait is
+		// probabilistic and flakes.
+		return tgt == "" && y == 96 && x >= 120 && x <= 132
 	}, 15*time.Second)
-	check(leashed, "far target dropped + skeleton back at spawn 126,96")
+	check(leashed, "far target dropped + skeleton back at spawn band 126,96")
 
 	// --- 6. Kill -> Despawn (engine respawn fires on the profile timer). ---
 	fmt.Println("== mob kill ==")

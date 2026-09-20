@@ -34,15 +34,21 @@ CLEAN=1 go run . &         # restart server first
 go run ./e2e/clean         # clean check
 ```
 
-Milestone harnesses (each against a TESTMAP=1 server; use a fresh DB per
-run, e.g. `DB_PATH=/tmp/e2e.db`, since logins restore persisted positions):
+Milestone harnesses (each against a TESTMAP=1 server — the default; use a
+fresh DB per run, e.g. `DB_PATH=/tmp/e2e.db`, since logins restore persisted
+positions). The harnesses dial a running server, they don't spawn one, so the
+debug damage accelerators are server-side env: start the server with
+`M9_MOBDMG=10` (m9 death leg) and/or `M11_HERODMG=10` (m11 skeleton kill
+leg). m11's drop leg greps the server log, so pass `M11_SERVER_LOG=<server
+log file>` to the m11 harness as well:
 
 ```sh
 go run ./e2e/m6                 # stores/bank/NPC/persistence
 go run ./e2e/m7                 # chat + rank-gated commands
 go run ./e2e/m8                 # minigames lobby/queue/score
-M9_MOBDMG=10 go run ./e2e/m9    # mob AI aggro/death/leash/kill
+go run ./e2e/m9                 # mob AI aggro/death/leash/kill
 go run ./e2e/m10                # areas music/overlay/pvp/camera + chest flow
+go run ./e2e/m11                # quests/achievements + gated drops/persistence
 ```
 
 ## Docs
