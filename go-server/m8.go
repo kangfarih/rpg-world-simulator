@@ -14,16 +14,17 @@ package main
 // (no PVP deaths), so teamwar kill points are driven through the M8TEST
 // debug frame; the lobby countdown packets arrive on their real 1s cadence
 // but the harness only samples them.
+//
+// State machine lives in internal/minigame (Manager + Game/Member); this
+// file is a thin transport adapter (Effects impl + session-mirror sync +
+// tick goroutines + M8TEST dispatcher). Packet shapes and cadences frozen.
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"sort"
-	"strconv"
-	"sync"
 	"time"
 
 	"rpg-world-server/internal/minigame"
@@ -88,147 +89,122 @@ const (
 type m8Area = minigame.Area
 
 // ---------------------------------------------------------------------------
-// Minigame runtime (minigame.ts base class fields).
+// Thin adapter: Manager owns the state machine; this file owns transport +
+// session mirrors. m8Mu/m8Games moved into minigame.Manager (mutex + games
+// map, instance-ID-keyed members, no playerConn pointers).
 // ---------------------------------------------------------------------------
 
-// m8Member is one player inside a minigame.
-// NOTE: kept in root (not aliased to minigame.Member) because it carries the
-// live playerConn pointer + transport; minigame.Member is the pure
-// instance-ID counterpart used for domain rules.
-type m8Member struct {
-	conn *playerConn
-	team int // Team enum value
-	// coursing state (player.ts coursingScore/coursingTarget)
-	score  int
-	target string
-}
-
-// m8Game holds the shared minigame state. One mutex guards all games (the
-// tick cadence is 1s and operations are tiny; per-game locks add risk
-// without benefit at this scale).
-// NOTE: kept in root (not aliased to minigame.Game) because it embeds the
-// mutex, live-conn members and spawn wiring; pure rules delegate to the
-// minigame package.
-type m8Game struct {
-	mu        sync.Mutex
-	key       string // "coursing" | "teamwar"
-	opcode    int    // Opcodes.Minigame value
-	name      string
-	countdown int
-	started   bool
-	// lobbyAreas = every 'lobby' mObjectType (each fires addPlayer in Node);
-	// lobby = the LAST loaded one (this.lobby field — getLobbyPosition uses
-	// it for teleport-backs).
-	lobbyAreas []*m8Area
-	lobby      *m8Area
-	lobbyWait  map[string]*m8Member // playersInLobby keyed by instance
-	inGame     map[string]*m8Member // playersInGame keyed by instance
-
-	// coursing extras
-	hunterSpawn *m8Area
-	preySpawns  []*m8Area
-	centre      struct{ x, y int }
-
-	// teamwar extras
-	redSpawn  *m8Area
-	blueSpawn *m8Area
-	redKills  int
-	blueKills int
-}
-
 var (
-	m8Mu    sync.Mutex
-	m8Games = map[string]*m8Game{}
+	m8Mgr                  = minigame.NewManager()
+	m8Fx  minigame.Effects = &m8Effects{}
 )
 
-// m8SendPacket ports Minigame.sendPacket: Minigame frame to each member.
-func m8SendPacket(members map[string]*m8Member, opcode int, data map[string]any) {
-	if len(members) == 0 {
+// m8Effects implements minigame.Effects with root transport.
+type m8Effects struct{}
+
+func m8ConnFor(instance string) *playerConn {
+	playersMu.Lock()
+	defer playersMu.Unlock()
+	for _, c := range players {
+		if c.instance == instance {
+			return c
+		}
+	}
+	return nil
+}
+
+func (m8Effects) Notify(instance, msg string) {
+	if c := m8ConnFor(instance); c != nil {
+		m6Notify(c, msg)
+	}
+}
+
+func (m8Effects) Teleport(instance string, x, y int) {
+	if c := m8ConnFor(instance); c != nil {
+		m8Teleport(c, x, y)
+	}
+}
+
+func (m8Effects) Broadcast(frames ...[]any) {
+	broadcast(frames...)
+}
+
+func (m8Effects) SendMinigame(instance string, opcode int, data map[string]any) {
+	if c := m8ConnFor(instance); c != nil {
+		_ = send(c.conn, pktOp(PacketMinigame, opcode, data))
+	}
+}
+
+func (m8Effects) SendPointer(instance string, target string) {
+	if c := m8ConnFor(instance); c != nil {
+		// player.pointer: Remove-then-Entity (pointer.ts default remove).
+		// Remove carries no data → 2-element frame like Node's serialize.
+		_ = send(c.conn, []any{PacketPointer, PointerRemove})
+		_ = send(c.conn, pktOp(PacketPointer, PointerEntity, map[string]any{
+			"instance": target, "type": PointerEntity,
+		}))
+	}
+}
+
+func (m8Effects) EntityPos(instance string) (int, int, bool) {
+	return entityPos(instance)
+}
+
+// m8SyncStarted mirrors started assignments onto playerConn fields.
+func m8SyncStarted(gameKey string, assignments map[string]minigame.Member) {
+	if len(assignments) == 0 {
 		return
 	}
-	// Deterministic order for logs; fan-out is per-conn anyway.
-	keys := make([]string, 0, len(members))
-	for k := range members {
+	keys := make([]string, 0, len(assignments))
+	for k := range assignments {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		mem := members[k]
-		_ = send(mem.conn.conn, pktOp(PacketMinigame, opcode, data))
+		mem := assignments[k]
+		if c := m8ConnFor(k); c != nil {
+			c.m8Game = gameKey
+			c.m8Team = mem.Team
+			c.m8Score = mem.Score
+			c.m8Target = mem.Target
+		}
 	}
 }
 
-// m8AddPlayer ports the private addPlayer: register in lobby, Lobby packet,
-// ENTERED_LOBBY notify. NOTE: Node sends {action: MinigameState.Lobby} here
-// (enum value 0) — NOT MinigameActions.Lobby (2). The two enums collide on
-// the client (0 = Score in MinigameActions); cloned verbatim.
-func (g *m8Game) addPlayer(c *playerConn) {
-	g.mu.Lock()
-	if _, ok := g.lobbyWait[c.instance]; ok {
-		g.mu.Unlock()
+// m8SyncScored mirrors coursing score updates onto playerConn fields.
+func m8SyncScored(scored map[string]int) {
+	if len(scored) == 0 {
 		return
 	}
-	g.lobbyWait[c.instance] = &m8Member{conn: c}
-	members := map[string]*m8Member{c.instance: g.lobbyWait[c.instance]}
-	name := g.name
-	g.mu.Unlock()
-
-	m8SendPacket(members, g.opcode, map[string]any{
-		"action": minigameStateLobby, // MinigameState.Lobby = 0 (Node quirk)
-	})
-	m6Notify(c, "misc:ENTERED_LOBBY;name="+name)
+	keys := make([]string, 0, len(scored))
+	for k := range scored {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if c := m8ConnFor(k); c != nil {
+			c.m8Score = scored[k]
+		}
+	}
 }
 
-// m8RemovePlayer ports the private removePlayer: drop from lobby, Exit
-// packet ({action: MinigameState.Exit = 2}), EXITED_LOBBY notify.
-func (g *m8Game) removePlayer(c *playerConn) {
-	g.mu.Lock()
-	mem, ok := g.lobbyWait[c.instance]
-	if ok {
-		delete(g.lobbyWait, c.instance)
+// m8ClearInstances resets session mirrors for stopped/disconnected players.
+func m8ClearInstances(instances []string) {
+	for _, k := range instances {
+		if c := m8ConnFor(k); c != nil {
+			c.m8Game = ""
+			c.m8Team = 0
+			c.m8Score = 0
+			c.m8Target = ""
+		}
 	}
-	g.mu.Unlock()
-	if !ok {
-		return
-	}
-	members := map[string]*m8Member{c.instance: mem}
-	m8SendPacket(members, g.opcode, map[string]any{"action": minigameStateExit})
-	m6Notify(c, "misc:EXITED_LOBBY;name="+g.name)
 }
 
-// snapshotCountdown reads the current countdown under the game lock.
-func (g *m8Game) snapshotCountdown() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.countdown
-}
-
-// m8Stop ports Minigame.stop: End packet to in-game players, clear state,
-// teleport everyone back to a random lobby position.
-func (g *m8Game) stop() {
-	g.mu.Lock()
-	members := g.inGame
-	lobby := g.lobby
-	g.inGame = map[string]*m8Member{}
-	g.started = false
-	if g.key == "teamwar" {
-		g.redKills = 0
-		g.blueKills = 0
-	}
-	// Node re-arms the countdown inside the NEXT tick (countdown <= 0 branch
-	// only fires when the tick runs), so 0 keeps that exact behavior.
-	g.countdown = 0
-	g.mu.Unlock()
-
-	m8SendPacket(members, g.opcode, map[string]any{"action": MinigameActionEnd})
-	for _, mem := range members {
-		mem.conn.m8Game = ""
-		mem.conn.m8Team = 0
-		mem.conn.m8Score = 0
-		mem.conn.m8Target = ""
-		x, y := minigame.LobbyPoint(lobby)
-		m8Teleport(mem.conn, x, y)
-	}
+// m8SyncTick applies a TickResult to session mirrors.
+func m8SyncTick(gameKey string, res minigame.TickResult) {
+	m8ClearInstances(res.Stopped)
+	m8SyncStarted(gameKey, res.Started)
+	m8SyncScored(res.Scored)
 }
 
 // m8Teleport ports character.teleport for minigame moves (position update +
@@ -242,226 +218,6 @@ func m8Teleport(c *playerConn, x, y int) {
 	broadcast(pkt(PacketTeleport, teleportData{Instance: c.instance, X: x, Y: y}))
 }
 
-// m8StartCoursing ports Coursing.start: shuffle, split hunters/prey 1:1,
-// assign targets, teleport to team spawns, schedule pointers.
-func (g *m8Game) startCoursing() {
-	g.mu.Lock()
-	// Shuffle lobby (minigame.ts shuffleLobby).
-	keys := make([]string, 0, len(g.lobbyWait))
-	for k := range g.lobbyWait {
-		keys = append(keys, k)
-	}
-	rand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
-
-	if len(keys) < coursingMinPlayers {
-		g.mu.Unlock()
-		for _, k := range keys {
-			m6Notify(g.lobbyWait[k].conn,
-				"misc:MINIMUM_PLAYERS_MINIGAME;minimum="+strconv.Itoa(coursingMinPlayers))
-		}
-		return
-	}
-
-	g.started = true
-
-	// Even split; odd player out is ignored (coursing.ts count logic).
-	count := len(keys)
-	if count%2 != 0 {
-		count--
-	}
-	hunters := keys[:count/2]
-	prey := keys[count/2 : count]
-
-	players := map[string]*m8Member{}
-	for i, hk := range hunters {
-		h := g.lobbyWait[hk]
-		p := g.lobbyWait[prey[i]]
-		h.team, p.team = coursingTeamHunter, coursingTeamPrey
-		h.target, p.target = prey[i], hk
-		h.score, p.score = 0, 0
-		players[hk], players[prey[i]] = h, p
-	}
-	// Odd player out: stays in the lobby for the next round.
-	for i := count; i < len(keys); i++ {
-		delete(g.lobbyWait, keys[i])
-	}
-	g.inGame = players
-	g.mu.Unlock()
-
-	// Drop everyone from the lobby registry and teleport to spawns.
-	for k, mem := range players {
-		g.mu.Lock()
-		delete(g.lobbyWait, k)
-		g.mu.Unlock()
-
-		mem.conn.m8Game = g.key
-		mem.conn.m8Team = mem.team
-		mem.conn.m8Score = 0
-		mem.conn.m8Target = mem.target
-
-		g.mu.Lock()
-		var x, y int
-		if mem.team == coursingTeamPrey && len(g.preySpawns) > 0 {
-			x, y = minigame.RandomPointIn(g.preySpawns[rand.Intn(len(g.preySpawns))])
-		} else {
-			x, y = minigame.RandomPointIn(g.hunterSpawn)
-		}
-		g.mu.Unlock()
-		m8Teleport(mem.conn, x, y)
-	}
-
-	// sendPointers after 1.5s (coursing.ts setTimeout).
-	time.AfterFunc(coursingPointerDelay*time.Millisecond, func() {
-		g.mu.Lock()
-		players := g.inGame
-		g.mu.Unlock()
-		for k, mem := range players {
-			if mem.target == "" {
-				continue
-			}
-			// player.pointer: Remove-then-Entity (pointer.ts default remove).
-			// Remove carries no data → 2-element frame like Node's serialize.
-			_ = send(mem.conn.conn, []any{PacketPointer, PointerRemove})
-			_ = send(mem.conn.conn, pktOp(PacketPointer, PointerEntity, map[string]any{
-				"instance": mem.target, "type": PointerEntity,
-			}))
-			_ = k
-		}
-	})
-}
-
-// m8StartTeamWar ports TeamWar.start: shuffle, split red/blue, teleport.
-func (g *m8Game) startTeamWar() {
-	g.mu.Lock()
-	keys := make([]string, 0, len(g.lobbyWait))
-	for k := range g.lobbyWait {
-		keys = append(keys, k)
-	}
-	rand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
-
-	if len(keys) < teamWarMinPlayers {
-		g.mu.Unlock()
-		for _, k := range keys {
-			m6Notify(g.lobbyWait[k].conn,
-				"misc:MINIMUM_PLAYERS_MINIGAME;minimum="+strconv.Itoa(teamWarMinPlayers))
-		}
-		return
-	}
-
-	g.started = true
-	split := len(keys) / 2
-	players := map[string]*m8Member{}
-	for i, k := range keys {
-		mem := g.lobbyWait[k]
-		if i < split {
-			mem.team = teamWarTeamBlue
-		} else {
-			mem.team = teamWarTeamRed
-		}
-		players[k] = mem
-	}
-	g.inGame = players
-	g.mu.Unlock()
-
-	for k, mem := range players {
-		g.mu.Lock()
-		delete(g.lobbyWait, k)
-		var x, y int
-		if mem.team == teamWarTeamRed {
-			x, y = minigame.RandomPointIn(g.redSpawn)
-		} else {
-			x, y = minigame.RandomPointIn(g.blueSpawn)
-		}
-		g.mu.Unlock()
-
-		mem.conn.m8Game = g.key
-		mem.conn.m8Team = mem.team
-		m8Teleport(mem.conn, x, y)
-	}
-}
-
-// m8Tick is the shared 1s tick (minigame.ts setInterval + subclass ticks).
-func (g *m8Game) tick() {
-	g.mu.Lock()
-	if g.countdown <= 0 {
-		g.countdown = minigame.RearmCountdown(g.key)
-		wasStarted := g.started
-		g.mu.Unlock()
-		if wasStarted {
-			g.stop()
-		} else if g.key == "coursing" {
-			g.startCoursing()
-		} else {
-			g.startTeamWar()
-		}
-		return
-	}
-	g.countdown--
-	countdown := g.countdown
-	started := g.started
-	lobby := map[string]*m8Member{}
-	for k, v := range g.lobbyWait {
-		lobby[k] = v
-	}
-	inGame := map[string]*m8Member{}
-	for k, v := range g.inGame {
-		inGame[k] = v
-	}
-	centreX, centreY := g.centre.x, g.centre.y
-	redKills, blueKills := g.redKills, g.blueKills
-	scoreTick := countdown%coursingScoreTick == 0
-	g.mu.Unlock()
-
-	// Lobby countdown packets every tick (both games).
-	if len(lobby) > 0 {
-		m8SendPacket(lobby, g.opcode, map[string]any{
-			"action":    MinigameActionLobby,
-			"countdown": countdown,
-			"started":   started,
-		})
-	}
-
-	// Coursing: update prey scores every 4 ticks from distance-to-centre.
-	if g.key == "coursing" && started && scoreTick {
-		for k, mem := range inGame {
-			if mem.team != coursingTeamPrey {
-				continue
-			}
-			px, py, _ := entityPos(k)
-			score := minigame.CoursingScore(px, py, centreX, centreY) // Utils.getDistance / COURSING_SCORE_DIVISOR
-			mem.conn.m8Score += score
-			mem.score = mem.conn.m8Score
-			m8SendPacket(map[string]*m8Member{k: mem}, g.opcode, map[string]any{
-				"action": MinigameActionScore,
-				"score":  mem.conn.m8Score,
-			})
-		}
-	}
-
-	// TeamWar: in-game score packets every tick.
-	if g.key == "teamwar" && len(inGame) > 0 {
-		m8SendPacket(inGame, g.opcode, map[string]any{
-			"action":        MinigameActionScore,
-			"countdown":     countdown,
-			"redTeamKills":  redKills,
-			"blueTeamKills": blueKills,
-		})
-	}
-}
-
-// m8RecordKill ports TeamWar.kill (the coursing kill callback has no
-// behaviour in Node — only teamwar overrides it).
-func (g *m8Game) recordKill(killer *playerConn) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	switch killer.m8Team {
-	case teamWarTeamBlue:
-		g.blueKills += killPointsPerKill
-	case teamWarTeamRed:
-		g.redKills += killPointsPerKill
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Area linking + lifecycle (minigames.ts constructor + linkAreas).
 // ---------------------------------------------------------------------------
@@ -469,9 +225,7 @@ func (g *m8Game) recordKill(killer *playerConn) {
 // m8LoadGames parses world.json areas.minigame, links each area to its
 // minigame (linkAreas), and starts the 1s tick goroutine per game.
 func m8LoadGames() {
-	m8Mu.Lock()
-	defer m8Mu.Unlock()
-	if len(m8Games) > 0 {
+	if m8Mgr.HasGames() {
 		return
 	}
 	loadWorld()
@@ -482,78 +236,39 @@ func m8LoadGames() {
 	if err != nil {
 		return
 	}
-	var doc struct {
-		Areas struct {
-			Minigame []m8Area `json:"minigame"`
-		} `json:"areas"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	areas, err := minigame.ParseAreasDoc(raw)
+	if err != nil {
 		log.Printf("m8: parse areas: %v", err)
 		return
 	}
 
-	newGame := func(key string, opcode int, name string, countdown int) *m8Game {
-		return &m8Game{
-			key: key, opcode: opcode, name: name, countdown: countdown,
-			lobbyWait: map[string]*m8Member{}, inGame: map[string]*m8Member{},
-		}
-	}
-	coursing := newGame("coursing", MinigameCoursing, "Coursing", coursingCountdown)
-	teamwar := newGame("teamwar", MinigameTeamWar, "TeamWar", teamWarCountdown)
+	m8Mgr.EnsureGame("coursing", MinigameCoursing, "Coursing",
+		minigame.EnvCountdown("M8_COURSING_COUNTDOWN", coursingCountdown))
+	m8Mgr.EnsureGame("teamwar", MinigameTeamWar, "TeamWar",
+		minigame.EnvCountdown("M8_TEAMWAR_COUNTDOWN", teamWarCountdown))
 
-	for i := range doc.Areas.Minigame {
-		area := doc.Areas.Minigame[i]
-		switch area.Minigame {
-		case "coursing":
-			switch area.MObjectType {
-			case "lobby":
-				coursing.lobbyAreas = append(coursing.lobbyAreas, &area)
-				coursing.lobby = &area // last one wins (this.lobby field)
-			case "hunterspawn":
-				coursing.hunterSpawn = &area
-			case "preyspawn":
-				coursing.preySpawns = append(coursing.preySpawns, &area)
-			case "centre":
-				coursing.centre.x, coursing.centre.y = area.X, area.Y
-			}
-		case "teamwar":
-			switch area.MObjectType {
-			case "lobby":
-				teamwar.lobbyAreas = append(teamwar.lobbyAreas, &area)
-				teamwar.lobby = &area
-			case "redteamspawn":
-				teamwar.redSpawn = &area
-			case "blueteamspawn":
-				teamwar.blueSpawn = &area
-			}
-		}
+	for _, a := range areas {
+		m8Mgr.AddArea(a)
 	}
 
-	coursing.countdown = minigame.EnvCountdown("M8_COURSING_COUNTDOWN", coursingCountdown)
-	teamwar.countdown = minigame.EnvCountdown("M8_TEAMWAR_COUNTDOWN", teamWarCountdown)
-
-	m8Games["coursing"] = coursing
-	m8Games["teamwar"] = teamwar
-
-	for _, g := range m8Games {
-		gg := g
+	for _, key := range m8Mgr.GameKeys() {
+		k := key
 		go func() {
 			t := time.NewTicker(minigameTickInterval * time.Millisecond)
 			defer t.Stop()
 			for range t.C {
-				gg.tick()
+				res := m8Mgr.Tick(k, m8Fx)
+				m8SyncTick(k, res)
 			}
 		}()
 	}
 	log.Printf("m8: minigames loaded (coursing lobby=%v teamwar lobby=%v)",
-		coursing.lobby != nil, teamwar.lobby != nil)
+		m8Mgr.HasLobby("coursing"), m8Mgr.HasLobby("teamwar"))
 }
 
 // m8GameFor returns the named game (nil when missing).
-func m8GameFor(key string) *m8Game {
-	m8Mu.Lock()
-	defer m8Mu.Unlock()
-	return m8Games[key]
+func m8GameFor(key string) *minigame.Game {
+	return m8Mgr.GameFor(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -566,52 +281,7 @@ func m8GameFor(key string) *m8Game {
 // exit hook only to detect leaving via the lobby (Node tracks exits through
 // the area callbacks; the stub keeps membership until stop()).
 func m8OnPositionUpdate(c *playerConn) {
-	// Coursing lobby enter/exit (area onEnter/onExit parity). Membership
-	// checks run over EVERY lobby area (each fires its own callbacks).
-	g := m8GameFor("coursing")
-	if g != nil && len(g.lobbyAreas) > 0 {
-		inside := false
-		for _, a := range g.lobbyAreas {
-			if a.Inside(c.sess.playerX, c.sess.playerY) {
-				inside = true
-				break
-			}
-		}
-
-		g.mu.Lock()
-		_, inLobby := g.lobbyWait[c.instance]
-		g.mu.Unlock()
-
-		switch {
-		case inside && !inLobby && c.m8Game == "":
-			g.addPlayer(c)
-		case !inside && inLobby:
-			g.removePlayer(c)
-		}
-	}
-
-	// TeamWar lobby (same base-class addPlayer/removePlayer flow).
-	tw := m8GameFor("teamwar")
-	if tw != nil && len(tw.lobbyAreas) > 0 {
-		inside := false
-		for _, a := range tw.lobbyAreas {
-			if a.Inside(c.sess.playerX, c.sess.playerY) {
-				inside = true
-				break
-			}
-		}
-
-		tw.mu.Lock()
-		_, inLobby := tw.lobbyWait[c.instance]
-		tw.mu.Unlock()
-
-		switch {
-		case inside && !inLobby && c.m8Game == "":
-			tw.addPlayer(c)
-		case !inside && inLobby:
-			tw.removePlayer(c)
-		}
-	}
+	m8Mgr.OnPositionUpdate(c.instance, c.sess.playerX, c.sess.playerY, c.m8Game, m8Fx)
 }
 
 // m8OnDisconnect ports Minigame.disconnect: teleport to a random lobby
@@ -620,23 +290,14 @@ func m8OnDisconnect(c *playerConn) {
 	if c.m8Game == "" {
 		return
 	}
-	g := m8GameFor(c.m8Game)
-	if g == nil {
-		return
-	}
-	g.mu.Lock()
-	delete(g.inGame, c.instance)
-	delete(g.lobbyWait, c.instance)
-	remaining := len(g.inGame)
-	lobby := g.lobby
-	g.mu.Unlock()
+	key := c.m8Game
+	x, y, remaining := m8Mgr.Disconnect(key, c.instance)
 
 	c.m8Game = ""
 	c.m8Team = 0
 	c.m8Score = 0
 	c.m8Target = ""
 
-	x, y := minigame.LobbyPoint(lobby)
 	// The conn is dying; update the session position so the disconnect
 	// persist path saves the lobby tile and the relogin lands back in the
 	// lobby area (disconnect() setPosition parity). Persist goes through
@@ -645,8 +306,9 @@ func m8OnDisconnect(c *playerConn) {
 	m5TrackPos(c)
 
 	// minigame.ts disconnect: stop when fewer than 2 players remain.
-	if remaining < 2 {
-		g.stop()
+	if minigame.ShouldStop(remaining) {
+		stopped := m8Mgr.Stop(key, m8Fx)
+		m8ClearInstances(stopped)
 	}
 }
 
@@ -672,7 +334,7 @@ func m8HandleTest(c *playerConn, frame clientFrame) {
 			return
 		}
 		if g := m8GameFor(c.m8Game); g != nil {
-			g.recordKill(c)
+			m8Mgr.RecordKillTeam(c.m8Game, c.m8Team)
 		}
 	case "kills":
 		// Echo the teamwar kill counters (game state introspection).
@@ -680,9 +342,7 @@ func m8HandleTest(c *playerConn, frame clientFrame) {
 		if g == nil {
 			return
 		}
-		g.mu.Lock()
-		r, b := g.redKills, g.blueKills
-		g.mu.Unlock()
+		r, b := m8Mgr.KillCounts("teamwar")
 		m6Notify(c, fmt.Sprintf("m8:kills red=%d blue=%d", r, b))
 	case "pointers":
 		// Re-fire coursing sendPointers (idempotent, TESTMAP-only) so the
@@ -691,21 +351,7 @@ func m8HandleTest(c *playerConn, frame clientFrame) {
 		if g == nil {
 			return
 		}
-		g.mu.Lock()
-		players := map[string]*m8Member{}
-		for k, v := range g.inGame {
-			players[k] = v
-		}
-		g.mu.Unlock()
-		for _, mem := range players {
-			if mem.target == "" {
-				continue
-			}
-			_ = send(mem.conn.conn, []any{PacketPointer, PointerRemove})
-			_ = send(mem.conn.conn, pktOp(PacketPointer, PointerEntity, map[string]any{
-				"instance": mem.target, "type": PointerEntity,
-			}))
-		}
+		m8Mgr.SendPointers("coursing", m8Fx)
 	case "state":
 		// Full session introspection for the harness (positions, team,
 		// score, target, game key).

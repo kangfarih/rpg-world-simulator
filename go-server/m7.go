@@ -1,6 +1,6 @@
 package main
 
-// M7 — chat + commands (chat/commands slice of the Node clone).
+// M7 — chat + commands (thin adapter over internal/player/chat).
 //
 // Ports the Node chat path (incoming.ts handleChat → player.chat →
 // sendToRegions / world.globalMessage) and the player+moderator command
@@ -8,14 +8,23 @@ package main
 // support. S→C frames follow common/network/impl/chat.ts: the packet
 // carries no opcode, and {instance,...} = entity bubble chat while
 // {source,...} = static chatbox line (connection.ts handleChat).
+//
+// All PURE logic — sanitization, display names, token-bucket math, global
+// cooldowns, command tables, outcome strings — lives in
+// internal/player/chat. This file keeps ONLY wiring: frame parsing,
+// transport (send/broadcast/socRoute*), the per-conn session shape the rest
+// of the root package addresses (chatStateFor(...).rank,
+// m7PlayerByName/m7PlayerUsernames, m7Teleport, m6NotifyWithSource) and the
+// m12/m13 delegation. Behavior (frames, rate limits, command outcomes) is
+// frozen: main.go/ops/social call sites compile unchanged.
 
 import (
 	"encoding/json"
-	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"rpg-world-server/internal/player/chat"
 )
 
 // ---------------------------------------------------------------------------
@@ -28,18 +37,23 @@ const (
 	NetworkPong = 1
 )
 
-// Modules.Ranks (modules.ts:327) — subset the Go stub models.
+// Modules.Ranks (modules.ts:327) — subset the Go stub models. Values are the
+// chat package's canonical ranks, aliased here so rank comparisons across
+// the root package stay in one place.
 const (
-	RankNone      = 0
-	RankModerator = 1
-	RankAdmin     = 2
+	RankNone      = chat.RankNone
+	RankModerator = chat.RankModerator
+	RankAdmin     = chat.RankAdmin
 )
 
-// RankTitles (modules.ts:365) for chat name prefixing.
-var rankTitles = map[int]string{
-	RankModerator: "Mod",
-	RankAdmin:     "Admin",
-}
+// RankTitles (modules.ts:365) for chat name prefixing (shared with the chat
+// package's DisplayName helper; read-only).
+var rankTitles = chat.RankTitles
+
+// Text-pattern aliases (sanitizer/Utils.formatName parity lives in chat;
+// kept here so existing references keep compiling).
+var whitespaceRe = chat.WhitespaceRe
+var wordRe = chat.WordRe
 
 // ---------------------------------------------------------------------------
 // Per-connection chat state.
@@ -48,7 +62,7 @@ var rankTitles = map[int]string{
 // chatState carries the per-connection M7 session fields. Rate limiting is
 // a token bucket over the region chat (commands/global paths only tick the
 // rank cooldown like Node's lastGlobalChat), so spamming cannot flood a
-// region regardless of rank.
+// region regardless of rank. Bucket math delegates to chat.AllowBucket.
 type chatState struct {
 	bucketMu   sync.Mutex
 	tokens     float64   // refillable chat tokens
@@ -58,9 +72,9 @@ type chatState struct {
 	rank           int   // Modules.Ranks value (0 = None)
 }
 
-const chatBucketSize = 3.0               // burst capacity
-const chatRefillPerSec = 1.0 / 2.0       // one message per 2 seconds
-const globalChatCooldown = int64(60_000) // Ranks.None cooldown (player.ts getGlobalChatCooldown default)
+const chatBucketSize = chat.BucketSize         // burst capacity
+const chatRefillPerSec = chat.RefillPerSec     // one message per 2 seconds
+const globalChatCooldown = chat.GlobalCooldown // Ranks.None cooldown (player.ts getGlobalChatCooldown default)
 
 // allowChat consumes one token, refilling elapsed-time first. Calls with no
 // tokens left are rejected (Node has no equivalent — it trusts the client's
@@ -70,50 +84,25 @@ func (cs *chatState) allowChat() bool {
 	cs.bucketMu.Lock()
 	defer cs.bucketMu.Unlock()
 
-	now := time.Now()
-	if cs.lastRefill.IsZero() {
-		cs.lastRefill = now
-		cs.tokens = chatBucketSize
-	}
-	cs.tokens += now.Sub(cs.lastRefill).Seconds() * chatRefillPerSec
-	if cs.tokens > chatBucketSize {
-		cs.tokens = chatBucketSize
-	}
-	cs.lastRefill = now
-
-	if cs.tokens < 1 {
-		return false
-	}
-	cs.tokens--
-	return true
+	ok, tokens, refill := chat.AllowBucket(cs.tokens, cs.lastRefill, time.Now())
+	cs.tokens, cs.lastRefill = tokens, refill
+	return ok
 }
 
 // globalChatReady ports canGlobalChat(): the rank-based cooldown between
 // global messages (default rank = 60s, mods/admins = 5s).
 func (cs *chatState) globalChatReady() bool {
-	cooldown := globalChatCooldown
-	if cs.rank >= RankModerator {
-		cooldown = 5000
-	}
-	return nowMillis()-cs.lastGlobalChat > cooldown
+	return chat.GlobalReady(cs.rank, cs.lastGlobalChat, nowMillis())
 }
 
 // globalChatDuration ports getGlobalChatDuration(): whole minutes left on
 // the cooldown, minimum 1 (player.ts).
 func (cs *chatState) globalChatDuration() int {
-	cooldown := globalChatCooldown
-	if cs.rank >= RankModerator {
-		cooldown = 5000
-	}
-	d := (cooldown - (nowMillis() - cs.lastGlobalChat)) / 1000 / 60
-	if d < 1 {
-		d = 1
-	}
-	return int(d)
+	return chat.GlobalDuration(cs.rank, cs.lastGlobalChat, nowMillis())
 }
 
 func nowMillis() int64 {
-	return time.Now().UnixMilli()
+	return chat.NowMillis()
 }
 
 // chatStateFor returns the M7 state attached to a playerConn, creating it
@@ -140,13 +129,52 @@ type chatPacketData struct {
 }
 
 // ---------------------------------------------------------------------------
+// Transport seams (chat.Moderation/chat.Router over live root state).
+// ---------------------------------------------------------------------------
+
+// m13Moderation implements chat.Moderation over the persisted m13 mute flags.
+type m13Moderation struct{}
+
+func (m13Moderation) IsMuted(username string) bool { return m13IsMuted(username) }
+
+// chatRouter implements chat.Router over the live transports: region bubble
+// broadcast, global Router fan-out, and sourced unicasts.
+type chatRouter struct{}
+
+var _ chat.Router = chatRouter{}
+
+func (chatRouter) SendBubble(instance, message string, withBubble bool, colour string) {
+	broadcast(pkt(PacketChat, chatPacketData{
+		Instance:   instance,
+		Message:    message,
+		WithBubble: withBubble,
+		Colour:     colour,
+	}))
+}
+
+func (chatRouter) SendGlobal(source, message, colour string) {
+	socRouteGlobal(pkt(PacketChat, chatPacketData{
+		Source:  source,
+		Message: message,
+		Colour:  colour,
+	}))
+}
+
+func (chatRouter) SendSourced(username, message, colour, source string) {
+	if t := m7PlayerByName(username); t != nil {
+		m6NotifyWithSource(t, message, colour, source)
+	}
+}
+
+var defaultRouter = chatRouter{}
+
+// ---------------------------------------------------------------------------
 // Chat entry point (incoming.ts handleChat + player.chat).
 // ---------------------------------------------------------------------------
 
-var whitespaceRe = regexp.MustCompile(`\S`)
-var wordRe = regexp.MustCompile(`\w\S*`)
-
 // m7HandleChat is the PacketChat dispatcher (C→S Chat frame = [text]).
+// Gate order is frozen: sanitize → visible-text → command bypass → region
+// bucket → ops limiter → mute check → region chat.
 func m7HandleChat(c *playerConn, frame clientFrame) {
 	if len(frame) < 2 {
 		return
@@ -156,15 +184,13 @@ func m7HandleChat(c *playerConn, frame clientFrame) {
 		return
 	}
 
-	// Sanitization: strip tags then collapse control characters. The Node
-	// sanitizer.escape/sanitize combo HTML-escapes < > & and quotes.
 	text := m7Sanitize(raw[0])
-	if !whitespaceRe.MatchString(text) {
+	if !chat.HasVisibleText(text) {
 		return
 	}
 
 	// Commands (/ or ; prefix) bypass chat entirely (incoming.ts:476).
-	if strings.HasPrefix(text, "/") || strings.HasPrefix(text, ";") {
+	if chat.IsCommand(text) {
 		m7ParseCommand(c, text)
 		return
 	}
@@ -185,36 +211,22 @@ func m7HandleChat(c *playerConn, frame clientFrame) {
 
 	// Mute gate (incoming.ts:479): the m13 slice persists user.mute in the
 	// players.data blob and rejects chat while the deadline is in the future.
-	if m13IsMuted(c.username) {
-		m6Notify(c, "You have been muted.")
+	if (m13Moderation{}).IsMuted(c.username) {
+		m6Notify(c, chat.MutedText())
 		return
 	}
 
 	m7Chat(c, text, false, true, "")
 }
 
-// m7Sanitize ports sanitizer.escape + sanitize: HTML-escape the five XML
-// entities and drop NULs. Node's `bo-wie/sanitize-html` escape pass.
+// m7Sanitize ports sanitizer.escape + sanitize (delegates to chat.Sanitize).
 func m7Sanitize(s string) string {
-	s = strings.ReplaceAll(s, "\x00", "")
-	r := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&#x27;",
-	)
-	return r.Replace(s)
+	return chat.Sanitize(s)
 }
 
-// m7FormatName ports Utils.formatName: capitalize every word.
+// m7FormatName ports Utils.formatName (delegates to chat.FormatName).
 func m7FormatName(name string) string {
-	return wordRe.ReplaceAllStringFunc(name, func(w string) string {
-		if w == "" {
-			return w
-		}
-		return strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
-	})
+	return chat.FormatName(name)
 }
 
 // m7Chat ports player.chat(message, global, withBubble, colour): rank
@@ -224,60 +236,41 @@ func m7Chat(c *playerConn, message string, global bool, withBubble bool, colour 
 
 	if global {
 		if !cs.globalChatReady() {
-			m6Notify(c, fmt.Sprintf("misc:CANNOT_GLOBAL_CHAT_MINUTES;duration=%d", cs.globalChatDuration()))
+			m6Notify(c, chat.GlobalCooldownNotice(cs.globalChatDuration()))
 			return
 		}
 		cs.lastGlobalChat = nowMillis()
 	}
 
-	name := m7FormatName(c.username)
-	if cs.rank != RankNone {
-		if title, ok := rankTitles[cs.rank]; ok {
-			name = "[" + title + "] " + name
-		}
-		if colour == "" {
-			colour = "rgba(191, 161, 63, 1.0)"
-		}
-	}
+	name := chat.DisplayName(c.username, cs.rank)
+	colour = chat.ResolveColour(cs.rank, colour)
 
 	if global {
 		// world.globalMessage: [Global] prefix source frame, no bubble.
 		// All-in-one hub routing: resolve the online set via the Router and
 		// unicast; fall back to the existing broadcast when nobody resolves.
-		frame := pkt(PacketChat, chatPacketData{
-			Source:  "[Global] " + name,
-			Message: message,
-			Colour:  colour,
-		})
-		socRouteGlobal(frame)
+		defaultRouter.SendGlobal(chat.GlobalSource(name), message, colour)
 		return
 	}
 
 	// Region-scoped bubble (player.chat → sendToRegions): the broadcast
 	// helper resolves c.instance's tile and fans out to the 9-region
 	// interest sets, matching world.push(Regions).
-	frame := pkt(PacketChat, chatPacketData{
-		Instance:   c.instance,
-		Message:    message,
-		WithBubble: withBubble,
-		Colour:     colour,
-	})
-	broadcast(frame)
+	defaultRouter.SendBubble(c.instance, message, withBubble, colour)
 }
 
 // ---------------------------------------------------------------------------
 // Commands (controllers/commands.ts).
 // ---------------------------------------------------------------------------
 
-// m7ParseCommand ports Commands.parse: strip the prefix, split on spaces,
-// then run the player/mod command tables.
+// m7ParseCommand ports Commands.parse (delegates prefix/split to
+// chat.SplitCommand), then runs the player/mod command tables in order plus
+// the M12 crafting and M13 guild/mod/admin tables.
 func m7ParseCommand(c *playerConn, rawText string) {
-	blocks := strings.Split(strings.TrimPrefix(strings.TrimPrefix(rawText, "/"), ";"), " ")
-	if len(blocks) == 0 || blocks[0] == "" {
+	command, args, ok := chat.SplitCommand(rawText)
+	if !ok {
 		return
 	}
-	command := blocks[0]
-	args := blocks[1:]
 
 	m7PlayerCommands(c, command, args)
 	m7ModeratorCommands(c, command, args)
@@ -288,61 +281,45 @@ func m7ParseCommand(c *playerConn, rawText string) {
 // m7PlayerCommands ports handlePlayerCommands (the subset meaningful in the
 // Go stub world): players, coords, g/gc/global, pm/msg.
 func m7PlayerCommands(c *playerConn, command string, blocks []string) {
-	switch command {
-	case "players":
+	cmd, ok := chat.ClassifyPlayer(command)
+	if !ok {
+		return
+	}
+	switch cmd {
+	case chat.CmdPlayers:
 		names := m7PlayerUsernames()
-		population := len(names)
-		if population == 1 {
-			m6Notify(c, "There is currently 1 person online.")
-		} else {
-			m6Notify(c, fmt.Sprintf("There are currently %d people online.", population))
-		}
+		m6Notify(c, chat.PlayersSummary(len(names)))
 		if chatStateFor(c).rank == RankAdmin {
 			m6Notify(c, strings.Join(names, ", "))
 		}
 
-	case "coords":
-		m6Notify(c, fmt.Sprintf("x: %d y: %d", c.sess.playerX, c.sess.playerY))
+	case chat.CmdCoords:
+		m6Notify(c, chat.CoordsText(c.sess.playerX, c.sess.playerY))
 
-	case "ping":
+	case chat.CmdPing:
 		// player.ping(): Network Ping frame, bypassing the outbox queue.
 		_ = send(c.conn, pktOp(PacketNetwork, NetworkPing, nil))
 
-	case "g", "gc", "global":
-		m7Chat(c, strings.Join(blocks, " "), true, false, "rgba(191, 161, 63, 1.0)")
+	case chat.CmdGlobal:
+		m7Chat(c, strings.Join(blocks, " "), true, false, chat.GlobalColour)
 
-	case "pm", "msg":
-		// commands.ts: username = the text between the two `*` markers, and
-		// the message is every block after the username's blocks (which keeps
-		// the `*username*` wrapper in the delivered text — a Node quirk,
-		// cloned verbatim).
-		joined := strings.Join(blocks, " ")
-		parts := strings.Split(joined, "*")
-		if len(parts) < 2 || parts[1] == "" {
+	case chat.CmdPM:
+		username, message, ok := chat.ParsePrivateMessage(blocks)
+		if !ok {
 			return
 		}
-		username := parts[1]
-		usernameBlocks := len(strings.Fields(username))
-		message := strings.Join(blocks[usernameBlocks:], " ")
-		m7SendPrivateMessage(c, strings.ToLower(username), message)
+		m7SendPrivateMessage(c, username, message)
 	}
 }
 
 // m7ModeratorCommands ports handleModeratorCommands (subset): /teleport.
 // Rank gate mirrors the isMod/isAdmin/isHollowAdmin early return.
 func m7ModeratorCommands(c *playerConn, command string, blocks []string) {
-	if chatStateFor(c).rank < RankModerator {
+	if !chat.ModAllowed(chatStateFor(c).rank) {
 		return
 	}
-	switch command {
-	case "teleport":
-		if len(blocks) < 2 {
-			return
-		}
-		var x, y int
-		_, errX := fmt.Sscanf(blocks[0], "%d", &x)
-		_, errY := fmt.Sscanf(blocks[1], "%d", &y)
-		if errX == nil && errY == nil {
+	if cmd, ok := chat.ClassifyMod(command); ok && cmd == chat.ModTeleport {
+		if x, y, ok := chat.ParseTeleportArgs(blocks); ok {
 			m7Teleport(c, x, y)
 		}
 	}
@@ -356,12 +333,13 @@ func m7SendPrivateMessage(c *playerConn, playerName string, message string) {
 	// an offline target falls back to the existing misc:NOT_ONLINE notify.
 	target := socRouteChat(playerName)
 	if target == nil {
-		m6Notify(c, fmt.Sprintf("misc:NOT_ONLINE;username=%s", playerName))
+		m6Notify(c, chat.PMOffline(playerName))
 		return
 	}
 	formatted := m7FormatName(c.username)
-	m6NotifyWithSource(target, message, "aquamarine", "[From "+formatted+"]")
-	m6NotifyWithSource(c, message, "aquamarine", "[To "+m7FormatName(target.username)+"]")
+	fromSource, toSource := chat.PMSources(formatted, m7FormatName(target.username))
+	defaultRouter.SendSourced(target.username, message, chat.PMColour, fromSource)
+	defaultRouter.SendSourced(c.username, message, chat.PMColour, toSource)
 }
 
 // m7Teleport ports character.teleport: set position, Teleport frame to the
@@ -406,12 +384,15 @@ func m7PlayerByName(name string) *playerConn {
 }
 
 // m6NotifyWithSource is the notify() variant with a source header
-// (player.notify(message, colour, message.title) → Notification Text).
+// (player.notify(message, colour, message.title) → Notification Text). The
+// payload shape lives in the chat package (chat.SourceNotice); this wrapper
+// keeps the established call sites (m7 PM path, m13 jail path) compiling.
 func m6NotifyWithSource(c *playerConn, message string, colour string, source string) {
-	col := colour
-	src := source
+	n := chat.Notice(message, colour, source)
+	col := n.Colour
+	src := n.Source
 	_ = send(c.conn, pktOp(PacketNotification, NotificationText, notificationPacketData{
-		Message: message,
+		Message: n.Message,
 		Colour:  &col,
 		Source:  &src,
 	}))

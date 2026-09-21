@@ -1,4 +1,4 @@
-// Pet companion wiring (behavior-additive root glue over internal/pets).
+// Pet companion wiring (thin root adapter over internal/entity).
 //
 // TS sources (all read-only recon, no new opcodes):
 //   - packages/server/src/game/entity/character/pet/pet.ts — Pet extends
@@ -62,15 +62,21 @@
 //   - Hunger/expiry (internal/pets IsHungry/IsExpired) have no TS source and
 //     are NOT enforced here (documented-skip); born/fed timestamps are kept
 //     so the state probe can report the predicates.
+//
+// Layout: the stateful registry and follow/teleport + attack-mirror
+// orchestration live in internal/entity (imported, not duplicated); this file
+// keeps the World implementation over existing globals (setEntityPos,
+// broadcast, Movement/Spawn frames, m5 state, combat pipeline) plus thin
+// wrappers so main.go/m6.go call sites compile UNCHANGED.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
+	"rpg-world-server/internal/entity"
 	"rpg-world-server/internal/pets"
 )
 
@@ -82,37 +88,15 @@ const petEntityType = 7
 const petPickup = 0
 
 // petMirrorDamage is the fixed pet swing damage (new-in-Go; TS pets never
-// attack). Small enough to never skew combat-harness DPS (pets only exist
-// when explicitly granted).
-const petMirrorDamage = 3
+// attack). Alias of entity.MirrorDamage; the orchestration passes the value
+// through the World seam so this file never hard-codes a second copy.
+const petMirrorDamage = entity.MirrorDamage
 
-// petItemMob maps items.json pet-item keys to their "pet" mob keys
-// (verified: ratpet->rat, rathatpet->rathat, ratballoonpet->ratballoon;
-// royalpet quest reward "catpet"->cat by the same "<mob>pet" convention).
-var petItemMob = map[string]string{
-	"ratpet":        "rat",
-	"rathatpet":     "rathat",
-	"ratballoonpet": "ratballoon",
-	"catpet":        "cat",
-}
+// petRecord is one live companion (alias of the entity registry record).
+type petRecord = entity.Record
 
-// petRecord is one live companion. Owner is the owner's player instance.
-type petRecord struct {
-	Instance string
-	MobKey   string
-	ItemKey  string
-	Owner    string
-	X, Y     int
-	BornMs   int64
-	FedMs    int64
-}
-
-var (
-	petMu         sync.Mutex
-	petByOwner    = map[string]*petRecord{}
-	petByInstance = map[string]*petRecord{}
-	petSeq        int64
-)
+// petRegistry is the live companion store (owned by internal/entity).
+var petRegistry = entity.NewRegistry()
 
 // petSpawnData mirrors PetData (common/types/pet.d.ts): EntityData plus the
 // `owner` instance string the client createPet reads (EntityData only carries
@@ -152,6 +136,91 @@ func petFollowFrame(instance, owner string) []any {
 	})
 }
 
+// petWorld implements entity.World over the existing root globals. All frame
+// construction (Spawn/Movement/Despawn/Animation/Combat) and all m5/combat
+// pipeline calls stay here; internal/entity only decides what happens.
+type petWorld struct{}
+
+func (petWorld) OwnerPos(owner string) (int, int, bool) {
+	return entityPos(owner)
+}
+
+func (petWorld) SpawnPet(rec entity.Record) {
+	setEntityPos(rec.Instance, rec.X, rec.Y)
+	broadcast(pkt(PacketSpawn, petPayload(&rec)))
+	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+}
+
+func (petWorld) MovePet(rec entity.Record) {
+	setEntityPos(rec.Instance, rec.X, rec.Y)
+	broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
+		Instance: rec.Instance, X: intp(rec.X), Y: intp(rec.Y),
+	}))
+	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+}
+
+func (petWorld) TeleportPet(rec entity.Record) {
+	setEntityPos(rec.Instance, rec.X, rec.Y)
+	broadcast(pkt(PacketDespawn, despawnData{Instance: rec.Instance}))
+	broadcast(pkt(PacketSpawn, petPayload(&rec)))
+	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+	log.Printf("pets: %s teleported to owner %s (%d,%d)", rec.Instance, rec.Owner, rec.X, rec.Y)
+}
+
+func (petWorld) DespawnPet(instance string) {
+	entitiesMu.Lock()
+	delete(entities, instance)
+	entitiesMu.Unlock()
+	broadcast(pkt(PacketDespawn, despawnData{Instance: instance}))
+}
+
+func (petWorld) IsMob(target string) bool {
+	return m9MobFor(target) != nil
+}
+
+func (petWorld) HitMob(petInstance, ownerInstance, target string, dmg int) {
+	m := m9MobFor(target)
+	if m == nil {
+		return
+	}
+	broadcast(pkt(PacketAnimation, animationData{Instance: petInstance, Action: ActionAttack}))
+	broadcast(pktOp(PacketCombat, CombatHit, combatData{
+		Instance: petInstance, Target: target,
+		Hit: HitData{Type: HitsNormal, Damage: dmg},
+	}))
+	m9PlayerHit(m, petConnByInstance(ownerInstance), dmg)
+	log.Printf("pets: %s mirrored %s -> %s dmg=%d", petInstance, ownerInstance, target, dmg)
+}
+
+func (petWorld) HitDummy(petInstance, ownerInstance string, dmg int) bool {
+	combatMu.Lock()
+	defer combatMu.Unlock()
+	if combatDead {
+		return false
+	}
+	applyBossHitLocked(petInstance, dmg, HitsNormal, nil, false, -1, true)
+	log.Printf("pets: %s mirrored %s -> dummy dmg=%d", petInstance, ownerInstance, dmg)
+	return true
+}
+
+func (petWorld) DummyTarget() string {
+	return combatDummyInstance
+}
+
+// petConnByInstance resolves a live playerConn by instance for combat credit
+// (retaliate/loot/quest flow). Nil when the owner is gone; m9PlayerHit is
+// nil-safe (skips credit, still applies broadcast-side damage already sent).
+func petConnByInstance(instance string) *playerConn {
+	playersMu.Lock()
+	defer playersMu.Unlock()
+	for _, c := range players {
+		if c.instance == instance {
+			return c
+		}
+	}
+	return nil
+}
+
 // petGrant spawns a companion for the owner's connection (player.ts setPet:
 // ALREADY_HAVE_PET guard, spawn at the owner's tile, immediate follow).
 // Returns nil when the owner already has a pet.
@@ -159,96 +228,39 @@ func petGrant(c *playerConn, mobKey, itemKey string) *petRecord {
 	if c == nil || mobKey == "" {
 		return nil
 	}
-	if itemKey == "" {
-		itemKey = mobKey + "pet"
-	}
-	petMu.Lock()
-	if _, has := petByOwner[c.instance]; has {
-		petMu.Unlock()
+	now := time.Now().UnixMilli()
+	rec, already := petRegistry.Grant(c.instance, c.sess.playerX, c.sess.playerY, mobKey, itemKey, now)
+	if already {
 		m6Notify(c, "misc:ALREADY_HAVE_PET")
 		return nil
 	}
-	petSeq++
-	now := time.Now().UnixMilli()
-	r := &petRecord{
-		Instance: fmt.Sprintf("pet-%d", petSeq),
-		MobKey:   mobKey, ItemKey: itemKey, Owner: c.instance,
-		X: c.sess.playerX, Y: c.sess.playerY,
-		BornMs: now, FedMs: now,
+	if rec == nil {
+		return nil
 	}
-	petByOwner[c.instance] = r
-	petByInstance[r.Instance] = r
-	petMu.Unlock()
-	setEntityPos(r.Instance, r.X, r.Y)
-	broadcast(pkt(PacketSpawn, petPayload(r)))
-	broadcast(petFollowFrame(r.Instance, r.Owner))
-	log.Printf("pets: %s granted %s (%s) at %d,%d", c.instance, r.Instance, mobKey, r.X, r.Y)
-	return r
+	petWorld{}.SpawnPet(*rec)
+	log.Printf("pets: %s granted %s (%s) at %d,%d", c.instance, rec.Instance, mobKey, rec.X, rec.Y)
+	return rec
 }
 
 // petHasOwner reports whether the player instance currently owns a pet.
 func petHasOwner(owner string) bool {
-	petMu.Lock()
-	defer petMu.Unlock()
-	return petByOwner[owner] != nil
+	return petRegistry.Has(owner)
 }
 
 // petPayloadByInstance resolves a Who lookup for a live pet instance.
 func petPayloadByInstance(instance string) (any, bool) {
-	petMu.Lock()
-	r := petByInstance[instance]
-	petMu.Unlock()
-	if r == nil {
+	r, ok := petRegistry.ByInstance(instance)
+	if !ok {
 		return nil, false
 	}
-	return petPayload(r), true
+	return petPayload(&r), true
 }
 
 // petTick steps every owned pet toward its owner (called from the central
-// 20Hz tick loop; empty registry = no frames). Teleport (despawn + respawn
-// at the owner) beyond pets.TeleportDistance, else one FollowStep + Move and
-// Follow frames. Pets never block movement: no blocked() consult, no
-// resourceEntities registration (collision checks only see tiles + resources).
+// 20Hz tick loop; empty registry = no frames). Orchestration lives in
+// internal/entity; frames stay in the petWorld seam above.
 func petTick() {
-	petMu.Lock()
-	recs := make([]*petRecord, 0, len(petByOwner))
-	for _, r := range petByOwner {
-		recs = append(recs, r)
-	}
-	petMu.Unlock()
-	for _, r := range recs {
-		ox, oy, ok := entityPos(r.Owner)
-		if !ok {
-			continue // owner gone (disconnect cleanup removes the pet)
-		}
-		petMu.Lock()
-		px, py := r.X, r.Y
-		petMu.Unlock()
-		switch {
-		case pets.ShouldTeleport(ox, oy, px, py):
-			petMu.Lock()
-			r.X, r.Y = ox, oy
-			petMu.Unlock()
-			setEntityPos(r.Instance, ox, oy)
-			broadcast(pkt(PacketDespawn, despawnData{Instance: r.Instance}))
-			broadcast(pkt(PacketSpawn, petPayload(r)))
-			broadcast(petFollowFrame(r.Instance, r.Owner))
-			log.Printf("pets: %s teleported to owner %s (%d,%d)", r.Instance, r.Owner, ox, oy)
-		case pets.ShouldFollow(ox, oy, px, py):
-			nx, ny := pets.FollowStep(ox, oy, px, py)
-			if nx == px && ny == py {
-				continue
-			}
-			petMu.Lock()
-			r.X, r.Y = nx, ny
-			petMu.Unlock()
-			setEntityPos(r.Instance, nx, ny)
-			broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
-				Instance: r.Instance, X: intp(nx), Y: intp(ny),
-			}))
-			broadcast(petFollowFrame(r.Instance, r.Owner))
-		}
-	}
+	petRegistry.Tick(petWorld{})
 }
 
 // petMirrorSwing ports the attack-mirror (new-in-Go; TS pets never attack):
@@ -259,31 +271,7 @@ func petMirrorSwing(c *playerConn, target string) {
 	if c == nil || target == "" {
 		return
 	}
-	petMu.Lock()
-	r := petByOwner[c.instance]
-	petMu.Unlock()
-	if r == nil {
-		return
-	}
-	if m := m9MobFor(target); m != nil {
-		broadcast(pkt(PacketAnimation, animationData{Instance: r.Instance, Action: ActionAttack}))
-		broadcast(pktOp(PacketCombat, CombatHit, combatData{
-			Instance: r.Instance, Target: target,
-			Hit: HitData{Type: HitsNormal, Damage: petMirrorDamage},
-		}))
-		m9PlayerHit(m, c, petMirrorDamage)
-		log.Printf("pets: %s mirrored %s -> %s dmg=%d", r.Instance, c.instance, target, petMirrorDamage)
-		return
-	}
-	if target == combatDummyInstance {
-		combatMu.Lock()
-		defer combatMu.Unlock()
-		if combatDead {
-			return
-		}
-		applyBossHitLocked(r.Instance, petMirrorDamage, HitsNormal, nil, false, -1, true)
-		log.Printf("pets: %s mirrored %s -> dummy dmg=%d", r.Instance, c.instance, petMirrorDamage)
-	}
+	petRegistry.Mirror(petWorld{}, c.instance, target)
 }
 
 // petForgetPlayer despawns + drops pet state on disconnect (abForgetPlayer /
@@ -292,20 +280,11 @@ func petForgetPlayer(c *playerConn) {
 	if c == nil {
 		return
 	}
-	petMu.Lock()
-	r := petByOwner[c.instance]
-	if r != nil {
-		delete(petByOwner, c.instance)
-		delete(petByInstance, r.Instance)
-	}
-	petMu.Unlock()
-	if r == nil {
+	r, ok := petRegistry.RemoveByOwner(c.instance)
+	if !ok {
 		return
 	}
-	entitiesMu.Lock()
-	delete(entities, r.Instance)
-	entitiesMu.Unlock()
-	broadcast(pkt(PacketDespawn, despawnData{Instance: r.Instance}))
+	petWorld{}.DespawnPet(r.Instance)
 	log.Printf("pets: %s forgotten on disconnect of %s", r.Instance, c.instance)
 }
 
@@ -322,10 +301,8 @@ func petHandlePacket(c *playerConn, frame clientFrame) {
 	if err := json.Unmarshal(frame[1], &d); err != nil || d.Opcode == nil || *d.Opcode != petPickup {
 		return
 	}
-	petMu.Lock()
-	r := petByOwner[c.instance]
-	petMu.Unlock()
-	if r == nil {
+	r, ok := petRegistry.ByOwner(c.instance)
+	if !ok {
 		return
 	}
 	if len(m5StateFor(c.username).Inv) >= ModulesInventorySize {
@@ -338,19 +315,13 @@ func petHandlePacket(c *playerConn, frame clientFrame) {
 		Slot: &slotData{Index: idx, Key: r.ItemKey, Count: 1, Enchantments: map[string]any{}},
 	}))
 	markDirty(c.username)
-	petMu.Lock()
-	delete(petByOwner, c.instance)
-	delete(petByInstance, r.Instance)
-	petMu.Unlock()
-	entitiesMu.Lock()
-	delete(entities, r.Instance)
-	entitiesMu.Unlock()
-	broadcast(pkt(PacketDespawn, despawnData{Instance: r.Instance}))
+	_, _ = petRegistry.RemoveByOwner(c.instance)
+	petWorld{}.DespawnPet(r.Instance)
 	log.Printf("pets: %s picked up by %s (+%s)", r.Instance, c.instance, r.ItemKey)
 }
 
 // petDropKey peeks the inventory slot for a pet item (handler.ts
-// item.isPetItem() parity via the items.json table above).
+// item.isPetItem() parity via the items.json table in internal/entity).
 func petDropKey(c *playerConn, index int) (mob, item string, ok bool) {
 	st := m5StateFor(c.username)
 	pstateMu.Lock()
@@ -359,7 +330,7 @@ func petDropKey(c *playerConn, index int) (mob, item string, ok bool) {
 		return "", "", false
 	}
 	key := st.Inv[index].Key
-	mob, ok = petItemMob[key]
+	mob, ok = entity.LookupItem(key)
 	if !ok {
 		return "", "", false
 	}
@@ -369,15 +340,7 @@ func petDropKey(c *playerConn, index int) (mob, item string, ok bool) {
 // petResolveKey accepts a pet-item key ("ratpet") or a mob key ("rat",
 // "cat") for the debug grant; unknown/empty defaults to rat/ratpet.
 func petResolveKey(key string) (mob, item string) {
-	if m, ok := petItemMob[key]; ok {
-		return m, key
-	}
-	for _, m := range petItemMob {
-		if key == m {
-			return m, m + "pet"
-		}
-	}
-	return "rat", "ratpet"
+	return entity.ResolveKey(key)
 }
 
 // petTestHandler is the TESTMAP-only debug dispatcher (m9test/m11test/abtest
@@ -401,10 +364,8 @@ func petTestHandler(c *playerConn, data []byte) {
 			m6Notify(c, fmt.Sprintf("pet:grant %s mob=%s at=%d,%d", r.Instance, mob, r.X, r.Y))
 		}
 	case "state":
-		petMu.Lock()
-		r := petByOwner[c.instance]
-		petMu.Unlock()
-		if r == nil {
+		r, ok := petRegistry.ByOwner(c.instance)
+		if !ok {
 			m6Notify(c, "pet:state none")
 			return
 		}
@@ -421,21 +382,12 @@ func petTestHandler(c *playerConn, data []byte) {
 			// never-elapsing lifespan.
 			pets.IsHungry(now, r.FedMs), pets.IsExpired(now, r.BornMs, 1<<62)))
 	case "remove":
-		petMu.Lock()
-		r := petByOwner[c.instance]
-		if r != nil {
-			delete(petByOwner, c.instance)
-			delete(petByInstance, r.Instance)
-		}
-		petMu.Unlock()
-		if r == nil {
+		r, ok := petRegistry.RemoveByOwner(c.instance)
+		if !ok {
 			m6Notify(c, "pet:state none")
 			return
 		}
-		entitiesMu.Lock()
-		delete(entities, r.Instance)
-		entitiesMu.Unlock()
-		broadcast(pkt(PacketDespawn, despawnData{Instance: r.Instance}))
+		petWorld{}.DespawnPet(r.Instance)
 		m6Notify(c, "pet:removed "+r.Instance)
 	}
 }

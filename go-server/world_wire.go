@@ -1,5 +1,7 @@
 // World wiring (warps + events + lights/signs globals) — behavior-additive
-// root glue over internal/warps, internal/events and internal/globals.
+// thin adapter over internal/controller (warps + events orchestration) and
+// internal/worldmap glow (lights/sign orchestration), reusing the pure
+// internal/warps, internal/events and internal/globals packages.
 //
 // TS sources (all read-only recon, no new packet shapes):
 //   - packages/server/src/controllers/warps.ts — menu-driven warp(id):
@@ -64,6 +66,24 @@
 //   - Sign distance gate skipped (lenient like m5Pickup): Target on a sign
 //     position works from anywhere so the e2e can reach the far-away real
 //     signs; logged.
+//
+// Split notes (E1c): stateful orchestration moved WITHOUT behavior change:
+//   - internal/controller WarpController owns the warp registry, the
+//     menu-gating table and cooldown clocks (gate outcome computation +
+//     WORLD_WARP_COOLDOWN_MS semantics); this file keeps the World impl
+//     (worldWarpStore over m13/m5/m11/m7 globals) plus teleport side
+//     effects, delegating gates/landing to the controller.
+//   - internal/controller EventController owns the rotation scheduler plus
+//     the active set/fired counters (WORLD_EVENT_MS semantics); this file
+//     keeps the global-notice fan-out and the m5 multiplier probes.
+//   - internal/worldmap Glow owns the globals snapshot plus per-conn
+//     lightsLoaded dedupe (and sign paging helpers); this file keeps packet
+//     construction (worldLightData/worldBubbleData) and transport through
+//     the GlowWorld seam.
+//   - Stayed in root (cannot move cleanly): playerConn transport (send/
+//     broadcast/updateClientRegion/setEntityPos), m5/m6/m7/m10/m11/m13
+//     state reads, TESTMAP/clean/combat mode flags, worldPath resolution,
+//     packet shapes, tick cadence, TESTMAP debug strings.
 package main
 
 import (
@@ -71,123 +91,100 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/events"
 	"rpg-world-server/internal/globals"
-	"rpg-world-server/internal/warps"
+	"rpg-world-server/internal/worldmap"
 )
+
+// ---------------------------------------------------------------------------
+// Registries (thin singletons delegating to the new packages).
+// ---------------------------------------------------------------------------
+
+var (
+	worldWarpCtl  = controller.NewWarpController()
+	worldEventCtl = controller.NewEventController()
+	worldGlow     = worldmap.NewGlow()
+)
+
+// worldWarpExt aliases the controller gating entry so call sites keep
+// their signatures.
+type worldWarpExt = controller.WarpEntry
+
+// worldWarpNames mirrors Modules.Warps order (modules.ts:206-213): the C->S
+// Warp {id} indexes this enum, controllers/warps.ts getWarp lowercases the
+// name to find the world.json entry.
+var worldWarpNames = controller.WarpNames
 
 // ---------------------------------------------------------------------------
 // Warps.
 // ---------------------------------------------------------------------------
 
-// worldWarpNames mirrors Modules.Warps order (modules.ts:206-213): the C->S
-// Warp {id} indexes this enum, controllers/warps.ts getWarp lowercases the
-// name to find the world.json entry.
-var worldWarpNames = []string{
-	"mudwich", "aynor", "lakesworld", "patsow", "crullfield", "undersea",
-}
-
-// worldWarpExt is one world.json areas.warps entry with the menu-gating
-// fields the geometry-only internal/warps package intentionally drops.
-type worldWarpExt struct {
-	Name  string
-	X, Y  int
-	W, H  int
-	Level int
-	Quest string
-	Ach   string
-}
-
-var (
-	worldWarpMu   sync.Mutex
-	worldWarps    []worldWarpExt
-	worldWarpReg  *warps.Registry
-	worldWarpLast = map[string]int64{} // username -> last warp unix-ms
-)
-
 // worldWarpCooldownMs is the TS warpTimeout (warps.ts: 300s between warps).
 // WORLD_WARP_COOLDOWN_MS overrides it (0 disables, for the e2e).
 func worldWarpCooldownMs() int64 {
-	if v := os.Getenv("WORLD_WARP_COOLDOWN_MS"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
-			return n
-		}
+	return controller.CooldownMs()
+}
+
+// worldWarpStore implements controller.WarpStore over the root globals.
+// IsAdmin reads the warping conn's rank (chatStateFor parity); the rest
+// read by username like the pre-split inline checks.
+type worldWarpStore struct {
+	c *playerConn
+}
+
+func (s worldWarpStore) IsJailed(username string) bool {
+	return m13IsJailed(username)
+}
+
+func (s worldWarpStore) IsAdmin(username string) bool {
+	if s.c == nil {
+		return false
 	}
-	return 300_000
+	return chatStateFor(s.c).rank >= RankAdmin
+}
+
+func (s worldWarpStore) PlayerLevel(username string) int {
+	return m5StateFor(username).Level
+}
+
+func (s worldWarpStore) QuestFinished(username, quest string) bool {
+	return m11StateFor(username).isFinished(quest)
+}
+
+func (s worldWarpStore) AchievementDone(username, ach string) bool {
+	def := m11A[ach]
+	st := m11StateFor(username)
+	return def != nil && st.Achs[ach] >= def.StageCount
+}
+
+func (s worldWarpStore) FormatName(name string) string {
+	return m7FormatName(name)
 }
 
 // worldBootWarps loads the warp registry + the menu-gating table from the
 // same world.json path the map loader uses.
 func worldBootWarps() {
-	reg, err := warps.Load(worldPath())
-	if err != nil {
+	if err := worldWarpCtl.Load(worldPath()); err != nil {
 		log.Printf("world: warps: %v (warp engine disabled)", err)
 		return
 	}
-	worldWarpReg = reg
-	raw, err := os.ReadFile(worldPath())
-	if err != nil {
-		log.Printf("world: warps reread: %v", err)
-		return
-	}
-	var doc struct {
-		Areas struct {
-			Warps []struct {
-				Name        string `json:"name"`
-				X           int    `json:"x"`
-				Y           int    `json:"y"`
-				Width       int    `json:"width"`
-				Height      int    `json:"height"`
-				Level       int    `json:"level"`
-				Quest       string `json:"quest"`
-				Achievement string `json:"achievement"`
-			} `json:"warps"`
-		} `json:"areas"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		log.Printf("world: warps parse: %v", err)
-		return
-	}
-	worldWarpMu.Lock()
-	worldWarps = worldWarps[:0]
-	for _, w := range doc.Areas.Warps {
-		worldWarps = append(worldWarps, worldWarpExt{
-			Name: strings.ToLower(w.Name), X: w.X, Y: w.Y,
-			W: w.Width, H: w.Height,
-			Level: w.Level, Quest: w.Quest, Ach: w.Achievement,
-		})
-	}
-	worldWarpMu.Unlock()
-	log.Printf("world: warps loaded=%d", len(doc.Areas.Warps))
+	log.Printf("world: warps loaded=%d", worldWarpCtl.Count())
 }
 
 // worldFindWarp resolves a warp by Modules.Warps enum id (getWarp parity).
 func worldFindWarp(id int) *worldWarpExt {
-	if id < 0 || id >= len(worldWarpNames) {
-		return nil
-	}
-	return worldFindWarpByName(worldWarpNames[id])
+	return worldWarpCtl.FindByID(id)
 }
 
 // worldFindWarpByName resolves a warp by (case-insensitive) name.
 func worldFindWarpByName(name string) *worldWarpExt {
-	key := strings.ToLower(strings.TrimSpace(name))
-	worldWarpMu.Lock()
-	defer worldWarpMu.Unlock()
-	for i := range worldWarps {
-		if worldWarps[i].Name == key {
-			w := worldWarps[i]
-			return &w
-		}
-	}
-	return nil
+	return worldWarpCtl.FindByName(name)
 }
 
 // worldHandleWarp routes C->S Warp frames [39,{id}] (incoming.ts handleWarp).
@@ -216,43 +213,15 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 	if w.W <= 0 || w.H <= 0 {
 		return false
 	}
-	if m13IsJailed(c.username) {
-		m6Notify(c, "warps:CANNOT_WARP_JAIL")
-		return false
-	}
 	nowMs := time.Now().UnixMilli()
-	if cd := worldWarpCooldownMs(); cd > 0 && chatStateFor(c).rank < RankAdmin {
-		worldWarpMu.Lock()
-		last := worldWarpLast[c.username]
-		worldWarpMu.Unlock()
-		if nowMs-last < cd {
-			left := cd - (nowMs - last)
-			dur := fmt.Sprintf("%d seconds", left/1000)
-			if left > 60_000 {
-				dur = fmt.Sprintf("%d minutes", (left+59_999)/60_000)
-			}
-			m6Notify(c, "warps:CANNOT_WARP_COOLDOWN;time="+dur)
-			return false
-		}
-	}
-	if w.Level > 0 && m5StateFor(c.username).Level < w.Level {
-		m6Notify(c, "warps:CANNOT_WARP_LEVEL;level="+strconv.Itoa(w.Level))
+	if deny := worldWarpCtl.Authorize(c.username, w, nowMs, worldWarpStore{c: c}); deny != "" {
+		m6Notify(c, deny)
 		return false
 	}
-	if w.Quest != "" && !m11StateFor(c.username).isFinished(w.Quest) {
-		m6Notify(c, "warps:CANNOT_WARP_QUEST;questName="+w.Quest+";name="+m7FormatName(w.Name))
+	lx, ly, ok := controller.Landing(w, rand.Intn)
+	if !ok {
 		return false
 	}
-	if w.Ach != "" {
-		def := m11A[w.Ach]
-		st := m11StateFor(c.username)
-		if def == nil || st.Achs[w.Ach] < def.StageCount {
-			m6Notify(c, "warps:CANNOT_WARP_ACHIEVEMENT")
-			return false
-		}
-	}
-	lx := w.X + rand.Intn(w.W)
-	ly := w.Y + rand.Intn(w.H)
 	c.sess.playerX, c.sess.playerY = lx, ly
 	setEntityPos(c.instance, lx, ly)
 	updateClientRegion(c)
@@ -260,9 +229,7 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 	m10OnPositionUpdate(c)
 	m5TrackPos(c)
 	worldPushLights(c)
-	worldWarpMu.Lock()
-	worldWarpLast[c.username] = nowMs
-	worldWarpMu.Unlock()
+	worldWarpCtl.Record(c.username, nowMs)
 	m6Notify(c, "warps:WARPED_TO;name="+m7FormatName(w.Name))
 	log.Printf("world: %s warped to %s (%d,%d)", c.username, w.Name, lx, ly)
 	return true
@@ -272,47 +239,18 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 // Events.
 // ---------------------------------------------------------------------------
 
-var (
-	worldEventMu     sync.Mutex
-	worldEvents      *events.Scheduler
-	worldEventActive = map[string]bool{}
-	worldEventFired  int
-	worldEventEvery  int64
-)
-
 // worldBootEvents starts the rotation scheduler. WORLD_EVENT_MS overrides the
 // per-event cadence (test hook for fast event-notice legs); default keeps the
 // TS hourly cadence from DefaultEvents.
 func worldBootEvents() {
-	list := events.DefaultEvents()
-	every := events.CheckIntervalMs
-	if v := os.Getenv("WORLD_EVENT_MS"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			for i := range list {
-				list[i].IntervalMs = n
-			}
-			every = n
-		}
-	}
-	worldEventMu.Lock()
-	worldEventEvery = every
-	worldEventMu.Unlock()
-	worldEvents = events.NewScheduler(list)
-	worldEvents.Start()
-	log.Printf("world: events started=%d intervalMs=%d", len(list), every)
+	n, every := worldEventCtl.Boot()
+	log.Printf("world: events started=%d intervalMs=%d", n, every)
 }
 
 // worldEventTick fans due rotation events out as global notices. Called from
 // the central 20Hz tick loop (additive: no events due most ticks).
 func worldEventTick() {
-	if worldEvents == nil {
-		return
-	}
-	for _, e := range worldEvents.Due(time.Now().UnixMilli()) {
-		worldEventMu.Lock()
-		worldEventActive[e.Key] = true
-		worldEventFired++
-		worldEventMu.Unlock()
+	for _, e := range worldEventCtl.Due(time.Now().UnixMilli()) {
 		socRouteGlobal(pkt(PacketChat, chatPacketData{
 			Source:  "[Global] WORLD",
 			Message: "The " + e.Name + " event has started.",
@@ -325,10 +263,7 @@ func worldEventTick() {
 // active (events.ts doubleDropProbability parity, expressed as a repeated
 // roll). Dormant otherwise — callers pass the roll through unchanged.
 func worldDoubleDrops(drops []m5Drop) []m5Drop {
-	worldEventMu.Lock()
-	on := worldEventActive["double-drops"]
-	worldEventMu.Unlock()
-	if !on || len(drops) == 0 {
+	if !worldEventCtl.IsActive("double-drops") || len(drops) == 0 {
 		return drops
 	}
 	out := make([]m5Drop, 0, len(drops)*2)
@@ -337,21 +272,17 @@ func worldDoubleDrops(drops []m5Drop) []m5Drop {
 
 // worldXPBoost reports the 1.5x experience event (experiencePerHit parity).
 func worldXPBoost() bool {
-	worldEventMu.Lock()
-	defer worldEventMu.Unlock()
-	return worldEventActive["experience"]
+	return worldEventCtl.IsActive("experience")
 }
 
 // worldHarvestDouble reports the lumberjacking/mining double-yield events
 // (Utils.doubleLumberjacking/doubleMining parity) for a gathering skill.
 func worldHarvestDouble(skill string) bool {
-	worldEventMu.Lock()
-	defer worldEventMu.Unlock()
 	switch skill {
 	case "lumberjacking":
-		return worldEventActive["lumberjacking"]
+		return worldEventCtl.IsActive("lumberjacking")
 	case "mining":
-		return worldEventActive["mining"]
+		return worldEventCtl.IsActive("mining")
 	}
 	return false
 }
@@ -362,18 +293,10 @@ func worldHarvestDouble(skill string) bool {
 
 // Overlay Lamp opcodes (Opcodes.Overlay: Set0 Remove1 Lamp2 RemoveLamps3;
 // m10.go only names Set/Remove, so Lamp lives here).
-const OverlayLamp = 2
+const OverlayLamp = worldmap.OverlayLamp
 
 // Bubble opcodes (Opcodes.Bubble: Entity0 Position1).
-const BubblePosition = 1
-
-var (
-	worldGlowMu  sync.Mutex
-	worldGlobals *globals.Globals
-	// worldLampsLoaded mirrors player.lightsLoaded (handler.ts): per-instance
-	// set of already-sent "x-y" lights so region re-entry stays silent.
-	worldLampsLoaded = map[string]map[string]bool{}
-)
+const BubblePosition = worldmap.BubblePosition
 
 // worldLightData mirrors SerializedLight (overlay.ts) for Lamp frames.
 type worldLightData struct {
@@ -395,25 +318,54 @@ type worldBubbleData struct {
 	Y        *int   `json:"y,omitempty"`
 }
 
+// worldGlowWorld implements worldmap.GlowWorld over the root transport:
+// region math via regionOf/surroundingRegions, sends via send() unicast to
+// the conn holding the instance. Packet shapes are unchanged.
+type worldGlowWorld struct{}
+
+func (worldGlowWorld) RegionOf(x, y int) int { return regionOf(x, y) }
+
+func (worldGlowWorld) SurroundingRegions(rid int) []int { return surroundingRegions(rid) }
+
+func (worldGlowWorld) SendLamp(instance string, l globals.Light) {
+	c := connByInstance(instance)
+	if c == nil {
+		return
+	}
+	_ = send(c.conn, pktOp(PacketOverlay, OverlayLamp, map[string]any{
+		"light": worldLightData{
+			Instance: fmt.Sprintf("light-%d-%d", l.X, l.Y),
+			X:        l.X, Y: l.Y, Colour: l.Colour,
+			Diffuse:          0.2,
+			Distance:         l.Radius,
+			FlickerSpeed:     300,
+			FlickerIntensity: 1,
+		},
+	}))
+}
+
+func (worldGlowWorld) SendBubble(instance, bubbleInstance, text string, x, y int) {
+	c := connByInstance(instance)
+	if c == nil {
+		return
+	}
+	_ = send(c.conn, pktOp(PacketBubble, BubblePosition, worldBubbleData{
+		Instance: bubbleInstance, Text: text, X: intp(x), Y: intp(y),
+	}))
+}
+
 // worldBootGlobals loads lights/signs from world.json. TESTMAP gets one
 // synthetic lamp next to spawn (documented divergence: the real lights are
 // far from the stub spawn, so region-enter would otherwise never emit Lamp).
 func worldBootGlobals() {
-	g, err := globals.Load(worldPath())
-	if err != nil {
+	if err := worldGlow.Load(worldPath()); err != nil {
 		log.Printf("world: globals: %v (lights/signs disabled)", err)
 		return
 	}
-	if testMode && !cleanMode && !combatMode && len(g.LightsFor(regionOf(102, 96))) == 0 {
-		g.Lights = append(g.Lights, globals.Light{
-			X: 102, Y: 96, Radius: globals.DefaultLightRadius,
-			Colour: globals.DefaultLightColour,
-		})
+	if worldGlow.EnsureTestLamp(testMode, cleanMode, combatMode, regionOf) {
 		log.Printf("world: TESTMAP synthetic lamp at 102,96")
 	}
-	worldGlowMu.Lock()
-	worldGlobals = g
-	worldGlowMu.Unlock()
+	g := worldGlow.Globals()
 	log.Printf("world: globals lights=%d signs=%d", len(g.Lights), len(g.Signs))
 }
 
@@ -424,63 +376,19 @@ func worldPushLights(c *playerConn) {
 	if c == nil || c.username == "" {
 		return
 	}
-	worldGlowMu.Lock()
-	g := worldGlobals
-	worldGlowMu.Unlock()
-	if g == nil {
+	if worldGlow.Globals() == nil {
 		return
 	}
-	rid := regionOf(c.sess.playerX, c.sess.playerY)
-	worldGlowMu.Lock()
-	loaded := worldLampsLoaded[c.instance]
-	if loaded == nil {
-		loaded = map[string]bool{}
-		worldLampsLoaded[c.instance] = loaded
-	}
-	var fresh []globals.Light
-	for _, r := range surroundingRegions(rid) {
-		for _, l := range g.LightsFor(r) {
-			key := strconv.Itoa(l.X) + "-" + strconv.Itoa(l.Y)
-			if loaded[key] {
-				continue
-			}
-			loaded[key] = true
-			fresh = append(fresh, l)
-		}
-	}
-	worldGlowMu.Unlock()
-	for _, l := range fresh {
-		_ = send(c.conn, pktOp(PacketOverlay, OverlayLamp, map[string]any{
-			"light": worldLightData{
-				Instance: fmt.Sprintf("light-%d-%d", l.X, l.Y),
-				X:        l.X, Y: l.Y, Colour: l.Colour,
-				Diffuse:          0.2,
-				Distance:         l.Radius,
-				FlickerSpeed:     300,
-				FlickerIntensity: 1,
-			},
-		}))
-	}
-	if len(fresh) > 0 {
-		log.Printf("world: %s lamps=%d (region %d)", c.username, len(fresh), rid)
+	n := worldGlow.Push(worldGlowWorld{}, c.instance, c.sess.playerX, c.sess.playerY)
+	if n > 0 {
+		log.Printf("world: %s lamps=%d (region %d)", c.username, n, regionOf(c.sess.playerX, c.sess.playerY))
 	}
 }
 
 // worldPushLightsForce clears the per-conn loaded set then pushes (debug
 // re-send for the worldtest lights leg).
 func worldPushLightsForce(c *playerConn) int {
-	worldGlowMu.Lock()
-	delete(worldLampsLoaded, c.instance)
-	g := worldGlobals
-	worldGlowMu.Unlock()
-	if g == nil {
-		return 0
-	}
-	worldPushLights(c)
-	worldGlowMu.Lock()
-	n := len(worldLampsLoaded[c.instance])
-	worldGlowMu.Unlock()
-	return n
+	return worldGlow.PushForce(worldGlowWorld{}, c.instance, c.sess.playerX, c.sess.playerY)
 }
 
 // worldForgetPlayer drops per-conn lamp state on disconnect.
@@ -488,47 +396,17 @@ func worldForgetPlayer(c *playerConn) {
 	if c == nil {
 		return
 	}
-	worldGlowMu.Lock()
-	delete(worldLampsLoaded, c.instance)
-	worldGlowMu.Unlock()
+	worldGlow.Forget(c.instance)
 }
 
 // worldSignTalk handles Target Talk on a sign position ("x-y" instance,
 // player.ts handleObjectInteraction parity): Bubble Position with talkIndex
 // paging over the comma-split text. Reports whether a sign matched.
 func worldSignTalk(c *playerConn, instance string) bool {
-	worldGlowMu.Lock()
-	g := worldGlobals
-	worldGlowMu.Unlock()
-	if g == nil {
-		return false
-	}
-	parts := strings.Split(instance, "-")
-	if len(parts) != 2 {
-		return false
-	}
-	x, errX := strconv.Atoi(parts[0])
-	y, errY := strconv.Atoi(parts[1])
-	if errX != nil || errY != nil {
-		return false
-	}
-	s, ok := g.SignAt(x, y)
+	msg, ok := worldGlow.TalkWith(worldGlowWorld{}, c.instance, instance, &c.talkNPC, &c.talkIndex)
 	if !ok {
 		return false
 	}
-	pages := strings.Split(s.Text, ",")
-	if len(pages) == 0 {
-		return false
-	}
-	if c.talkNPC != instance {
-		c.talkNPC = instance
-		c.talkIndex = 0
-	}
-	msg := pages[c.talkIndex%len(pages)]
-	c.talkIndex++
-	_ = send(c.conn, pktOp(PacketBubble, BubblePosition, worldBubbleData{
-		Instance: instance, Text: msg, X: intp(x), Y: intp(y),
-	}))
 	log.Printf("world: %s read sign %s (%q)", c.username, instance, msg)
 	return true
 }
@@ -559,26 +437,17 @@ func worldTestHandler(c *playerConn, data []byte) {
 	if err := json.Unmarshal(data, &d); err != nil || d.WorldTest == "" {
 		return
 	}
-	worldGlowMu.Lock()
-	g := worldGlobals
-	worldGlowMu.Unlock()
+	g := worldGlow.Globals()
 	switch d.WorldTest {
 	case "echo":
-		nw, nl, ns := 0, 0, 0
-		worldWarpMu.Lock()
-		nw = len(worldWarps)
-		worldWarpMu.Unlock()
+		nw := worldWarpCtl.Count()
+		nl, ns := 0, 0
 		if g != nil {
 			nl, ns = len(g.Lights), len(g.Signs)
 		}
 		m6Notify(c, fmt.Sprintf("world:ok warps=%d events=%d lights=%d signs=%d", nw, len(events.DefaultEvents()), nl, ns))
 	case "warps":
-		worldWarpMu.Lock()
-		names := make([]string, 0, len(worldWarps))
-		for _, w := range worldWarps {
-			names = append(names, w.Name)
-		}
-		worldWarpMu.Unlock()
+		names := worldWarpCtl.Names()
 		m6Notify(c, "world:warps ["+strings.Join(names, ",")+"]")
 	case "warp":
 		var w *worldWarpExt
@@ -595,22 +464,17 @@ func worldTestHandler(c *playerConn, data []byte) {
 			m6Notify(c, fmt.Sprintf("world:warp %s x=%d y=%d", w.Name, c.sess.playerX, c.sess.playerY))
 		}
 	case "at":
-		if d.X == nil || d.Y == nil || worldWarpReg == nil {
+		if d.X == nil || d.Y == nil || !worldWarpCtl.Loaded() {
 			return
 		}
-		if w := worldWarpReg.At(*d.X, *d.Y); w != nil {
+		if w := worldWarpCtl.At(*d.X, *d.Y); w != nil {
 			m6Notify(c, fmt.Sprintf("world:at %d,%d id=%d x=%d y=%d w=%d h=%d", *d.X, *d.Y, w.ID, w.X, w.Y, w.W, w.H))
 		} else {
 			m6Notify(c, fmt.Sprintf("world:at %d,%d none", *d.X, *d.Y))
 		}
 	case "events":
-		worldEventMu.Lock()
-		var active []string
-		for k := range worldEventActive {
-			active = append(active, k)
-		}
-		n, every := worldEventFired, worldEventEvery
-		worldEventMu.Unlock()
+		active := worldEventCtl.ActiveKeys()
+		n, every := worldEventCtl.Fired(), worldEventCtl.Interval()
 		sort.Strings(active)
 		m6Notify(c, fmt.Sprintf("world:events active=[%s] fired=%d intervalMs=%d", strings.Join(active, ","), n, every))
 	case "lights":

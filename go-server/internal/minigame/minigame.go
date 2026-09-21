@@ -254,21 +254,10 @@ func (g *Game) AddArea(a Area) {
 }
 
 // ---------------------------------------------------------------------------
-// Transport seam: the root adapter implements Effects with send/broadcast/
-// setEntityPos/m6Notify; pure methods below take it as a parameter.
+// Transport seam: the root adapter implements Effects (see manager.go) with
+// send/broadcast/setEntityPos/m6Notify; pure methods below take it as a
+// parameter.
 // ---------------------------------------------------------------------------
-
-// Effects is the transport seam for minigame side effects. Implementations
-// live in the root adapter:
-//
-//	Notify   -> m6Notify(instance's conn, msg)
-//	Teleport -> m8Teleport(instance's conn, x, y)
-//	Broadcast -> broadcast(frames ...[]any)
-type Effects interface {
-	Notify(instance, msg string)
-	Teleport(instance string, x, y int)
-	Broadcast(frames ...[]any)
-}
 
 // NotifyMinimumPlayers ports the not-enough-players branch of startCoursing/
 // startTeamWar (misc:MINIMUM_PLAYERS_MINIGAME to every lobby waiter).
