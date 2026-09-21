@@ -5,8 +5,9 @@
 //
 // RegionTile currently lives in package main (packets.go), which cannot be
 // imported, so this package defines its own Tile struct with identical JSON
-// tags plus pure helpers. All functions take explicit args; there are no
-// globals and no sync.Once — the caller owns caching.
+// tags plus pure helpers. Load is the uncached single-read primitive (the
+// caller owns caching); LoadDefault is the shared canonical store with
+// sync.Once discipline that the root delegates to.
 package worldmap
 
 import (
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // Map division + Tiled flip-bit constants (mirrors main.go, which mirrors
@@ -240,4 +242,72 @@ func (w *World) RegionData(px, py int) map[int][]Tile {
 		}
 	}
 	return data
+}
+
+// Default world store: the canonical holder mirroring the old root sync.Once
+// discipline. Load stays the uncached single-read primitive; LoadDefault is
+// the shared cached path the root delegates to. The first path wins; later
+// calls return the cached world. No logging here (the root keeps its
+// fatal/log lines).
+var (
+	defaultOnce  sync.Once
+	defaultWorld *World
+	defaultErr   error
+)
+
+// LoadDefault loads the world at path once and returns the cached result
+// (nil world plus error when the first load failed).
+func LoadDefault(path string) (*World, error) {
+	defaultOnce.Do(func() {
+		defaultWorld, defaultErr = Load(path)
+	})
+	return defaultWorld, defaultErr
+}
+
+// Default returns the cached world (nil until LoadDefault succeeds).
+func Default() *World { return defaultWorld }
+
+// DefaultErr returns the cached load error, if any.
+func DefaultErr() error { return defaultErr }
+
+// IsBlocked mirrors the real-terrain half of the root tileBlocked
+// (map.ts:170,201-208): OOB or empty data blocks; otherwise any layer whose
+// unflipped id is in collisions/objects blocks. TESTMAP pond/grass overlays
+// stay with the root caller.
+func (w *World) IsBlocked(x, y int) bool {
+	if x < 0 || y < 0 || x >= w.Width || y >= w.Height {
+		return true
+	}
+	idx := y*w.Width + x
+	if idx < 0 || idx >= len(w.Data) {
+		return true
+	}
+	raw := w.Data[idx]
+	if string(raw) == "0" || string(raw) == "[]" || string(raw) == "null" {
+		return true
+	}
+	var layers []int
+	var num float64
+	if err := json.Unmarshal(raw, &num); err == nil {
+		if num < 1 {
+			return true
+		}
+		layers = []int{int(num)}
+	} else {
+		var arr []float64
+		if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
+			return true
+		}
+		layers = make([]int, len(arr))
+		for i, v := range arr {
+			layers[i] = int(v)
+		}
+	}
+	for _, id := range layers {
+		u := UnflipTile(id)
+		if w.Collisions[u] || w.Objects[u] {
+			return true
+		}
+	}
+	return false
 }

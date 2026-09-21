@@ -322,54 +322,26 @@ func worldPath() string {
 	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/map/world.json"
 }
 
-type worldFile struct {
-	Width      int               `json:"width"`
-	Height     int               `json:"height"`
-	Data       []json.RawMessage `json:"data"`
-	Collisions []int             `json:"collisions"`
-	Objects    []int             `json:"objects"`
-	Cursors    map[string]string `json:"cursors"`
-}
-
+// Canonical world data lives in internal/worldmap (World/LoadDefault); the
+// root keeps thin compat aliases so m8/m10 (`world == nil`), m13
+// (`world.Width`), and bus_impl/regionOf/getTestRegionData (`sideLen`)
+// compile unchanged.
 var (
 	worldOnce sync.Once
-	world     *worldFile
-	collSet   map[int]bool
-	objSet    map[int]bool
-	curSet    map[int]string
+	world     *worldmap.World
 	sideLen   int
 )
 
 func loadWorld() {
+	w, err := worldmap.LoadDefault(worldPath())
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 	worldOnce.Do(func() {
-		raw, err := os.ReadFile(worldPath())
-		if err != nil {
-			log.Fatalf("read world.json: %v", err)
-		}
-		var w worldFile
-		if err := json.Unmarshal(raw, &w); err != nil {
-			log.Fatalf("parse world.json: %v", err)
-		}
-		collSet = make(map[int]bool, len(w.Collisions))
-		for _, id := range w.Collisions {
-			collSet[id] = true
-		}
-		objSet = make(map[int]bool, len(w.Objects))
-		for _, id := range w.Objects {
-			objSet[id] = true
-		}
-		curSet = make(map[int]string, len(w.Cursors))
-		for k, v := range w.Cursors {
-			id, err := strconv.Atoi(k)
-			if err != nil {
-				continue
-			}
-			curSet[id] = v
-		}
-		sideLen = w.Width / mapDivisionSize
-		world = &w
+		world = w
+		sideLen = w.SideLen
 		log.Printf("world loaded: %dx%d sideLen=%d tiles=%d collisions=%d objects=%d",
-			w.Width, w.Height, sideLen, len(w.Data), len(collSet), len(objSet))
+			w.Width, w.Height, sideLen, len(w.Data), len(w.Collisions), len(w.Objects))
 	})
 }
 
@@ -378,123 +350,37 @@ func unflipTile(id int) int {
 	return worldmap.UnflipTile(id)
 }
 
-// buildTile mirrors regions.ts:610-646: skip empty, keep data>=1 (arrays are
-// always kept), flag collisions/objects/cursors per layer. Walkable tiles
-// keep C=false. Returns false for skipped tiles.
+// buildTile delegates to the canonical worldmap store (regions.ts:610-646).
+// The RegionTile conversion stays here (RegionTile lives in package main via
+// packets.go, which worldmap cannot import).
 func buildTile(x, y int) (RegionTile, bool) {
-	idx := y*world.Width + x
-	if idx < 0 || idx >= len(world.Data) {
+	loadWorld()
+	t, ok := world.BuildTile(x, y)
+	if !ok {
 		return RegionTile{}, false
 	}
-	raw := world.Data[idx]
-	if string(raw) == "0" || string(raw) == "[]" || string(raw) == "null" {
-		return RegionTile{}, false
-	}
-	var layers []int
-	var data any
-	var num float64
-	if err := json.Unmarshal(raw, &num); err == nil {
-		if num < 1 {
-			return RegionTile{}, false
-		}
-		layers = []int{int(num)}
-		data = layers[0]
-	} else {
-		var arr []float64
-		if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
-			return RegionTile{}, false
-		}
-		layers = make([]int, len(arr))
-		for i, v := range arr {
-			layers[i] = int(v)
-		}
-		data = layers
-	}
-
-	tile := RegionTile{X: x, Y: y, Data: data}
-	for _, id := range layers {
-		u := unflipTile(id)
-		if objSet[u] {
-			tile.O = true
-			tile.C = true
-		} else if collSet[u] {
-			tile.C = true
-		}
-		if cur, ok := curSet[u]; ok {
-			tile.Cur = cur
-		}
-	}
-	return tile, true
+	return RegionTile{X: t.X, Y: t.Y, Data: t.Data, C: t.C, O: t.O, Cur: t.Cur}, true
 }
 
-// surroundingRegions mirrors getSurroundingRegions (regions.ts:711-766),
-// region first then neighbours (9 for interior regions like 50).
+// surroundingRegions delegates to the canonical worldmap store
+// (regions.ts:711-766), region first then neighbours.
 func surroundingRegions(region int) []int {
-	total := (world.Width / mapDivisionSize) * (world.Height / mapDivisionSize)
-	if region < 0 || region > total-1 {
-		return nil
-	}
-	out := []int{region}
-	left := region%sideLen == 0
-	right := region%sideLen == sideLen-1
-	top := region < sideLen
-	bottom := region > total-sideLen-1
-
-	switch {
-	case left:
-		out = append(out, region+1)
-	case right:
-		out = append(out, region-1)
-	default:
-		out = append(out, region-1, region+1)
-	}
-
-	switch {
-	case top || bottom:
-		rel := region + sideLen
-		if !top {
-			rel = region - sideLen
-		}
-		out = append(out, rel)
-		switch {
-		case rel%sideLen == 0:
-			out = append(out, rel+1)
-		case rel%sideLen == sideLen-1:
-			out = append(out, rel-1)
-		default:
-			out = append(out, rel-1, rel+1)
-		}
-	case left:
-		out = append(out, region-sideLen, region-sideLen+1, region+sideLen, region+sideLen+1)
-	case right:
-		out = append(out, region-sideLen, region-sideLen-1, region+sideLen, region+sideLen-1)
-	default:
-		out = append(out, region+sideLen, region-sideLen,
-			region+sideLen-1, region+sideLen+1, region-sideLen-1, region-sideLen+1)
-	}
-	return out
+	loadWorld()
+	return world.SurroundingRegions(region)
 }
 
-// getRegionData mirrors getRegionData (regions.ts:501-529) for a static
-// spawn: region of (px,py) plus all surrounding regions, empty ones dropped.
+// getRegionData delegates to the canonical worldmap store (regions.ts:501-529)
+// for a static spawn, converting Tiles to RegionTiles; empty regions dropped.
 func getRegionData(px, py int) map[int][]RegionTile {
 	loadWorld()
-	region := (py/mapDivisionSize)*sideLen + (px / mapDivisionSize)
-	data := make(map[int][]RegionTile)
-	for _, rid := range surroundingRegions(region) {
-		x0 := (rid % sideLen) * mapDivisionSize
-		y0 := (rid / sideLen) * mapDivisionSize
-		var tiles []RegionTile
-		for y := y0; y < y0+mapDivisionSize; y++ {
-			for x := x0; x < x0+mapDivisionSize; x++ {
-				if t, ok := buildTile(x, y); ok {
-					tiles = append(tiles, t)
-				}
-			}
+	raw := world.RegionData(px, py)
+	data := make(map[int][]RegionTile, len(raw))
+	for rid, tiles := range raw {
+		out := make([]RegionTile, 0, len(tiles))
+		for _, t := range tiles {
+			out = append(out, RegionTile{X: t.X, Y: t.Y, Data: t.Data, C: t.C, O: t.O, Cur: t.Cur})
 		}
-		if len(tiles) > 0 {
-			data[rid] = tiles
-		}
+		data[rid] = out
 	}
 	return data
 }
@@ -1856,41 +1742,7 @@ func tileBlocked(x, y int) bool {
 		}
 	}
 	loadWorld()
-	if x < 0 || y < 0 || x >= world.Width || y >= world.Height {
-		return true
-	}
-	idx := y*world.Width + x
-	if idx < 0 || idx >= len(world.Data) {
-		return true
-	}
-	raw := world.Data[idx]
-	if string(raw) == "0" || string(raw) == "[]" || string(raw) == "null" {
-		return true
-	}
-	var layers []int
-	var num float64
-	if err := json.Unmarshal(raw, &num); err == nil {
-		if num < 1 {
-			return true
-		}
-		layers = []int{int(num)}
-	} else {
-		var arr []float64
-		if err := json.Unmarshal(raw, &arr); err != nil || len(arr) == 0 {
-			return true
-		}
-		layers = make([]int, len(arr))
-		for i, v := range arr {
-			layers[i] = int(v)
-		}
-	}
-	for _, id := range layers {
-		u := unflipTile(id)
-		if collSet[u] || objSet[u] {
-			return true
-		}
-	}
-	return false
+	return world.IsBlocked(x, y)
 }
 
 // resourceAt returns the instance occupying (x,y), if it is a resource.
