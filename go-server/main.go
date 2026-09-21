@@ -2099,14 +2099,15 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 		}
 		dx := abs(*mv.RequestX - s.playerX)
 		dy := abs(*mv.RequestY - s.playerY)
-		if dx > 2 || dy > 2 {
-			// Noclip jump (player.ts handleMovementRequest diff>2).
+		if (dx > 2 || dy > 2) && !m13NoclipAllowed(c.username) {
+			// Noclip jump (player.ts handleMovementRequest diff>2). m13:
+			// player.noclip bypasses the jump check (movement.ts noclip).
 			return rejectLocked(conn, c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.playerX, s.playerY, *mv.RequestX, *mv.RequestY))
 		}
-		if checkSpeed(s, dx+dy) {
+		if checkSpeed(s, dx+dy) && !m13NoclipAllowed(c.username) {
 			return rejectLocked(conn, c, "speed request")
 		}
-		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) {
+		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.username) {
 			stopPlayer(conn, s, c.instance)
 			updateClientRegion(c)
 		}
@@ -3225,6 +3226,21 @@ func handleConn(conn *websocket.Conn) {
 					// Welcome Spawn carries the right pvp flag.
 					m10OnPositionUpdate(c)
 				}
+				// M13 login gates: banned users get the 'ban' text frame and a
+				// close (Node login.go database loader -> connection.reject);
+				// the persisted mspeed override applies to the session before
+				// the first movement check.
+				if m13CheckBan(c.username) {
+					writeMu.Lock()
+					_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					_ = conn.WriteMessage(websocket.TextMessage, []byte("ban"))
+					writeMu.Unlock()
+					removeClient(conn)
+					return
+				}
+				if ms := m13MovementSpeed(c.username); ms > 0 {
+					c.sess.movementSpeed = ms
+				}
 				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
 				// M11: restore + batch quest/achievement state after the login
 				// extras (handler.ts:69-70 onLoaded → handleQuests/
@@ -3259,6 +3275,9 @@ func handleConn(conn *websocket.Conn) {
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m12test"] != nil {
 						m12HandleTest(c, frame[1])
+					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m13test"] != nil {
+						m13TestHandler(c, frame[1])
 					}
 				}
 			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
@@ -3313,6 +3332,7 @@ func main() {
 	m5Init()
 	m6StartStoreTicker() // M6: stores.json registry + 20s stock refresh
 	m11EnsureTables()    // M11: quests/achievements SQLite tables (schema up-front)
+	m13EnsureTables()    // M13: mute/ban/jail/noclip flags table (schema up-front)
 	m8LoadGames()        // M8: world.json minigame areas + 1s tick engines
 	m10LoadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
 	m10InjectTestAreas() // M10: TESTMAP synthetic area bands for the e2e

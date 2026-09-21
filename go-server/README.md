@@ -52,6 +52,7 @@ go run ./e2e/m9                 # mob AI aggro/death/leash/kill
 go run ./e2e/m10                # areas music/overlay/pvp/camera + chest flow
 go run ./e2e/m11                # quests/achievements + gated drops/persistence
 go run ./e2e/m12                # trade + crafting + enchanting
+go run ./e2e/m13                # full commands.ts port (admin/mod/quest)
 ```
 
 ## Docs

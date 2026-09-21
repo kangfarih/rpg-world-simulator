@@ -177,8 +177,13 @@ func m7HandleChat(c *playerConn, frame clientFrame) {
 		return
 	}
 
-	// Mute check (incoming.ts:479) — Go stub has no mute persistence yet;
-	// placeholder keeps the ordering for the future M8 slice.
+	// Mute gate (incoming.ts:479): the m13 slice persists user.mute in the
+	// players.data blob and rejects chat while the deadline is in the future.
+	if m13IsMuted(c.username) {
+		m6Notify(c, "You have been muted.")
+		return
+	}
+
 	m7Chat(c, text, false, true, "")
 }
 
@@ -268,7 +273,8 @@ func m7ParseCommand(c *playerConn, rawText string) {
 
 	m7PlayerCommands(c, command, args)
 	m7ModeratorCommands(c, command, args)
-	m12PlayerCommands(c, command) // M12: crafting interface opens (/crafting etc.)
+	m12PlayerCommands(c, command)     // M12: crafting interface opens (/crafting etc.)
+	m13ParseCommand(c, command, args) // M13: guild + full mod/admin tables
 }
 
 // m7PlayerCommands ports handlePlayerCommands (the subset meaningful in the
