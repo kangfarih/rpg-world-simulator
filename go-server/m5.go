@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"rpg-world-server/internal/meta"
+	"rpg-world-server/internal/persist"
 
 	_ "modernc.org/sqlite"
 )
@@ -850,10 +851,30 @@ func handlePlayerAttack(c *playerConn, target string) {
 // SQLite persist.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SQLite persist (single-writer Store in internal/persist).
+// ---------------------------------------------------------------------------
+//
+// The SQL + dirty set live in internal/persist (persist.Store: Open,
+// EnsureSchema, MarkDirty/MarkClean/DirtyList, WritePlayer/LoadPlayer,
+// Snapshot, FlushDirty, Close — moved here verbatim, identical schema,
+// WAL+NORMAL pragmas, identical log text). This section keeps the root
+// names every other seam uses — dbConn/dbMu for the m11/m13/social/
+// abilities/ops direct-table access, and m5Init/markDirty/flushDirty/
+// m5SaveSync/m5Load/m5LoginWelcome with unchanged signatures — and
+// delegates to the store (converting m5State <-> persist.State).
+// dbConn aliases the store handle (single connection, SetMaxOpenConns(1)).
+// Ticker/goroutine ownership stays in root: m5Init starts the 10s dirty
+// flush and the SIGTERM/SIGINT final-flush handler exactly as before.
+// Lock discipline: never hold dbMu and pstateMu at the same time
+// (m5Snapshot needs pstateMu). flushDirty/m5SaveSync snapshot first, then
+// write under dbMu; m5Load holds dbMu across the store read and takes
+// pstateMu only to install the result.
+
 var (
-	dbConn *sql.DB
-	dbMu   sync.Mutex
-	dirty  = map[string]bool{}
+	dbConn       *sql.DB
+	dbMu         sync.Mutex
+	persistStore *persist.Store
 )
 
 func dbPath() string {
@@ -866,31 +887,12 @@ func dbPath() string {
 func m5Init() {
 	initLevelExp()
 	loadM5Tables()
-	db, err := sql.Open("sqlite", dbPath())
+	st, err := persist.Open(dbPath())
 	if err != nil {
-		log.Fatalf("m5: open db: %v", err)
+		log.Fatalf("m5: %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	for _, pr := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"} {
-		if _, err := db.Exec(pr); err != nil {
-			log.Fatalf("m5: pragma %q: %v", pr, err)
-		}
-	}
-	for _, ddl := range []string{
-		`CREATE TABLE IF NOT EXISTS players(instance TEXT PRIMARY KEY, name TEXT, x INT, y INT, level INT, hp INT, data TEXT)`,
-		`CREATE TABLE IF NOT EXISTS inventory(player TEXT, slot INT, item TEXT, count INT, enchantments TEXT, PRIMARY KEY(player, slot))`,
-		`CREATE TABLE IF NOT EXISTS bank(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
-		`CREATE TABLE IF NOT EXISTS equipment(player TEXT, type INT, item TEXT, count INT, PRIMARY KEY(player, type))`,
-		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
-	} {
-		if _, err := db.Exec(ddl); err != nil {
-			log.Fatalf("m5: ddl: %v", err)
-		}
-	}
-	// M12 migration: pre-existing DBs lack the inventory enchantments column
-	// (CREATE IF NOT EXISTS is a no-op there). Ignore failure = column exists.
-	_, _ = db.Exec(`ALTER TABLE inventory ADD COLUMN enchantments TEXT`)
-	dbConn = db
+	persistStore = st
+	dbConn = st.DB()
 	log.Printf("m5: sqlite open %s (WAL+NORMAL)", dbPath())
 	go func() {
 		t := time.NewTicker(10 * time.Second)
@@ -910,12 +912,10 @@ func m5Init() {
 }
 
 func markDirty(key string) {
-	if key == "" || dbConn == nil {
+	if key == "" || dbConn == nil || persistStore == nil {
 		return
 	}
-	dbMu.Lock()
-	dirty[key] = true
-	dbMu.Unlock()
+	persistStore.MarkDirty(key)
 }
 
 func m5Snapshot(key string) *m5State {
@@ -935,96 +935,74 @@ func m5Snapshot(key string) *m5State {
 	return cp
 }
 
-func writePlayer(key string, st *m5State) {
-	extra := map[string]any{"equip": []any{}}
-	if len(st.Equip) > 0 {
-		eqs := make([]any, 0, len(st.Equip))
-		for t, e := range st.Equip {
-			if e.Key == "" || e.Count < 1 {
-				continue
-			}
-			eqs = append(eqs, map[string]any{"type": t, "key": e.Key, "count": e.Count})
-		}
-		extra["equip"] = eqs
+// m5ToPersist converts an in-memory player state to the persist snapshot
+// (inventory enchantments serialized to the DB column format; bank rows
+// carry no enchantments, matching the bank table).
+func m5ToPersist(st *m5State) persist.State {
+	ps := persist.State{
+		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP,
+		Skills: make(map[int]persist.Skill, len(st.Skills)),
 	}
-	extraRaw, _ := json.Marshal(extra)
-	if _, err := dbConn.Exec(
-		`INSERT INTO players(instance,name,x,y,level,hp,data) VALUES(?,?,?,?,?,?,?) `+
-			`ON CONFLICT(instance) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y,`+
-			`level=excluded.level,hp=excluded.hp,data=excluded.data`,
-		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw)); err != nil {
-		log.Printf("m5: save players %s: %v", key, err)
-		return
+	for _, s := range st.Inv {
+		ps.Inv = append(ps.Inv, persist.Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchJSON(s)})
 	}
-	if _, err := dbConn.Exec(`DELETE FROM inventory WHERE player=?`, key); err != nil {
-		log.Printf("m5: clear inventory %s: %v", key, err)
-		return
+	for _, s := range st.Bank {
+		ps.Bank = append(ps.Bank, persist.Slot{Key: s.Key, Count: s.Count})
 	}
-	for i, s := range st.Inv {
-		if _, err := dbConn.Exec(
-			`INSERT INTO inventory(player,slot,item,count,enchantments) VALUES(?,?,?,?,?)`, key, i, s.Key, s.Count, m5SlotEnchJSON(s)); err != nil {
-			log.Printf("m5: save inventory %s: %v", key, err)
-			return
-		}
-	}
-	if _, err := dbConn.Exec(`DELETE FROM bank WHERE player=?`, key); err != nil {
-		log.Printf("m5: clear bank %s: %v", key, err)
-		return
-	}
-	for i, s := range st.Bank {
-		if _, err := dbConn.Exec(
-			`INSERT INTO bank(player,slot,item,count) VALUES(?,?,?,?)`, key, i, s.Key, s.Count); err != nil {
-			log.Printf("m5: save bank %s: %v", key, err)
-			return
-		}
-	}
-	if _, err := dbConn.Exec(`DELETE FROM equipment WHERE player=?`, key); err != nil {
-		log.Printf("m5: clear equipment %s: %v", key, err)
-		return
-	}
-	for t, e := range st.Equip {
-		if e.Key == "" || e.Count < 1 {
-			continue
-		}
-		if _, err := dbConn.Exec(
-			`INSERT INTO equipment(player,type,item,count) VALUES(?,?,?,?)`, key, t, e.Key, e.Count); err != nil {
-			log.Printf("m5: save equipment %s: %v", key, err)
-			return
-		}
-	}
-	if _, err := dbConn.Exec(`DELETE FROM skills WHERE player=?`, key); err != nil {
-		log.Printf("m5: clear skills %s: %v", key, err)
-		return
+	for _, e := range st.Equip {
+		ps.Equip = append(ps.Equip, persist.Slot{Key: e.Key, Count: e.Count})
 	}
 	for id, s := range st.Skills {
-		if _, err := dbConn.Exec(
-			`INSERT INTO skills(player,skill,level,xp) VALUES(?,?,?,?)`, key, id, s.Level, s.XP); err != nil {
-			log.Printf("m5: save skills %s: %v", key, err)
-			return
-		}
+		ps.Skills[id] = persist.Skill{Level: s.Level, XP: s.XP}
 	}
-	log.Printf("m5: saved %s (pos %d,%d level %d inv %d skills %d)", key, st.X, st.Y, st.Level, len(st.Inv), len(st.Skills))
+	return ps
+}
+
+// persistToM5 converts a persist snapshot back to the in-memory state,
+// normalizing the fixed ModulesEquipmentCount slot array (slot indexing
+// must never panic) exactly like the old m5Load tail.
+func persistToM5(ps persist.State) *m5State {
+	st := &m5State{X: ps.X, Y: ps.Y, Level: ps.Level, HP: ps.HP, Skills: map[int]*m5Skill{}}
+	for _, s := range ps.Inv {
+		st.Inv = append(st.Inv, m5Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchParse(s.Ench)})
+	}
+	for _, s := range ps.Bank {
+		st.Bank = append(st.Bank, m5Slot{Key: s.Key, Count: s.Count})
+	}
+	eslots := make([]m5Slot, 0, len(ps.Equip))
+	for _, s := range ps.Equip {
+		eslots = append(eslots, m5Slot{Key: s.Key, Count: s.Count})
+	}
+	eq := make([]m5Slot, ModulesEquipmentCount)
+	copy(eq, eslots)
+	st.Equip = eq
+	for id, s := range ps.Skills {
+		st.Skills[id] = &m5Skill{Level: s.Level, XP: s.XP}
+	}
+	return st
+}
+
+func writePlayer(key string, st *m5State) {
+	if persistStore == nil {
+		return
+	}
+	_ = persistStore.WritePlayer(key, m5ToPersist(st))
 }
 
 func flushDirty() {
-	if dbConn == nil {
+	if dbConn == nil || persistStore == nil {
 		return
 	}
 	// Lock discipline: never hold dbMu and pstateMu at the same time
 	// (m5Snapshot needs pstateMu). Snapshot first, then write under dbMu.
-	dbMu.Lock()
-	keys := make([]string, 0, len(dirty))
-	for key := range dirty {
-		keys = append(keys, key)
-	}
-	dbMu.Unlock()
+	keys := persistStore.DirtyList()
 	for _, key := range keys {
 		st := m5Snapshot(key)
 		dbMu.Lock()
 		if st != nil {
 			writePlayer(key, st)
 		}
-		delete(dirty, key)
+		persistStore.MarkClean(key)
 		dbMu.Unlock()
 	}
 }
@@ -1032,7 +1010,7 @@ func flushDirty() {
 // m5SaveSync flushes one player immediately (disconnect path).
 // Lock discipline: never hold dbMu and pstateMu at the same time.
 func m5SaveSync(key string) {
-	if dbConn == nil || key == "" {
+	if dbConn == nil || persistStore == nil || key == "" {
 		return
 	}
 	st := m5Snapshot(key)
@@ -1040,91 +1018,22 @@ func m5SaveSync(key string) {
 	if st != nil {
 		writePlayer(key, st)
 	}
-	delete(dirty, key)
+	persistStore.MarkClean(key)
 	dbMu.Unlock()
 }
 
 // m5Load restores a player row (Welcome from DB when the instance is known).
 func m5Load(key string) (*m5State, bool) {
-	if dbConn == nil || key == "" {
+	if dbConn == nil || persistStore == nil || key == "" {
 		return nil, false
 	}
 	dbMu.Lock()
 	defer dbMu.Unlock()
-	var name string
-	st := &m5State{Skills: map[int]*m5Skill{}}
-	var data string
-	err := dbConn.QueryRow(
-		`SELECT name,x,y,level,hp,data FROM players WHERE instance=?`, key,
-	).Scan(&name, &st.X, &st.Y, &st.Level, &st.HP, &data)
-	if err != nil {
+	ps, ok := persistStore.LoadPlayer(key)
+	if !ok {
 		return nil, false
 	}
-	rows, err := dbConn.Query(`SELECT item,count,enchantments FROM inventory WHERE player=? ORDER BY slot`, key)
-	if err != nil {
-		return nil, false
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var k string
-		var c int
-		var ench string
-		if err := rows.Scan(&k, &c, &ench); err != nil {
-			continue
-		}
-		st.Inv = append(st.Inv, m5Slot{Key: k, Count: c, Ench: m5SlotEnchParse(ench)})
-	}
-	rows.Close()
-	brows, err := dbConn.Query(`SELECT item,count FROM bank WHERE player=? ORDER BY slot`, key)
-	if err != nil {
-		return nil, false
-	}
-	for brows.Next() {
-		var k string
-		var c int
-		if err := brows.Scan(&k, &c); err != nil {
-			continue
-		}
-		st.Bank = append(st.Bank, m5Slot{Key: k, Count: c})
-	}
-	brows.Close()
-	if erows, err := dbConn.Query(`SELECT type,item,count FROM equipment WHERE player=?`, key); err == nil {
-		st.Equip = make([]m5Slot, ModulesEquipmentCount)
-		for erows.Next() {
-			var t int
-			var k string
-			var c int
-			if err := erows.Scan(&t, &k, &c); err != nil {
-				continue
-			}
-			if t < 0 || t >= ModulesEquipmentCount {
-				continue
-			}
-			st.Equip[t] = m5Slot{Key: k, Count: c}
-		}
-		erows.Close()
-	} else {
-		st.Equip = nil // pre-equipment DB: Welcome still works, table lazily created
-	}
-	// Normalize the fixed 12-slot equipment array even when the row is
-	// missing (pre-equipment DBs): slot indexing must never panic.
-	if len(st.Equip) != ModulesEquipmentCount {
-		eq := make([]m5Slot, ModulesEquipmentCount)
-		copy(eq, st.Equip)
-		st.Equip = eq
-	}
-	srows, err := dbConn.Query(`SELECT skill,level,xp FROM skills WHERE player=?`, key)
-	if err != nil {
-		return nil, false
-	}
-	defer srows.Close()
-	for srows.Next() {
-		var id, lv, xp int
-		if err := srows.Scan(&id, &lv, &xp); err != nil {
-			continue
-		}
-		st.Skills[id] = &m5Skill{Level: lv, XP: xp}
-	}
+	st := persistToM5(ps)
 	pstateMu.Lock()
 	pstates[key] = st
 	pstateMu.Unlock()
