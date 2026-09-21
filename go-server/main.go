@@ -27,6 +27,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"rpg-world-server/internal/meta"
+	"rpg-world-server/internal/worldmap"
 )
 
 // addr resolves the listen address: PORT env (e.g. PORT=9002 for a side-by-side
@@ -372,10 +375,7 @@ func loadWorld() {
 
 // unflipTile strips Tiled flip bitmasks (map.ts:353-361).
 func unflipTile(id int) int {
-	if id > diagonalFlag {
-		return id &^ flipMask
-	}
-	return id
+	return worldmap.UnflipTile(id)
 }
 
 // buildTile mirrors regions.ts:610-646: skip empty, keep data>=1 (arrays are
@@ -1011,23 +1011,7 @@ func combatAutoRate(bot string) time.Duration {
 
 func combatMaxDamageFloat(bot string, critical bool) float64 {
 	st := combatBotStats[bot]
-	dmg := float64(st.damageBonus+st.damageLevel) * 1.25
-	if critical {
-		dmg *= 1.5
-	}
-	dmg += 5 // player bonus
-	switch st.attackStyle {
-	case "slash":
-		dmg *= 1.1
-	case "crush":
-		dmg *= 1.05
-	case "shared":
-		dmg *= 1.03
-	}
-	if dmg < 0 {
-		dmg = 0
-	}
-	return dmg
+	return meta.MaxDamageFloat(st.damageBonus, st.damageLevel, st.attackStyle, critical)
 }
 
 // combatAccuracyWeight ports getAccuracyWeight for a zero-defense dummy:
@@ -1036,49 +1020,12 @@ func combatMaxDamageFloat(bot string, critical bool) float64 {
 // archer 41 (crit 59), mage 62 (crit 91).
 func combatAccuracyWeight(bot string) float64 {
 	st := combatBotStats[bot]
-	if st.archer {
-		if st.archery > 0 {
-			return math.Max(float64(st.archery)/3, 1)
-		}
-		return 1
-	}
-	if st.magic {
-		if st.magicStat > 0 {
-			return math.Max(float64(st.magicStat)/3, 1)
-		}
-		return 1
-	}
-	total := 0.0
-	for _, v := range []int{st.crush, st.slash, st.stab, st.magicStat, st.archery} {
-		if v > 0 {
-			total += float64(v) / 3
-		}
-	}
-	if total < 1 {
-		total = 1
-	}
-	return total
+	return meta.AccuracyWeight(st.archer, st.magic, st.crush, st.slash, st.stab, st.magicStat, st.archery)
 }
 
 func combatAccuracy(bot string, critical bool) float64 {
 	st := combatBotStats[bot]
-	acc := ModulesMaxAccuracy
-	if bonus := float64(st.accuracyBonus); bonus <= 70 {
-		acc += 1 - bonus/70
-	}
-	acc += float64(ModulesMaxLevel-st.accuracyLevel+1) * 0.01
-	acc += 1 * 0.0175 // dummy defense level 1
-	acc += -(math.Sqrt(combatAccuracyWeight(bot)) / 22.36) + 1
-	if critical {
-		acc -= 0.15
-	}
-	if acc < 0.7 {
-		acc = 0.7
-	}
-	if acc > 2.0 {
-		acc = 2.0
-	}
-	return acc
+	return meta.Accuracy(ModulesMaxAccuracy, ModulesMaxLevel, st.accuracyBonus, st.accuracyLevel, combatAccuracyWeight(bot), critical)
 }
 
 // combatRollLocked rolls one formula hit for bot (caller holds combatMu;
@@ -1086,17 +1033,11 @@ func combatAccuracy(bot string, critical bool) float64 {
 // crit chance (no gear bonus on the bots).
 func combatRollLocked(bot string, critical bool) int {
 	max := combatMaxDamageFloat(bot, critical)
-	dmg := int(math.Floor(math.Pow(rand.Float64(), combatAccuracy(bot, critical)) * (max + 1)))
-	if dmg > combatHP {
-		dmg = combatHP
-	}
-	if dmg < 0 {
-		dmg = 0
-	}
-	return dmg
+	acc := combatAccuracy(bot, critical)
+	return meta.RollDamage(max, acc, rand.Float64(), combatHP)
 }
 
-func combatRollCrit() bool { return rand.Float64() < 0.05 }
+func combatRollCrit() bool { return meta.RollCrit(rand.Float64()) }
 
 // Modules constants mirrored from packages/common/network/modules.ts.
 const (
@@ -2210,6 +2151,10 @@ func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 			m10OpenChest(c, chest)
 			return
 		}
+		// World: Target Talk on a sign position -> Bubble text (sign.talk).
+		if worldSignTalk(c, instance) {
+			return
+		}
 	}
 	if opcode == TargetObject && isResourceInstance(instance) {
 		hitResource(c.instance, instance)
@@ -2250,6 +2195,7 @@ func handleCombatReq(c *playerConn, frame clientFrame) {
 	// path stays for the COMBAT party scene.
 	if m9MobFor(cd.Target) != nil || cd.Target == combatDummyInstance {
 		handlePlayerAttack(c, cd.Target)
+		petMirrorSwing(c, cd.Target) // pet same-target swing (no-op with no pet)
 	}
 }
 
@@ -2477,6 +2423,7 @@ func updateClientRegion(c *playerConn) {
 	playersMu.Lock()
 	c.regions = surroundingRegions(rid)
 	playersMu.Unlock()
+	worldPushLights(c) // world: region-enter Lamp fan-out (deduped, no-op when none new)
 }
 
 // clientInterested reports whether conn's regions include the entity tile.
@@ -2649,6 +2596,9 @@ func startTickLoop() {
 			t := time.NewTicker(50 * time.Millisecond)
 			defer t.Stop()
 			for range t.C {
+				abStatusTick()   // DoT ticks -> Points, expiries -> EffectRemove
+				petTick()        // pet follow steps / teleports (no-op with no pets)
+				worldEventTick() // event rotation -> global notices (no-op when none due)
 				playersMu.Lock()
 				conns := make([]*playerConn, 0, len(players))
 				for _, c := range players {
@@ -2709,6 +2659,14 @@ func removeClient(conn *websocket.Conn) {
 	m9PlayerLeave(c)
 	// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
 	m10ForgetPlayer(c.instance)
+	// Abilities: drop mana/target/fx state + freeze-tracker keys.
+	abForgetPlayer(c)
+	// Pets: despawn the companion (disconnect removePet parity).
+	petForgetPlayer(c)
+	// World: drop per-conn lamp state.
+	worldForgetPlayer(c)
+	// Social: hub unregister + friends flush + offline fanout (all three).
+	socOnDisconnect(c)
 	m12ClearSession(c, nil)
 	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
 	m5SaveSync(c.username)
@@ -2804,10 +2762,14 @@ func hitResource(attacker, instance string) {
 	// M6 (resourceskill.ts:114-118 order): the table item lands in the
 	// inventory BEFORE the skill XP — a full inventory would swallow the XP.
 	if ci := connByInstance(attacker); ci != nil && info.Item != "" {
-		idx := m5AddItem(ci.username, info.Item, 1)
+		yield := 1
+		if worldHarvestDouble(skill) {
+			yield = 2 // world: lumberjacking/mining double-yield events
+		}
+		idx := m5AddItem(ci.username, info.Item, yield)
 		_ = send(ci.conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
-			Slot: &slotData{Index: idx, Key: info.Item, Count: 1, Enchantments: map[string]any{}},
+			Slot: &slotData{Index: idx, Key: info.Item, Count: yield, Enchantments: map[string]any{}},
 		}))
 		markDirty(ci.username)
 	}
@@ -2989,6 +2951,9 @@ func spawnPayload(instance string) (any, bool) {
 		}
 	}
 	playersMu.Unlock()
+	if d, ok := petPayloadByInstance(instance); ok {
+		return d, true
+	}
 	if d, ok := staticPayload(instance); ok {
 		return d, true
 	}
@@ -3150,6 +3115,11 @@ func handleConn(conn *websocket.Conn) {
 			if len(frame) == 0 {
 				continue
 			}
+			// Ops limiter: drop inbound frames over the per-conn msg budget.
+			if !opsAllowMsg(opsConnID(conn)) {
+				log.Printf("ops: drop frame over msg budget instance=%s", c.instance)
+				continue
+			}
 			var id int
 			if err := json.Unmarshal(frame[0], &id); err != nil {
 				continue
@@ -3248,10 +3218,20 @@ func handleConn(conn *websocket.Conn) {
 				m11EnsureTables()
 				m11LoadQuests(c.username)
 				frames = append(frames, m11LoginBatches(c.username)...)
+				// Abilities: restore unlocks + queue the Ability Batch
+				// (handler.ts onLoaded ability serialize).
+				abLoadAbilities(c.username)
+				frames = append(frames, abLoginBatch(c.username))
+				// Social: friends table DDL (boot already ran it; cheap
+				// re-ensure like m11), restore + batch the Friends List and
+				// the guild Login/Update when guilded, fan presence out.
+				socEnsureTables()
+				frames = append(frames, socOnLogin(c)...)
 				if err := send(conn, frames...); err != nil {
 					log.Printf("write welcome/map: %v", err)
 					return
 				}
+				worldPushLights(c) // world: login region-enter Lamp fan-out
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
 				sendSpawns()
 			case PacketList: // C List request -> Spawns + Positions
@@ -3279,12 +3259,42 @@ func handleConn(conn *websocket.Conn) {
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m13test"] != nil {
 						m13TestHandler(c, frame[1])
 					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["abtest"] != nil {
+						abTestHandler(c, frame[1])
+					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["pettest"] != nil {
+						petTestHandler(c, frame[1])
+					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["socialtest"] != nil {
+						socTestHandler(c, frame[1])
+					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["worldtest"] != nil {
+						worldTestHandler(c, frame[1])
+					}
 				}
 			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
 				m6HandleEquipment(c, frame)
 			case PacketQuest: // C Quest {key} -> accept the start prompt (M11)
 				if len(frame) >= 2 {
 					m11HandleAccept(c, frame[1])
+				}
+			case PacketAbility: // C Ability {opcode,key,index} -> use / quickslot
+				if len(frame) >= 2 {
+					abHandleAbility(c, frame[1])
+				}
+			case PacketPet: // C Pet {opcode} -> Pickup(0) returns the pet (pets wire)
+				petHandlePacket(c, frame)
+			case PacketWarp: // C Warp {id} -> menu-driven warp (world wire)
+				if len(frame) >= 2 {
+					worldHandleWarp(c, frame[1])
+				}
+			case PacketFriends: // C Friends {opcode,username} -> Add/Remove (social wire)
+				if len(frame) >= 2 {
+					socHandleFriends(c, frame[1])
+				}
+			case PacketGuild: // C Guild {opcode,...} -> Create/Join/Leave/List/Chat/... (social wire)
+				if len(frame) >= 2 {
+					socHandleGuild(c, frame[1])
 				}
 			case PacketTrade: // C Trade (M12)
 				if len(frame) >= 2 {
@@ -3333,6 +3343,10 @@ func main() {
 	m6StartStoreTicker() // M6: stores.json registry + 20s stock refresh
 	m11EnsureTables()    // M11: quests/achievements SQLite tables (schema up-front)
 	m13EnsureTables()    // M13: mute/ban/jail/noclip flags table (schema up-front)
+	abEnsureTables()     // abilities: unlock table (schema up-front)
+	socEnsureTables()    // social: guilds + friends tables (schema up-front)
+	socLoadGuilds()      // social: rebuild the guild registry from the tables
+	worldBoot()          // world: warps registry + globals + event scheduler
 	m8LoadGames()        // M8: world.json minigame areas + 1s tick engines
 	m10LoadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
 	m10InjectTestAreas() // M10: TESTMAP synthetic area bands for the e2e
@@ -3344,14 +3358,16 @@ func main() {
 		startCombat()
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("upgrade: %v", err)
+		conn, ok := opsAccept(w, r)
+		if !ok {
 			return
 		}
-		log.Printf("client connected: %s", r.RemoteAddr)
 		handleConn(conn)
+		opsRelease(conn)
 	})
+
+	opsStartAPI()     // API_PORT set => serve REST; unset => off; busy port => log + continue
+	opsStartConsole() // TTY stdin only; CONSOLE=0 or piped stdin => off
 
 	fmt.Printf("kaetram-stub listening on %s\n", addr())
 	log.Printf("cleanMode=%v testMode=%v combatMode=%v (CLEAN/COMBAT env or --clean/--combat; TESTMAP env or --testmap flag, default ON)", cleanMode, testMode, combatMode)

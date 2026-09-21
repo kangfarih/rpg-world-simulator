@@ -83,6 +83,7 @@ type m9MobProfile struct {
 	Roaming       *bool  `json:"roaming"`
 	Aggressive    bool   `json:"aggressive"`
 	AlwaysAggro   bool   `json:"alwaysAggressive"`
+	Poisonous     bool   `json:"poisonous"` // mobs.json `poisonous` (poisonspider)
 	Boss          bool   `json:"boss"`
 	Miniboss      bool   `json:"miniboss"`
 	AttackStats   struct {
@@ -586,6 +587,11 @@ func (m *m9Mob) attackLocked(c *playerConn) {
 	}
 	dmg := m.rollDamage(c)
 	m9DamagePlayer(c, dmg, m)
+	// TS character.ts handlePoisonDamage: a poisonous attacker poisons the
+	// victim (setPoison Venom default).
+	if m.prof.Poisonous {
+		abApplyPoison(c.instance)
+	}
 	broadcast(pktOp(PacketCombat, CombatHit, combatData{
 		Instance: m.instance, Target: c.instance,
 		Hit: HitData{Type: HitsNormal, Damage: dmg},

@@ -858,8 +858,9 @@ func m11HandleQuestTalk(c *playerConn, st *m11PlayerState, key, npcKey string) b
 		return true
 	}
 	if sd.Ability != "" {
-		// Ability rewards have no engine slice yet — log-only divergence.
-		log.Printf("m11: stage ability reward %q ignored (no ability engine)", sd.Ability)
+		// Quest stage ability reward (quest.ts givePlayerAbility):
+		// abilities.add(ability, abilityLevel || 1).
+		abGrantAbility(c, st.Username, sd.Ability, sd.AbilityLevel)
 	}
 	m11GrantExperience(c, st, sd.SkillRewards)
 	m11Progress(c, st, key)
@@ -1113,6 +1114,11 @@ func m11AchProgress(c *playerConn, st *m11PlayerState, key string) {
 	}
 	if stage >= def.StageCount {
 		log.Printf("m11: %s finished achievement %s", st.Username, key)
+		// Achievement ability reward (achievement.ts finishCallback ->
+		// abilities.add(rewardAbility, rewardAbilityLevel || 1)).
+		if def.Raw.RewardAbility != "" {
+			abGrantAbility(c, st.Username, def.Raw.RewardAbility, def.Raw.RewardAbilityLevel)
+		}
 		if c != nil && def.Raw.RewardExperience > 0 {
 			if id, ok := map[string]int{
 				"lumberjacking": SkillLumberjacking, "mining": SkillMining,

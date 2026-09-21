@@ -25,118 +25,76 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"rpg-world-server/internal/minigame"
 )
 
 // ---------------------------------------------------------------------------
 // Constants (Opcodes.Minigame, MinigameState/Actions, Modules.MinigameConstants).
+// Re-exported from internal/minigame (pure domain logic); values frozen.
 // ---------------------------------------------------------------------------
 
 const (
-	MinigameTeamWar  = 0 // Opcodes.Minigame.TeamWar
-	MinigameCoursing = 1 // Opcodes.Minigame.Coursing
+	MinigameTeamWar  = minigame.MinigameTeamWar  // Opcodes.Minigame.TeamWar
+	MinigameCoursing = minigame.MinigameCoursing // Opcodes.Minigame.Coursing
 )
 
 const (
-	MinigameActionScore = 0 // MinigameActions.Score
-	MinigameActionEnd   = 1 // MinigameActions.End
-	MinigameActionLobby = 2 // MinigameActions.Lobby
-	MinigameActionExit  = 3 // MinigameActions.Exit
+	MinigameActionScore = minigame.MinigameActionScore // MinigameActions.Score
+	MinigameActionEnd   = minigame.MinigameActionEnd   // MinigameActions.End
+	MinigameActionLobby = minigame.MinigameActionLobby // MinigameActions.Lobby
+	MinigameActionExit  = minigame.MinigameActionExit  // MinigameActions.Exit
 )
 
 // MinigameState (opcodes.ts:184) — Lobby0 End1 Exit2. The base minigame.ts
 // uses THESE for addPlayer/removePlayer (a Node inconsistency with the
 // MinigameActions values used by the ticks; cloned verbatim).
 const (
-	minigameStateLobby = 0
-	minigameStateEnd   = 1
-	minigameStateExit  = 2
+	minigameStateLobby = minigame.MinigameStateLobby
+	minigameStateEnd   = minigame.MinigameStateEnd
+	minigameStateExit  = minigame.MinigameStateExit
 )
 
 const (
-	PointerLocation = 0 // Opcodes.Pointer.Location
-	PointerEntity   = 1 // Opcodes.Pointer.Entity
-	PointerRemove   = 3 // Opcodes.Pointer.Remove
+	PointerLocation = minigame.PointerLocation // Opcodes.Pointer.Location
+	PointerEntity   = minigame.PointerEntity   // Opcodes.Pointer.Entity
+	PointerRemove   = minigame.PointerRemove   // Opcodes.Pointer.Remove
 )
 
-const teamWarCountdown = 240      // TEAM_WAR_COUNTDOWN (lobby + in-game seconds)
-const teamWarMinPlayers = 2       // TEAM_WAR_MIN_PLAYERS
-const coursingCountdown = 45      // COURSING_COUNTDOWN
-const coursingMinPlayers = 2      // COURSING_MIN_PLAYERS
-const coursingScoreDivisor = 10   // COURSING_SCORE_DIVISOR
-const coursingTeamPrey = 2        // Team.Prey (api/minigame.ts)
-const coursingTeamHunter = 3      // Team.Hunter
-const teamWarTeamRed = 0          // Team.Red
-const teamWarTeamBlue = 1         // Team.Blue
-const coursingDeadPenalty = -10   // coursing.ts dead-player per-tick score
-const coursingScoreTick = 4       // score update every 4 ticks
-const coursingPointerDelay = 1500 // ms before sendPointers (coursing.ts)
-const minigameTickInterval = 1000 // minigame.ts tickInterval (1s)
-const killPointsPerKill = 1       // teamwar.kill increments by one per kill
-
-// Countdown overrides for fast e2e runs (same convention as M4_RESPAWN_MS).
-// Defaults are the exact Node constants; env values >0 win.
-func m8EnvCountdown(env string, def int) int {
-	if v := os.Getenv(env); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
-}
+const (
+	teamWarCountdown     = minigame.TeamWarCountdown     // TEAM_WAR_COUNTDOWN (lobby + in-game seconds)
+	teamWarMinPlayers    = minigame.TeamWarMinPlayers    // TEAM_WAR_MIN_PLAYERS
+	coursingCountdown    = minigame.CoursingCountdown    // COURSING_COUNTDOWN
+	coursingMinPlayers   = minigame.CoursingMinPlayers   // COURSING_MIN_PLAYERS
+	coursingScoreDivisor = minigame.CoursingScoreDivisor // COURSING_SCORE_DIVISOR
+	coursingTeamPrey     = minigame.CoursingTeamPrey     // Team.Prey (api/minigame.ts)
+	coursingTeamHunter   = minigame.CoursingTeamHunter   // Team.Hunter
+	teamWarTeamRed       = minigame.TeamWarTeamRed       // Team.Red
+	teamWarTeamBlue      = minigame.TeamWarTeamBlue      // Team.Blue
+	coursingDeadPenalty  = minigame.CoursingDeadPenalty  // coursing.ts dead-player per-tick score
+	coursingScoreTick    = minigame.CoursingScoreTick    // score update every 4 ticks
+	coursingPointerDelay = minigame.CoursingPointerDelay // ms before sendPointers (coursing.ts)
+	minigameTickInterval = minigame.MinigameTickInterval // minigame.ts tickInterval (1s)
+	killPointsPerKill    = minigame.KillPointsPerKill    // teamwar.kill increments by one per kill
+)
 
 // ---------------------------------------------------------------------------
 // Area model (areas/area.ts + areas/impl/minigame.ts).
+// Pure logic lives in internal/minigame; m8Area is a direct alias so the
+// world.json shape and all call sites below are unchanged.
 // ---------------------------------------------------------------------------
 
-// m8Area is one world.json areas.minigame entry.
-type m8Area struct {
-	ID          int    `json:"id"`
-	X           int    `json:"x"`
-	Y           int    `json:"y"`
-	Width       int    `json:"width"`
-	Height      int    `json:"height"`
-	MObjectType string `json:"mObjectType"`
-	Minigame    string `json:"minigame"`
-}
-
-// inside reports whether (x,y) falls within the area rectangle (area.ts
-// boundary math: x <= px < x+width).
-func (a *m8Area) inside(x, y int) bool {
-	if a == nil || a.Width <= 0 || a.Height <= 0 {
-		return false
-	}
-	return x >= a.X && x < a.X+a.Width && y >= a.Y && y < a.Y+a.Height
-}
-
-// m8RandomPointIn returns a random point inside the area using the Node
-// spawn formula (coursing/teamwar getSpawnPoint: x+1 .. x+width-1).
-func m8RandomPointIn(a *m8Area) (int, int) {
-	if a == nil || a.Width <= 2 || a.Height <= 2 {
-		if a != nil {
-			return a.X, a.Y
-		}
-		return 100, 96
-	}
-	return a.X + 1 + rand.Intn(a.Width-1), a.Y + 1 + rand.Intn(a.Height-1)
-}
-
-// m8LobbyPoint ports Minigame.getLobbyPosition: x+2 .. x+width-3 (the tighter
-// inset used for teleport-backs, distinct from the spawn formula).
-func m8LobbyPoint(a *m8Area) (int, int) {
-	if a == nil || a.Width <= 5 || a.Height <= 5 {
-		if a != nil {
-			return a.X, a.Y
-		}
-		return 100, 96
-	}
-	return a.X + 2 + rand.Intn(a.Width-4), a.Y + 2 + rand.Intn(a.Height-4)
-}
+// m8Area is one world.json areas.minigame entry (internal/minigame.Area).
+type m8Area = minigame.Area
 
 // ---------------------------------------------------------------------------
 // Minigame runtime (minigame.ts base class fields).
 // ---------------------------------------------------------------------------
 
 // m8Member is one player inside a minigame.
+// NOTE: kept in root (not aliased to minigame.Member) because it carries the
+// live playerConn pointer + transport; minigame.Member is the pure
+// instance-ID counterpart used for domain rules.
 type m8Member struct {
 	conn *playerConn
 	team int // Team enum value
@@ -148,6 +106,9 @@ type m8Member struct {
 // m8Game holds the shared minigame state. One mutex guards all games (the
 // tick cadence is 1s and operations are tiny; per-game locks add risk
 // without benefit at this scale).
+// NOTE: kept in root (not aliased to minigame.Game) because it embeds the
+// mutex, live-conn members and spawn wiring; pure rules delegate to the
+// minigame package.
 type m8Game struct {
 	mu        sync.Mutex
 	key       string // "coursing" | "teamwar"
@@ -265,7 +226,7 @@ func (g *m8Game) stop() {
 		mem.conn.m8Team = 0
 		mem.conn.m8Score = 0
 		mem.conn.m8Target = ""
-		x, y := m8LobbyPoint(lobby)
+		x, y := minigame.LobbyPoint(lobby)
 		m8Teleport(mem.conn, x, y)
 	}
 }
@@ -341,9 +302,9 @@ func (g *m8Game) startCoursing() {
 		g.mu.Lock()
 		var x, y int
 		if mem.team == coursingTeamPrey && len(g.preySpawns) > 0 {
-			x, y = m8RandomPointIn(g.preySpawns[rand.Intn(len(g.preySpawns))])
+			x, y = minigame.RandomPointIn(g.preySpawns[rand.Intn(len(g.preySpawns))])
 		} else {
-			x, y = m8RandomPointIn(g.hunterSpawn)
+			x, y = minigame.RandomPointIn(g.hunterSpawn)
 		}
 		g.mu.Unlock()
 		m8Teleport(mem.conn, x, y)
@@ -407,9 +368,9 @@ func (g *m8Game) startTeamWar() {
 		delete(g.lobbyWait, k)
 		var x, y int
 		if mem.team == teamWarTeamRed {
-			x, y = m8RandomPointIn(g.redSpawn)
+			x, y = minigame.RandomPointIn(g.redSpawn)
 		} else {
-			x, y = m8RandomPointIn(g.blueSpawn)
+			x, y = minigame.RandomPointIn(g.blueSpawn)
 		}
 		g.mu.Unlock()
 
@@ -423,11 +384,7 @@ func (g *m8Game) startTeamWar() {
 func (g *m8Game) tick() {
 	g.mu.Lock()
 	if g.countdown <= 0 {
-		if g.key == "coursing" {
-			g.countdown = coursingCountdown
-		} else {
-			g.countdown = teamWarCountdown
-		}
+		g.countdown = minigame.RearmCountdown(g.key)
 		wasStarted := g.started
 		g.mu.Unlock()
 		if wasStarted {
@@ -471,8 +428,7 @@ func (g *m8Game) tick() {
 				continue
 			}
 			px, py, _ := entityPos(k)
-			distance := abs(px-centreX) + abs(py-centreY) // Utils.getDistance
-			score := distance / coursingScoreDivisor
+			score := minigame.CoursingScore(px, py, centreX, centreY) // Utils.getDistance / COURSING_SCORE_DIVISOR
 			mem.conn.m8Score += score
 			mem.score = mem.conn.m8Score
 			m8SendPacket(map[string]*m8Member{k: mem}, g.opcode, map[string]any{
@@ -573,8 +529,8 @@ func m8LoadGames() {
 		}
 	}
 
-	coursing.countdown = m8EnvCountdown("M8_COURSING_COUNTDOWN", coursingCountdown)
-	teamwar.countdown = m8EnvCountdown("M8_TEAMWAR_COUNTDOWN", teamWarCountdown)
+	coursing.countdown = minigame.EnvCountdown("M8_COURSING_COUNTDOWN", coursingCountdown)
+	teamwar.countdown = minigame.EnvCountdown("M8_TEAMWAR_COUNTDOWN", teamWarCountdown)
 
 	m8Games["coursing"] = coursing
 	m8Games["teamwar"] = teamwar
@@ -616,7 +572,7 @@ func m8OnPositionUpdate(c *playerConn) {
 	if g != nil && len(g.lobbyAreas) > 0 {
 		inside := false
 		for _, a := range g.lobbyAreas {
-			if a.inside(c.sess.playerX, c.sess.playerY) {
+			if a.Inside(c.sess.playerX, c.sess.playerY) {
 				inside = true
 				break
 			}
@@ -639,7 +595,7 @@ func m8OnPositionUpdate(c *playerConn) {
 	if tw != nil && len(tw.lobbyAreas) > 0 {
 		inside := false
 		for _, a := range tw.lobbyAreas {
-			if a.inside(c.sess.playerX, c.sess.playerY) {
+			if a.Inside(c.sess.playerX, c.sess.playerY) {
 				inside = true
 				break
 			}
@@ -680,7 +636,7 @@ func m8OnDisconnect(c *playerConn) {
 	c.m8Score = 0
 	c.m8Target = ""
 
-	x, y := m8LobbyPoint(lobby)
+	x, y := minigame.LobbyPoint(lobby)
 	// The conn is dying; update the session position so the disconnect
 	// persist path saves the lobby tile and the relogin lands back in the
 	// lobby area (disconnect() setPosition parity). Persist goes through
@@ -761,10 +717,7 @@ func m8HandleTest(c *playerConn, frame clientFrame) {
 		}
 		// Dead-prey per-tick penalty (coursing.ts incrementCoursingScore(-10)
 		// with the clamp at 0). Echo the clamped score for the e2e.
-		c.m8Score += coursingDeadPenalty
-		if c.m8Score < 0 {
-			c.m8Score = 0
-		}
+		c.m8Score = minigame.ApplyDeadPenalty(c.m8Score)
 		m6Notify(c, fmt.Sprintf("m8:score=%d", c.m8Score))
 	}
 }

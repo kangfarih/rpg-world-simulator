@@ -612,7 +612,9 @@ func m10UpdateOverlay(c *playerConn, area *m10Area) {
 }
 
 // m10SetFreezing applies/removes the Freezing status effect
-// (Area.addPlayer/removePlayer -> player.status Effects.Freezing).
+// (Area.addPlayer/removePlayer -> player.status Effects.Freezing). The
+// tracker bridge feeds EFFECT_RATE cold damage through the Points pipeline
+// (character.ts handleColdDamage); the visual Effect frames stay here.
 func m10SetFreezing(c *playerConn, on bool) {
 	m10StateMu.Lock()
 	if m10Frozen[c.instance] == on {
@@ -621,6 +623,12 @@ func m10SetFreezing(c *playerConn, on bool) {
 	}
 	m10Frozen[c.instance] = on
 	m10StateMu.Unlock()
+
+	if on {
+		abFreezeApply(c.instance)
+	} else {
+		abFreezeClear(c.instance)
+	}
 
 	op := EffectRemove
 	if on {
@@ -693,6 +701,7 @@ func m10ForgetPlayer(instance string) {
 	delete(m10PvpState, instance)
 	delete(m10Frozen, instance)
 	m10StateMu.Unlock()
+	abFreezeClear(instance)
 }
 
 // ---------------------------------------------------------------------------

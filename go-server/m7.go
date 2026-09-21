@@ -177,6 +177,12 @@ func m7HandleChat(c *playerConn, frame clientFrame) {
 		return
 	}
 
+	// Ops limiter: shared per-conn chat bucket (same silent drop as the
+	// bucket-exhaust above — no notify).
+	if !opsAllowChat(c) {
+		return
+	}
+
 	// Mute gate (incoming.ts:479): the m13 slice persists user.mute in the
 	// players.data blob and rejects chat while the deadline is in the future.
 	if m13IsMuted(c.username) {
@@ -236,12 +242,14 @@ func m7Chat(c *playerConn, message string, global bool, withBubble bool, colour 
 
 	if global {
 		// world.globalMessage: [Global] prefix source frame, no bubble.
+		// All-in-one hub routing: resolve the online set via the Router and
+		// unicast; fall back to the existing broadcast when nobody resolves.
 		frame := pkt(PacketChat, chatPacketData{
 			Source:  "[Global] " + name,
 			Message: message,
 			Colour:  colour,
 		})
-		broadcast(frame)
+		socRouteGlobal(frame)
 		return
 	}
 
@@ -344,7 +352,9 @@ func m7ModeratorCommands(c *playerConn, command string, blocks []string) {
 // offline target notifies misc:NOT_ONLINE; delivery is an aquamarine
 // Notification with a [From <name>] source (both sides for the sender).
 func m7SendPrivateMessage(c *playerConn, playerName string, message string) {
-	target := m7PlayerByName(playerName)
+	// All-in-one hub routing: resolve the direct target via the Router first;
+	// an offline target falls back to the existing misc:NOT_ONLINE notify.
+	target := socRouteChat(playerName)
 	if target == nil {
 		m6Notify(c, fmt.Sprintf("misc:NOT_ONLINE;username=%s", playerName))
 		return

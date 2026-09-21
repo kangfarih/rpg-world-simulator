@@ -916,6 +916,21 @@ func m6HandleContainer(c *playerConn, frame clientFrame) {
 		if *msg.Type != ContainerTypeInventory {
 			return
 		}
+		// Pets (handler.ts handleDrop parity): dropping a pet item spawns the
+		// companion instead of a world item (the royalpet catpet reward flows
+		// through here, so m11 needs no hook). Already owning one keeps the
+		// item (player.ts ALREADY_HAVE_PET guard).
+		if mob, item, ok := petDropKey(c, *msg.FromIndex); ok {
+			if petHasOwner(c.instance) {
+				m6Notify(c, "misc:ALREADY_HAVE_PET")
+				return
+			}
+			m6InventoryRemoveAt(c, c.username, *msg.FromIndex, *msg.Value)
+			markDirty(c.username)
+			log.Printf("pets: %s drop-spawned %s (%s)", c.instance, item, mob)
+			petGrant(c, mob, item)
+			return
+		}
 		m6InventoryRemoveAt(c, c.username, *msg.FromIndex, *msg.Value)
 		markDirty(c.username)
 		log.Printf("m6: %s drop idx %d x%d", c.instance, *msg.FromIndex, *msg.Value)

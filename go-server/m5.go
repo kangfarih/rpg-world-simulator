@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -33,6 +32,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"rpg-world-server/internal/meta"
 
 	_ "modernc.org/sqlite"
 )
@@ -49,39 +50,18 @@ var (
 func initLevelExp() {
 	levelExpOnce.Do(func() {
 		// Mirror loader.ts exactly: indices 0..MAX_LEVEL-1 (loop i < MAX_LEVEL).
-		levelExpTbl = make([]int, ModulesMaxLevel)
-		levelExpTbl[0] = 0
-		for i := 1; i < ModulesMaxLevel; i++ {
-			points := int(math.Floor(0.25 * math.Floor(float64(i)+300*math.Pow(2, float64(i)/7))))
-			levelExpTbl[i] = points + levelExpTbl[i-1]
-		}
+		levelExpTbl = meta.BuildLevelExp(ModulesMaxLevel)
 	})
 }
 
 func expToLevel(xp int) int {
 	initLevelExp()
-	if xp < 0 {
-		return -1
-	}
-	for i := 1; i < len(levelExpTbl); i++ {
-		if xp < levelExpTbl[i] {
-			return i
-		}
-	}
-	return ModulesMaxLevel
+	return meta.ExpToLevel(levelExpTbl, ModulesMaxLevel, xp)
 }
 
 func nextExp(xp int) int {
 	initLevelExp()
-	if xp < 0 {
-		return -1
-	}
-	for i := 1; i < len(levelExpTbl); i++ {
-		if xp < levelExpTbl[i] {
-			return levelExpTbl[i]
-		}
-	}
-	return -1
+	return meta.NextExp(levelExpTbl, xp)
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +316,7 @@ func m5NearWalkable(x, y int) (int, int) {
 // (take-all on Target/Step; lootbag menu Open flow deferred, logged).
 func m5SpawnLoot(mobKey string, cx, cy int, owner string) {
 	drops := m5GetDropsFor(mobKey, owner)
+	drops = worldDoubleDrops(drops) // world: double-drops event duplicates the roll
 	lx, ly := m5NearWalkable(cx, cy)
 	lootMu.Lock()
 	lootSeq++
@@ -632,6 +613,9 @@ func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 		return
 	}
 	xp := damage * 2 // Modules.Constants.EXPERIENCE_PER_HIT.
+	if worldXPBoost() {
+		xp = xp * 3 / 2 // world: 1.5x experience event (experiencePerHit parity)
+	}
 	m5AddXP(c, key, SkillHealth, (xp+3)/4)
 	switch {
 	case archer:
@@ -825,12 +809,17 @@ func handlePlayerAttack(c *playerConn, target string) {
 			log.Printf("m5: %s swings at dead %s (ignored)", c.instance, target)
 			return
 		}
+		abSetTarget(c.instance, target)
 		broadcast(pkt(PacketAnimation, animationData{Instance: c.instance, Action: ActionAttack}))
 		broadcast(pktOp(PacketCombat, CombatHit, combatData{
 			Instance: c.instance, Target: target,
 			Hit: HitData{Type: HitsNormal, Damage: dmg},
 		}))
 		m9PlayerHit(m, c, dmg)
+		// TS combat.ts poison-on-hit: a poisonous weapon poisons the victim.
+		if abHeroWeaponPoisonous(c.username) {
+			abApplyPoison(target)
+		}
 		m5AwardCombatXP(c, c.username, dmg, false, false)
 		return
 	}
@@ -842,6 +831,7 @@ func handlePlayerAttack(c *playerConn, target string) {
 			log.Printf("m5: %s swings at dead boss (ignored)", c.instance)
 			return
 		}
+		abSetTarget(c.instance, target)
 		applyBossHitLocked(c.instance, dmg, HitsNormal, nil, false, -1, true)
 		died := combatDead
 		combatMu.Unlock()

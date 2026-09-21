@@ -188,15 +188,40 @@ func m13ParseCommand(c *playerConn, command string, blocks []string) {
 // Player commands: /guild kick|rank (commands.ts 'guild').
 // ---------------------------------------------------------------------------
 
-// m13GuildCommand ports the 'guild' case. The Go stub has no guild registry
-// (guildnpc exists as a talk NPC only), so both subcommands notify the
-// not-in-a-guild path exactly like the TS early return.
+// m13GuildCommand ports the 'guild' case (commands.ts:108-162) over the real
+// guild registry (social_wire.go): the not-in-a-guild gate keeps the exact TS
+// string, then kick|rank|invite subcommands run. Unknown subcommands stay
+// silent like the TS switch default.
 func m13GuildCommand(c *playerConn, command string, blocks []string) {
 	if command != "guild" {
 		return
 	}
-	_ = blocks // subcommand parse matches TS ('kick'/'rank' after the gate)
-	m6Notify(c, "You are not in a guild.")
+	if _, err := socGuilds.GuildOf(c.username); err != nil {
+		m6Notify(c, "You are not in a guild.")
+		return
+	}
+	if len(blocks) == 0 {
+		return
+	}
+	sub := blocks[0]
+	args := blocks[1:]
+	switch sub {
+	case "invite":
+		socGuildInvite(c, strings.Join(args, " "))
+	case "kick":
+		username := strings.Join(args, " ")
+		if username == "" {
+			m6Notify(c, "Malformed command, expected /guild kick [username]")
+			return
+		}
+		socGuildKick(c, username, true)
+	case "rank":
+		if len(args) < 2 {
+			m6Notify(c, "Malformed command, expected /guild rank [rank 0-6] [username]")
+			return
+		}
+		socGuildRankCommand(c, args[0], strings.Join(args[1:], " "))
+	}
 }
 
 // ---------------------------------------------------------------------------
