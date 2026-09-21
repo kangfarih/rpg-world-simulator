@@ -206,7 +206,13 @@ type tile struct {
 }
 
 func main() {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	// Honor PORT (the server's own override) so a side-by-side run works
+	// while the default 9001 is occupied.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9001"
+	}
+	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+port+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL FAIL:", err)
 		os.Exit(1)

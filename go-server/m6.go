@@ -37,6 +37,7 @@ type m6ItemInfo struct {
 	Skill        string // requirement skill key ("accuracy", ...)
 	Level        int    // requirement level (-1 when unset; getRequirement -> level or 0)
 	Poisonous    bool
+	Undroppable  bool // items.json `undroppable` (cannot trade/drop)
 }
 
 var (
@@ -62,6 +63,7 @@ func m6LoadItems() error {
 			Skill        string `json:"skill"`
 			Level        int    `json:"level"`
 			Poisonous    bool   `json:"poisonous"`
+			Undroppable  bool   `json:"undroppable"`
 		}
 		if err := json.Unmarshal(raw, &items); err != nil {
 			m6ItemsErr = err
@@ -73,7 +75,7 @@ func m6LoadItems() error {
 				max = ModulesMaxStack
 			}
 			m6Items[k] = &m6ItemInfo{Name: v.Name, Price: v.Price, Stackable: v.Stackable, MaxStackSize: max,
-				Type: v.Type, Skill: v.Skill, Level: v.Level, Poisonous: v.Poisonous}
+				Type: v.Type, Skill: v.Skill, Level: v.Level, Poisonous: v.Poisonous, Undroppable: v.Undroppable}
 		}
 		log.Printf("m6: items=%d", len(m6Items))
 	})
@@ -388,7 +390,7 @@ func m6InventoryRemoveAt(c *playerConn, key string, index, count int) {
 		pstateMu.Unlock()
 		_ = send(c.conn, pktOp(PacketContainer, ContainerRemove, containerData{
 			Type: ContainerTypeInventory,
-			Slot: &slotData{Index: index, Key: s.Key, Count: s.Count, Enchantments: map[string]any{}},
+			Slot: &slotData{Index: index, Key: s.Key, Count: s.Count, Enchantments: enchAny(s.Ench)},
 		}))
 		return
 	}
@@ -396,7 +398,7 @@ func m6InventoryRemoveAt(c *playerConn, key string, index, count int) {
 	pstateMu.Unlock()
 	_ = send(c.conn, pktOp(PacketContainer, ContainerRemove, containerData{
 		Type: ContainerTypeInventory,
-		Slot: &slotData{Index: index, Key: s.Key, Count: 0, Enchantments: map[string]any{}},
+		Slot: &slotData{Index: index, Key: s.Key, Count: 0, Enchantments: enchAny(s.Ench)},
 	}))
 }
 
@@ -693,7 +695,7 @@ func m6InvSlots(key string) []any {
 	slots := make([]any, 0, len(st.Inv))
 	for i, s := range st.Inv {
 		slots = append(slots, map[string]any{
-			"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+			"index": i, "key": s.Key, "count": s.Count, "enchantments": enchAny(s.Ench),
 		})
 	}
 	return slots
@@ -1029,9 +1031,9 @@ func m6HandleNPCTarget(c *playerConn, instance string) {
 		m6OpenBank(c)
 		return
 	}
-	// Enchanter role: no enchant engine in the slice; log-only.
+	// Enchanter role: container access + NPC Enchant (M12 enchant engine).
 	if info.Role == "enchanter" {
-		log.Printf("m6: %s talks to enchanter %s (no enchant engine)", c.instance, npcKey)
+		m12OpenEnchanter(c)
 		return
 	}
 	// Plain NPC: talk bubble text (npc.talk advancing per-player talkIndex).

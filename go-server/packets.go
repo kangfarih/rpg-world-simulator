@@ -7,7 +7,10 @@
 // EntityType.Object (6) is never spawned: entities.ts has no case for it.
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // Packet IDs (packages/common/network/packets.ts, 0-based).
 const (
@@ -467,10 +470,55 @@ const (
 
 // NPC opcodes (Opcodes.NPC: Talk0 Store1 Bank2 Enchant3 Countdown4).
 const (
-	NPCTalk  = 0
-	NPCStore = 1
-	NPCBank  = 2
+	NPCTalk    = 0
+	NPCStore   = 1
+	NPCBank    = 2
+	NPCEnchant = 3
 )
+
+// Trade opcodes (Opcodes.Trade: Request0 Add1 Remove2 Accept3 Close4 Open5).
+const (
+	TradeRequest = 0
+	TradeAdd     = 1
+	TradeRemove  = 2
+	TradeAccept  = 3
+	TradeClose   = 4
+	TradeOpen    = 5
+)
+
+// Enchant opcodes (Opcodes.Enchant: Select0 Confirm1).
+const (
+	EnchantSelect  = 0
+	EnchantConfirm = 1
+)
+
+// Crafting opcodes (Opcodes.Crafting: Open0 Select1 Craft2).
+const (
+	CraftingOpen   = 0
+	CraftingSelect = 1
+	CraftingCraft  = 2
+)
+
+// Modules.Skills ids for the crafting interfaces (modules.ts:215-235).
+const (
+	SkillCooking   = 9
+	SkillSmithing  = 10
+	SkillCraftingS = 11
+	SkillChiseling = 12
+	SkillFletching = 13
+	SkillSmelting  = 14
+	SkillAlchemy   = 17
+)
+
+// enchAny widens m5Slot.Ench for packet payloads (nil -> {}). Keys stringify
+// per the Enchantments wire shape ({"<id>": {"level": n}}).
+func enchAny(e Enchantments) map[string]any {
+	out := make(map[string]any, len(e))
+	for k, v := range e {
+		out[strconv.Itoa(k)] = v
+	}
+	return out
+}
 
 // Notification opcodes (Opcodes.Notification: Ok0 YesNo1 Text2 Popup3).
 const (

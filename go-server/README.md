@@ -40,7 +40,9 @@ positions). The harnesses dial a running server, they don't spawn one, so the
 debug damage accelerators are server-side env: start the server with
 `M9_MOBDMG=10` (m9 death leg) and/or `M11_HERODMG=10` (m11 skeleton kill
 leg). m11's drop leg greps the server log, so pass `M11_SERVER_LOG=<server
-log file>` to the m11 harness as well:
+log file>` to the m11 harness as well. Every harness (and the server)
+honors `PORT` — set it on both when 9001 is taken, e.g. a TS dev server
+running side-by-side:
 
 ```sh
 go run ./e2e/m6                 # stores/bank/NPC/persistence
@@ -49,6 +51,7 @@ go run ./e2e/m8                 # minigames lobby/queue/score
 go run ./e2e/m9                 # mob AI aggro/death/leash/kill
 go run ./e2e/m10                # areas music/overlay/pvp/camera + chest flow
 go run ./e2e/m11                # quests/achievements + gated drops/persistence
+go run ./e2e/m12                # trade + crafting + enchanting
 ```
 
 ## Docs

@@ -232,9 +232,20 @@ func npcPos(i int) (int, int) {
 	return 96 + (g%16)*2, 110 + (g/16)*2
 }
 
+// dialPort resolves the target port: PORT env (matching the server's own
+// override) or the default 9001.
+func dialPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return "9001"
+}
+
 func main() {
 	agentX, agentY := npcPos(0)
-	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	// Honor PORT (the server's own override) so a side-by-side run works
+	// while the default 9001 is occupied.
+	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL FAIL:", err)
 		os.Exit(1)
@@ -623,7 +634,7 @@ func main() {
 	conn.Close()
 	time.Sleep(300 * time.Millisecond)
 
-	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL FAIL (relogin):", err)
 		os.Exit(1)

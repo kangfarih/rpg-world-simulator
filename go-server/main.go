@@ -29,7 +29,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const addr = "127.0.0.1:9001"
+// addr resolves the listen address: PORT env (e.g. PORT=9002 for a side-by-side
+// run while the TS dev server occupies 9001) or the client-server default 9001.
+func addr() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return "127.0.0.1:" + p
+	}
+	return "127.0.0.1:9001"
+}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(_ *http.Request) bool { return true },
@@ -2701,6 +2708,7 @@ func removeClient(conn *websocket.Conn) {
 	m9PlayerLeave(c)
 	// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
 	m10ForgetPlayer(c.instance)
+	m12ClearSession(c, nil)
 	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
 	m5SaveSync(c.username)
 	// M11: quest/achievement rows persist on disconnect (same path).
@@ -3249,12 +3257,27 @@ func handleConn(conn *websocket.Conn) {
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m11test"] != nil {
 						m11HandleTest(c, frame[1])
 					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m12test"] != nil {
+						m12HandleTest(c, frame[1])
+					}
 				}
 			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
 				m6HandleEquipment(c, frame)
 			case PacketQuest: // C Quest {key} -> accept the start prompt (M11)
 				if len(frame) >= 2 {
 					m11HandleAccept(c, frame[1])
+				}
+			case PacketTrade: // C Trade (M12)
+				if len(frame) >= 2 {
+					m12HandleTrade(c, frame[1])
+				}
+			case PacketEnchant: // C Enchant Select/Confirm (M12)
+				if len(frame) >= 2 {
+					m12HandleEnchant(c, frame[1])
+				}
+			case PacketCrafting: // C Crafting Select/Craft (M12)
+				if len(frame) >= 2 {
+					m12HandleCrafting(c, frame[1])
 				}
 			case PacketRespawn: // C Respawn [] -> player.respawn (M9)
 				m9HandleRespawn(c)
@@ -3310,9 +3333,9 @@ func main() {
 		handleConn(conn)
 	})
 
-	fmt.Printf("kaetram-stub listening on %s\n", addr)
+	fmt.Printf("kaetram-stub listening on %s\n", addr())
 	log.Printf("cleanMode=%v testMode=%v combatMode=%v (CLEAN/COMBAT env or --clean/--combat; TESTMAP env or --testmap flag, default ON)", cleanMode, testMode, combatMode)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	if err := http.ListenAndServe(addr(), nil); err != nil {
 		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
 		os.Exit(1)
 	}

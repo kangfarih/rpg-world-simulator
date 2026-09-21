@@ -167,8 +167,19 @@ func notifyFrames() []notifyMsg {
 	return out
 }
 
+// dialPort resolves the target port: PORT env (matching the server's own
+// override) or the default 9001.
+func dialPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return "9001"
+}
+
 func main() {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	// Honor PORT (the server's own override) so a side-by-side run works
+	// while the default 9001 is occupied.
+	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL FAIL:", err)
 		os.Exit(1)
@@ -329,7 +340,7 @@ func main() {
 	// --- /teleport without rank -> ignored. ---
 	// Fresh connection, no seedRank => RankNone; the command tables must
 	// not fire (no Teleport frame), while plain chat still works.
-	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL2 FAIL:", err)
 		os.Exit(1)

@@ -407,6 +407,35 @@ func m5DestroyLoot(inst, why string) {
 type m5Slot struct {
 	Key   string
 	Count int
+	Ench  Enchantments // item enchantments {enchantmentId: {level}} (M12)
+}
+
+// m5SlotEnchJSON serializes a slot's enchantments for the inventory DB
+// column ({} when none).
+func m5SlotEnchJSON(s m5Slot) string {
+	if s.Ench == nil {
+		return "{}"
+	}
+	raw, err := json.Marshal(s.Ench)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// m5SlotEnchParse restores a slot's enchantments from the DB column.
+func m5SlotEnchParse(raw string) Enchantments {
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	ench := Enchantments{}
+	if err := json.Unmarshal([]byte(raw), &ench); err != nil {
+		return nil
+	}
+	if len(ench) == 0 {
+		return nil
+	}
+	return ench
 }
 
 type m5Skill struct {
@@ -629,11 +658,18 @@ func m5GatherXP(attackerInstance, skill string, xp int) {
 
 // m5AddItem stacks (items.json stackable) or appends; returns slot index.
 func m5AddItem(key, itemKey string, count int) int {
+	return m5AddItemEnch(key, itemKey, count, nil)
+}
+
+// m5AddItemEnch adds with enchantments (M12 crafting/enchant/trade paths);
+// stacking only merges when both stacks have identical enchantment maps —
+// a non-nil ench always takes a fresh slot.
+func m5AddItemEnch(key, itemKey string, count int, ench Enchantments) int {
 	loadM5Tables()
 	st := m5StateFor(key)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
-	if m5Stackable[itemKey] {
+	if ench == nil && m5Stackable[itemKey] {
 		for i, s := range st.Inv {
 			if s.Key == itemKey {
 				st.Inv[i].Count += count
@@ -641,7 +677,7 @@ func m5AddItem(key, itemKey string, count int) int {
 			}
 		}
 	}
-	st.Inv = append(st.Inv, m5Slot{Key: itemKey, Count: count})
+	st.Inv = append(st.Inv, m5Slot{Key: itemKey, Count: count, Ench: ench})
 	return len(st.Inv) - 1
 }
 
@@ -852,7 +888,7 @@ func m5Init() {
 	}
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS players(instance TEXT PRIMARY KEY, name TEXT, x INT, y INT, level INT, hp INT, data TEXT)`,
-		`CREATE TABLE IF NOT EXISTS inventory(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
+		`CREATE TABLE IF NOT EXISTS inventory(player TEXT, slot INT, item TEXT, count INT, enchantments TEXT, PRIMARY KEY(player, slot))`,
 		`CREATE TABLE IF NOT EXISTS bank(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
 		`CREATE TABLE IF NOT EXISTS equipment(player TEXT, type INT, item TEXT, count INT, PRIMARY KEY(player, type))`,
 		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
@@ -861,6 +897,9 @@ func m5Init() {
 			log.Fatalf("m5: ddl: %v", err)
 		}
 	}
+	// M12 migration: pre-existing DBs lack the inventory enchantments column
+	// (CREATE IF NOT EXISTS is a no-op there). Ignore failure = column exists.
+	_, _ = db.Exec(`ALTER TABLE inventory ADD COLUMN enchantments TEXT`)
 	dbConn = db
 	log.Printf("m5: sqlite open %s (WAL+NORMAL)", dbPath())
 	go func() {
@@ -933,7 +972,7 @@ func writePlayer(key string, st *m5State) {
 	}
 	for i, s := range st.Inv {
 		if _, err := dbConn.Exec(
-			`INSERT INTO inventory(player,slot,item,count) VALUES(?,?,?,?)`, key, i, s.Key, s.Count); err != nil {
+			`INSERT INTO inventory(player,slot,item,count,enchantments) VALUES(?,?,?,?,?)`, key, i, s.Key, s.Count, m5SlotEnchJSON(s)); err != nil {
 			log.Printf("m5: save inventory %s: %v", key, err)
 			return
 		}
@@ -1031,7 +1070,7 @@ func m5Load(key string) (*m5State, bool) {
 	if err != nil {
 		return nil, false
 	}
-	rows, err := dbConn.Query(`SELECT item,count FROM inventory WHERE player=? ORDER BY slot`, key)
+	rows, err := dbConn.Query(`SELECT item,count,enchantments FROM inventory WHERE player=? ORDER BY slot`, key)
 	if err != nil {
 		return nil, false
 	}
@@ -1039,10 +1078,11 @@ func m5Load(key string) (*m5State, bool) {
 	for rows.Next() {
 		var k string
 		var c int
-		if err := rows.Scan(&k, &c); err != nil {
+		var ench string
+		if err := rows.Scan(&k, &c, &ench); err != nil {
 			continue
 		}
-		st.Inv = append(st.Inv, m5Slot{Key: k, Count: c})
+		st.Inv = append(st.Inv, m5Slot{Key: k, Count: c, Ench: m5SlotEnchParse(ench)})
 	}
 	rows.Close()
 	brows, err := dbConn.Query(`SELECT item,count FROM bank WHERE player=? ORDER BY slot`, key)
@@ -1134,7 +1174,7 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 	slots := make([]any, 0, len(st.Inv))
 	for i, s := range st.Inv {
 		slots = append(slots, map[string]any{
-			"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+			"index": i, "key": s.Key, "count": s.Count, "enchantments": enchAny(s.Ench),
 		})
 	}
 	skills := make([]any, 0, len(st.Skills))
@@ -1160,7 +1200,7 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		bslots := make([]any, 0, len(st.Bank))
 		for i, s := range st.Bank {
 			bslots = append(bslots, map[string]any{
-				"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+				"index": i, "key": s.Key, "count": s.Count, "enchantments": enchAny(s.Ench),
 			})
 		}
 		extra = append(extra, pktOp(PacketContainer, ContainerBatch, containerData{

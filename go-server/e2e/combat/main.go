@@ -118,8 +118,19 @@ type tile struct {
 	C    bool            `json:"c"`
 }
 
+// dialPort resolves the target port: PORT env (matching the server's own
+// override) or the default 9001.
+func dialPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return "9001"
+}
+
 func main() {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	// Honor PORT (the server's own override) so a side-by-side run works
+	// while the default 9001 is occupied.
+	conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	if err != nil {
 		fmt.Println("DIAL FAIL:", err)
 		os.Exit(1)
@@ -920,7 +931,7 @@ func main() {
 	time.Sleep(800 * time.Millisecond)
 
 	incoming = make(chan []json.RawMessage, 65536)
-	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:9001/", nil)
+	conn2, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+dialPort()+"/", nil)
 	check(err == nil, "m5 reconnect dials")
 	if err != nil {
 		fmt.Println("RECONNECT DIAL FAIL:", err)

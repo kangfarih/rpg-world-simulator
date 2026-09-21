@@ -268,6 +268,7 @@ func m7ParseCommand(c *playerConn, rawText string) {
 
 	m7PlayerCommands(c, command, args)
 	m7ModeratorCommands(c, command, args)
+	m12PlayerCommands(c, command) // M12: crafting interface opens (/crafting etc.)
 }
 
 // m7PlayerCommands ports handlePlayerCommands (the subset meaningful in the
