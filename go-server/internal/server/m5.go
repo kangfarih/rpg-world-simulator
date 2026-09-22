@@ -565,6 +565,7 @@ func m5Init() {
 	persistStore = st
 	dbConn = st.DB()
 	log.Printf("m5: sqlite open %s (WAL+NORMAL)", dbPath())
+	checkWorldHashGate()   // D3: world.json sha256 vs meta.world_hash (warn; strict only)
 	abConfigure()          // abilities: wire the session seams (table handle + helpers)
 	petConfigure()         // entity: wire the companion seams (inventory + combat)
 	socConfigure()         // social: wire friends/guilds/hub seams (tables + presence)

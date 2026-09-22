@@ -1,6 +1,7 @@
 // Package persist owns the M5 SQLite persistence core: the single-writer
 // Store (one *sql.DB, one dirty set, one mutex), the players/inventory/bank/
-// equipment/skills schema, and the write/load/flush operations. Moved
+// equipment/skills schema plus the additive meta(k,v) table (D3 world_hash
+// boot gate), and the write/load/flush operations. Moved
 // verbatim out of the root m5.go persist section (E9a) WITHOUT behavior
 // change: identical DDL, identical WAL+NORMAL pragmas, identical SQL
 // sequences and log text.
@@ -149,6 +150,7 @@ func (s *Store) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS bank(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
 		`CREATE TABLE IF NOT EXISTS equipment(player TEXT, type INT, item TEXT, count INT, PRIMARY KEY(player, type))`,
 		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
+		`CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return fmt.Errorf("ddl: %w", err)
@@ -379,6 +381,39 @@ func (s *Store) LoadPlayer(key string) (State, bool) {
 		st.Skills[id] = Skill{Level: lv, XP: xp}
 	}
 	return st, true
+}
+
+// GetMeta reads one meta key (e.g. "world_hash" for the D3 boot gate).
+// The second return is false when the key is missing or the store is nil.
+// Callers hold the root dbMu, matching the other direct-table seams.
+func (s *Store) GetMeta(key string) (string, bool) {
+	if s == nil || s.db == nil || key == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v string
+	if err := s.db.QueryRow(`SELECT v FROM meta WHERE k=?`, key).Scan(&v); err != nil {
+		return "", false
+	}
+	return v, true
+}
+
+// SetMeta upserts one meta key. Callers hold the root dbMu, matching the
+// other direct-table seams.
+func (s *Store) SetMeta(key, value string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("meta: set %s: nil store", key)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`INSERT INTO meta(k,v) VALUES(?,?) `+
+			`ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+		key, value); err != nil {
+		return fmt.Errorf("meta: set %s: %w", key, err)
+	}
+	return nil
 }
 
 // FlushDirty writes every dirty player using snap to supply the
