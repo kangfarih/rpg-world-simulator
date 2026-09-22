@@ -6,29 +6,33 @@ Contract: JSON wire identical (`SPEC.md`: bulk `[[id,data]|[id,opcode,data]]` ov
 
 ### 0. Stack
 
-CURRENT (stub): Go 1.21 module `rpg-world-server`, `gorilla/websocket`, flat `main.go` + `packets.go`, in-memory only — no DB, no SQLite, no persistence.
-TARGET: Go 1.22 + `gobwas/ws` (`nhooyr.io/websocket` fallback) + `modernc.org/sqlite` (pure Go, no cgo) `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000`. Single-writer goroutine + prepared statements. Env config (`HOST/PORT/HUB_ENABLED`). Data copied/embedded from `packages/server/data/`.
+CURRENT (2026-09-22): Go 1.25 module `rpg-world-server`, `gorilla/websocket`, `modernc.org/sqlite` (pure Go, no cgo) `PRAGMA journal_mode=WAL; synchronous=NORMAL`, single-writer store (`internal/persist`, `SetMaxOpenConns(1)`), 23 `internal/*` packages (TS-mirror layout, see §2), `cmd/server` shim, 15+ black-box e2e harnesses (`go-server/e2e/*`) all green. Root `package main` retains the runtime wiring (transport, registry, dispatch, tick) with thin adapters over the packages.
+TARGET (remaining): `go:embed` data + `meta.world_hash` boot gate; multi-server hub transport; R1–R4 rollout (§12). `gobwas/ws` swap is optional (gorilla serves current scale).
 
 ### 1. Inventory
 
 Subsystems: bootstrap; conn + anti-spam (handshake/login/ready, IP throttle, chat bucket); regions/areas (48 tiles/region, sideLength 24, surroundingRegions); movement + anticheat (speed/collision/entity-grid verify, teleport-back); combat + projectiles (GCD, aggro, poison/burn/freeze/bleed); gathering (deplete→respawn); drops/loot (30–50s despawn); quests + achievements; stores/bank/trade/craft/enchant (stub: stores in-memory only); guilds/friends/hub; chat/commands ~1300 lines; abilities; minigames teamwar/coursing; NPC/pet/stats.
 Data (verified 2026-09-15): `items.json` 525, `mobs.json` 148, `npcs/spawns/tables.json`, `trees/rocks/fishing/foraging.json`, `stores.json`, `crafting/` 7 files, `quests/` 21 + `quest_bases/` 28, `abilities.json`, `minigames.json`, `map/world.json` 1152×1008; `sprites.json` client-only, no port.
 Packets: 61 (0–60 Connected…AdminSync; 59 Resource, 60 AdminSync) + opcodes (movement 0/1/2/3/4/5/7, equipment Batch0, store/guild/quest/ability/minigame sub-ops). Port all 53 `network/impl/*.ts` frames exactly.
-State split — persistent TARGET TODO (no DB in stub): players, equipment/inventory/bank, quests/achievements, skills/XP, stats, abilities, guilds; `meta` + migrations TODO. In-memory: entities, grids/regions, combat, loot timers, resource timers, store cache 20s TTL, minigame lobby/queue.
+State split — persistent DONE (SQLite, `internal/persist` + subsystem tables): players, equipment/inventory/bank, skills/XP, abilities, quests/achievements, guilds (`guilds`/`guild_members`), friends, m13 flags; dirty-flush every 10s + on disconnect + SIGTERM barrier. TODO: `meta` table (world hash, schema version) + expand-only migration discipline. In-memory: entities, region buckets, combat/aggro/projectiles, loot/chests (30–50s), resource timers, store 20s refresh, minigame lobby/queue, sessions + spam buckets, map frame cache.
 
-### 2. Package layout — TARGET (TODO M2+; CURRENT = flat `main.go` + `packets.go`)
+### 2. Package layout — ACTUAL (TS-mirror; extraction E0–E9 landed, see §4 ledger)
 
-- `cmd/server` — env, load data, open SQLite, build world, start hub+WS, signal flush.
-- `internal/net` — hub, bulk codec, 61 IDs + opcodes, 53 `impl/*` frames; region-scoped send; rate limits.
-- `internal/world` — map, collision/entity grids, regions/areas, pathing.
-- `internal/entities` — player/mob/npc/pet/projectile/item/chest/resource structs matching `EntityData/PlayerData`; never send type 6.
-- `internal/combat` — formulas, GCD, aggro, DoT ticks, projectile flight+Hit.
-- `internal/skills` — gathering/crafting rolls, XP curves (19 skills incl Chiseling/Smelting pseudo).
-- `internal/quests` — handlers over `quests/` 21 + `quest_bases/` 28 + achievements.
-- `internal/economy` — stores/bank/trade/craft/enchant + 20s store cache.
-- `internal/social` — guilds/friends/hub routing + chat/commands.
-- `internal/persist` — SQLite schema + single-writer store, dirty-flush.
-- `internal/minigame` — teamwar/coursing lobby/queue/score.
+- `cmd/server` — thin shim over the root runner (canonical entry pending root dissolution).
+- `internal/protocol` — 61 packet IDs + opcodes + `EntityData/PlayerData` + `pkt/pktOp/bulk` (canonical; root `packets.go` is an alias shim).
+- `internal/net` — `Bus` interface + rate `Limiter` (16/IP, 300 msg/s, chat 3-burst); root implements Bus via `bus_impl.go`.
+- `internal/world` — modes, movement/anticheat verify, tick `Engine` + cadence consts, `Store` seam (staged; registry maps still live in root).
+- `internal/worldmap` — canonical world store (`LoadDefault`, `BuildTile`, `SurroundingRegions`, `IsBlocked`) + lights/signs orchestration.
+- `internal/entity` — mob engine, areas system, pet registry/orchestration (live-conn structs stay in root adapters).
+- `internal/player` — pure-data `Player` model + `chat/` pipeline + `quest/` engine (registry, lifecycle, frames, SQLite).
+- `internal/controller` — trade/craft/enchant, stores/bank/equipment/NPC, warps/events orchestration, full commands tables.
+- `internal/persist` — single-writer SQLite store (players/inventory/bank/equipment/skills), identical schema/pragmas/cadence.
+- `internal/meta` — LevelExp table + damage/accuracy math (wired into m5 + combat).
+- `internal/minigame` — coursing/teamwar rules + `Manager` lifecycle (transport via `Effects`).
+- `internal/abilities` + `internal/status` — ability registry + DoT tracker (wired: quest rewards grant, 20Hz tick damages).
+- `internal/pets`, `internal/friends`, `internal/guilds`, `internal/hub` — registries + relay router (all-in-one mode).
+- `internal/warps`, `internal/events`, `internal/globals` — pure tables/scheduler/loaders.
+- `internal/api`, `internal/console`, `internal/app`, `internal/sim` — REST, stdin admin, boot config, demo-scene math.
 
 ### 3. SQLite schema — TARGET (stub: all in-memory; `meta`/migration TODO)
 
@@ -51,20 +55,31 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT); -- world.json hash, schema versio
 
 In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/chests (30–50s), resource timers, store cache (20s TTL), minigame lobby/queue, sessions + spam buckets, map frame cache.
 
-### 4. Milestones M1–M8
+### 4. Milestones — ALL DONE (parity complete; every item e2e-green, see `go-server/e2e/`)
 
-- M1 boot+map+spawn — DONE in stub: `Connected→Handshake→Login→Welcome+Map→Ready→Spawn*`, `[4,base64gzip,bufSize]` 9 regions, entity-grid block + Stop/Teleport-back. Modes: TESTMAP (default, 9 real regions + overlays: pond, 5-oak row, 232-entity grid) / CLEAN=1 (pure terrain, 2 players) / COMBAT=1 (boss dummy + 4-bot party). TODO: full-world streaming + embed all data.
-- M2 movement+anticheat — PARTIAL (single-resource block): TODO full verify per Request/Step, speed check, Follow/Speed, `List.Positions`, region handoff.
-- M3 combat+projectiles+GCD — TODO: formulas, `Combat/Heal/Effect`, projectile flight, aggro/leash/respawn, DoT ticks, death→despawn.
-- M4 resources+gathering — PARTIAL (shake + stump): TODO all tables, tool tiers, deplete→respawn, `Animation` + `Resource` sync.
-- M5 drops/loot+XP/skills — TODO: drop tables → lootbag/chest (30–50s), pickup, XP curves, 19 skills.
-- M6 quests/achievements+stores/bank/trade/craft — TODO: quest engine + achievements, store buy/sell/select + cache, bank, trade, `crafting/` 7 files, enchant.
-- M7 social+hub+chat/commands — TODO: guilds/friends persist + hub routing, ~1300-line commands port, anti-spam + per-IP limits.
-- M8 minigames+hardening — TODO: teamwar/coursing lobby/queue/score; region-scope sends, per-tick bulks, rate limits, load/soak, `go vet/build/gofmt` green.
+- M1 boot+map+spawn — DONE: `Connected→Handshake→Login→Welcome+Map→Ready→Spawn*`, `[4,base64gzip,bufSize]` 9 regions. Modes: TESTMAP (default + overlays) / CLEAN=1 / COMBAT=1. TODO (D3): full-world streaming + `go:embed` + `meta.world_hash` gate.
+- M2 movement+anticheat — DONE (`ed1b2a0` + E9b `internal/world` verify funcs): speed check, teleport-back, noclip bypass, `List.Positions`.
+- M3 combat+projectiles+GCD — DONE (`955ca3e`): formulas (`internal/meta`), `Combat/Heal/Effect`, projectile flight, aggro/leash/respawn, DoT ticks (`internal/status`).
+- M4 resources+gathering — DONE (`5494a20`): all tables, tool tiers, deplete→respawn, `Animation` + `Resource` sync.
+- M5 drops/loot+XP/skills — DONE (`29e2cb5` + E9a `internal/persist`): drop tables → lootbag/chest, pickup, XP curves, SQLite persist.
+- M6 stores/bank/NPC/equipment — DONE (`db20f81` + E6 `internal/controller`): buy/sell/select + 20s refresh, bank, containers, equip (`e2e/m6`).
+- M7 chat/commands — DONE (`f1b4246` + E3 `internal/player/chat`): region/global/PM, rank gates (`e2e/m7`).
+- M8 minigames — DONE (`9678f04` + E2 `internal/minigame` Manager): coursing/teamwar lobby/queue/score (`e2e/m8`).
+- M9 mob AI — DONE (`054659e` + E5 `internal/entity/mob`): roam/chase/leash/attack, death/respawn (`e2e/m9`).
+- M10 areas — DONE (`054659e` + E5 `internal/entity/areas`): music/overlay/pvp/camera/chest/dynamic (`e2e/m10`).
+- M11 quests+achievements — DONE (`9356043` + E7 `internal/player/quest`): 21 quests, gated drops, SQLite (`e2e/m11`).
+- M12 trade/craft/enchant — DONE (`c0d76ae` + E1 `internal/controller`): sessions, recipes, shards (`e2e/m12`).
+- M13 commands — DONE (`a42748a` + E8 `internal/controller`): full `commands.ts` port (`e2e/m13`).
+- P-A abilities+status — DONE (`internal/abilities`, `internal/status`, quest rewards grant; `e2e/abilities`).
+- P-B pets — DONE (`internal/pets` + `internal/entity/pet`; `e2e/pets`).
+- P-C friends/guilds/hub — DONE (`internal/friends`, `internal/guilds`, `internal/hub` all-in-one Router; `e2e/social`).
+- P-D warps/events/globals — DONE (`internal/warps`, `internal/events`, `internal/globals` + live multipliers; `e2e/world`).
+- P-E api/console/hardening — DONE (`internal/api`, `internal/console`, `internal/net` Limiter; soak 16-admit/4-reject).
+- E0–E9 extraction — DONE (commits `e1beb2d`, `23a437a`, `382c472`, `fe3c12f`, `c80843e`, `c39bea6`, `a25e86a`): TS-mirror `internal/*` owns all domain logic; root `package main` retains ONLY runtime wiring (transport, registry maps, dispatch switch, tick, boot) behind documented seams. Physical dissolution of that residue is D2-followup (needs call-site unfreeze, one coordinated pass).
 
-### 5. Perf notes — TARGET (stub: per-send writes, no tick/batching/region-scope)
+### 5. Perf notes — ACTUAL (all wired; soak-verified)
 
-20 Hz tick, deltas only; one bulk `[...]` write per conn per tick; region interest (surrounding regions); Map gzipped once at boot (cached frame); single-writer DB goroutine, flush dirty players 5–15s + on disconnect; persist off hot path; prepared statements + WAL; per-IP `MAX_CONNECTIONS`, per-conn msg/s + chat buckets.
+20 Hz tick (`FlushInterval` 50ms, `internal/world` consts); one bulk `[...]` write per conn per tick (20Hz outbox flush); region interest (surrounding regions); Map gzipped once at boot (cached frame); single-writer SQLite (`internal/persist`, max-open-conns=1), flush dirty every 10s + on disconnect + SIGTERM barrier; WAL + NORMAL; per-IP cap 16 + 300 msg/s + chat 3-burst (`internal/net` Limiter, enforced at accept/read/chat). Soak: 20 concurrent dials → 16 admitted / 4 rejected, server healthy, `testmap` green after.
 
 ### 6. Gap closures (audit 2026-09-15, all TARGET unless noted)
 
@@ -89,8 +104,8 @@ In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/ch
 
 ### 7. CURRENT vs TARGET
 
-CURRENT (stub): single binary, no DB, fixed IDs (`p1`/`p2`), `Handshake{gVer}` received but ignored (no gate), no hub/router — client points directly at the stub.
-TARGET: one `go-server` binary as `router` / `shard` / `all-in-one` (flags); gobwas/ws; SQLite WAL per shard + shared account DB; stamped `buildID` (git SHA) + `gVer` with enforced gate; standalone router + hub server-list; RUNNING→DRAINING→SHUTDOWN lifecycle; expand-only migrations. Nothing below assumes stub behavior.
+CURRENT (2026-09-22): full-parity all-in-one binary (SQLite WAL per process, random per-conn player instances, `Handshake{gVer}` received but ignored — no gate, all-in-one hub `Router` only, no server-list/heartbeat). Client points directly at the server.
+TARGET: one `go-server` binary as `router` / `shard` / `all-in-one` (flags); SQLite WAL per shard + shared account DB; stamped `buildID` (git SHA) + `gVer` with enforced gate; standalone router + hub server-list; RUNNING→DRAINING→SHUTDOWN lifecycle; expand-only migrations. Nothing below assumes all-in-one behavior.
 
 ### 8. Worlds-as-versions
 
