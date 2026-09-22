@@ -87,6 +87,16 @@ type ServerEntry struct {
 type ServerList struct {
 	Preferred string        `json:"preferred"`
 	Shards    []ServerEntry `json:"shards"`
+	// Previous is the previous healthy RUNNING version's addr (the canary
+	// remainder target + rollback fallback; "" omits = single version, the
+	// default boot renders byte-identical to before).
+	Previous string `json:"previous,omitempty"`
+	// CanaryPct is the active CANARY_PCT (omitted when 0 = today's
+	// behavior: 100% of NEW logins to Preferred).
+	CanaryPct int `json:"canaryPct,omitempty"`
+	// WarmUntil is the RFC3339 time until which the previous version must
+	// stay up (newest-observed + WARM_HOLD; "" omits = no previous).
+	WarmUntil string `json:"warmUntil,omitempty"`
 }
 
 // BuildServerList renders the hub table for login routing: shards newest
@@ -115,16 +125,73 @@ func BuildServerList(h *hub.Server) ServerList {
 	return out
 }
 
+// BuildServerListForLogin renders the hub table for one NEW session key
+// (instance/username, "" = anonymous): Preferred follows RouteLogin under
+// pct (pct<=0 or "" key = BuildServerList, today's behavior), Previous
+// always names the previous healthy version's addr when one is registered,
+// and WarmUntil gates TERM-ing the old build (see WarmTracker). The
+// canary decision is sticky per key: the same login key always resolves to
+// the same build for a fixed table + pct.
+func BuildServerListForLogin(h *hub.Server, key string, pct int, warm *WarmTracker, now time.Time) ServerList {
+	out := BuildServerList(h)
+	if h == nil {
+		return out
+	}
+	if key != "" && pct > 0 {
+		if pick, ok := RouteLogin(h, key, pct); ok {
+			out.Preferred = pick.Addr
+			if out.Preferred == "" {
+				out.Preferred = pick.Name
+			}
+		}
+		out.CanaryPct = pct
+	}
+	if prev, ok := PreviousRunning(h); ok {
+		addr := prev.Addr
+		if addr == "" {
+			addr = prev.Name
+		}
+		out.Previous = addr
+		if warm != nil {
+			if ts, ok := warm.newestObserved(h); ok {
+				hold := WarmHold()
+				if hold <= 0 {
+					hold = DefaultWarmHold
+				}
+				out.WarmUntil = ts.Add(hold).UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	return out
+}
+
 // RouterHandler wires the hub socket + /servers + /healthz on one mux. The
 // caller owns listening; h must be non-nil (RunRouter always supplies one).
+//
+// R3 canary: GET /servers accepts ?login=<instance-or-user> (also
+// ?instance= / ?user=) for a personalized canary decision under the live
+// CANARY_PCT env (router restart picks up env changes; the router is
+// stateless with a 5s SIGTERM grace). Without the param the response is
+// today's newest-RUNNING routing, unchanged.
 func RouterHandler(h *hub.Server, lc *Lifecycle) http.Handler {
 	if lc == nil {
 		lc = Default
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /servers", func(w http.ResponseWriter, _ *http.Request) {
+	warm := NewWarmTracker()
+	mux.HandleFunc("GET /servers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(BuildServerList(h))
+		q := r.URL.Query()
+		key := q.Get("login")
+		if key == "" {
+			key = q.Get("instance")
+		}
+		if key == "" {
+			key = q.Get("user")
+		}
+		now := time.Now()
+		warm.Observe(h, now)
+		_ = json.NewEncoder(w).Encode(BuildServerListForLogin(h, key, CanaryPct(), warm, now))
 	})
 	mux.HandleFunc("GET /healthz", lc.ServeHealth)
 	mux.Handle("/", h)

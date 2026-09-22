@@ -1,0 +1,65 @@
+// R3 expand-only migrations (GO-PLAN §11 + §12 R3): schema_version gate.
+//
+// Migration rule (expand-only): every schema change must be backward
+// compatible with the previous release's binary — additive tables, new
+// columns that are NULLABLE or carry a DEFAULT, never renames or drops in
+// the same release that stops writing them. Drops/renames land at least
+// two releases after the code stops depending on the old shape, so a
+// rollback to the previous binary always boots against a migrated DB.
+//
+// Enforcement: EnsureSchema stamps meta.schema_version with
+// CurrentSchemaVersion on fresh DBs, re-stamps forward on older DBs (the
+// additive DDL above already converged them), and REFUSES boot with an
+// explicit error when the DB's version is newer than this binary knows —
+// the caller (m5Init) turns that error into log.Fatalf, so a stale binary
+// never serves a schema it cannot understand. Rollback across a migration
+// is always safe (old binary + old-or-same version); roll-forward of the
+// binary is the only supported direction for newer schemas.
+package persist
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// SchemaVersionKey is the meta row carrying the schema version.
+const SchemaVersionKey = "schema_version"
+
+// CurrentSchemaVersion is the schema this binary understands. Bump it in
+// the same commit that adds the expand-only DDL to EnsureSchema.
+const CurrentSchemaVersion = 1
+
+// checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
+// row) are stamped with the current version; older versions are re-stamped
+// forward once the additive DDL has converged them; newer versions refuse
+// boot with an explicit error naming both versions and the recovery path.
+func (s *Store) checkSchemaVersion() error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("ddl: nil store")
+	}
+	stored, ok := s.GetMeta(SchemaVersionKey)
+	switch {
+	case !ok || strings.TrimSpace(stored) == "":
+		if err := s.SetMeta(SchemaVersionKey, strconv.Itoa(CurrentSchemaVersion)); err != nil {
+			return fmt.Errorf("ddl: stamp schema_version: %w", err)
+		}
+		return nil
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(stored))
+	if err != nil {
+		return fmt.Errorf("persist: schema_version %q unreadable (want integer): refusing boot; "+
+			"restore a backup from %s or reset the DB", stored, DefaultBackupDir)
+	}
+	if v > CurrentSchemaVersion {
+		return fmt.Errorf("persist: schema_version %d newer than binary supports (%d): refusing boot; "+
+			"deploy the matching (or newer) binary, or restore a backup from %s",
+			v, CurrentSchemaVersion, DefaultBackupDir)
+	}
+	if v < CurrentSchemaVersion {
+		if err := s.SetMeta(SchemaVersionKey, strconv.Itoa(CurrentSchemaVersion)); err != nil {
+			return fmt.Errorf("ddl: stamp schema_version: %w", err)
+		}
+	}
+	return nil
+}

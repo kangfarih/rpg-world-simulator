@@ -128,6 +128,9 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("pragma %q: %w", pr, err)
 		}
 	}
+	// R3 pre-deploy hook (default off): BACKUP_ON_BOOT=1 snapshots the
+	// owner connection before EnsureSchema migrates (see backup.go).
+	s.maybePreMigrateBackup()
 	if err := s.EnsureSchema(); err != nil {
 		db.Close()
 		return nil, err
@@ -139,7 +142,11 @@ func Open(path string) (*Store, error) {
 }
 
 // EnsureSchema creates the five persist tables when missing (verbatim DDL
-// from the old m5Init).
+// from the old m5Init), then stamps/gates meta.schema_version (see
+// schema.go: fresh DBs are stamped, older re-stamped forward, newer refuse
+// boot). The DDL strings below are frozen; schema changes add new
+// expand-only statements in the same commit that bumps
+// CurrentSchemaVersion.
 func (s *Store) EnsureSchema() error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("ddl: nil store")
@@ -156,7 +163,7 @@ func (s *Store) EnsureSchema() error {
 			return fmt.Errorf("ddl: %w", err)
 		}
 	}
-	return nil
+	return s.checkSchemaVersion()
 }
 
 // DB exposes the underlying handle for the legacy direct-table seams (m11
