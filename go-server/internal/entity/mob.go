@@ -104,21 +104,23 @@ const (
 // MobProfile mirrors the mobs.json entry shape Node Mob.loadData consumes.
 // JSON tags are identical to the old root m9MobProfile (file shape frozen).
 type MobProfile struct {
-	Name          string `json:"name"`
-	Level         int    `json:"level"`
-	HitPoints     int    `json:"hitPoints"`
-	AggroRange    int    `json:"aggroRange"`
-	AttackRange   int    `json:"attackRange"`
-	AttackRate    int    `json:"attackRate"`
-	MovementSpeed int    `json:"movementSpeed"`
-	RespawnDelay  int    `json:"respawnDelay"`
-	RoamDistance  int    `json:"roamDistance"`
-	Roaming       *bool  `json:"roaming"`
-	Aggressive    bool   `json:"aggressive"`
-	AlwaysAggro   bool   `json:"alwaysAggressive"`
-	Poisonous     bool   `json:"poisonous"`
-	Boss          bool   `json:"boss"`
-	Miniboss      bool   `json:"miniboss"`
+	Name          string     `json:"name"`
+	Level         int        `json:"level"`
+	HitPoints     int        `json:"hitPoints"`
+	AggroRange    int        `json:"aggroRange"`
+	AttackRange   int        `json:"attackRange"`
+	AttackRate    int        `json:"attackRate"`
+	MovementSpeed int        `json:"movementSpeed"`
+	RespawnDelay  int        `json:"respawnDelay"`
+	RoamDistance  int        `json:"roamDistance"`
+	Roaming       *bool      `json:"roaming"`
+	Aggressive    bool       `json:"aggressive"`
+	AlwaysAggro   bool       `json:"alwaysAggressive"`
+	Poisonous     bool       `json:"poisonous"`
+	Boss          bool       `json:"boss"`
+	Miniboss      bool       `json:"miniboss"`
+	Drops         []DropJSON `json:"drops"`
+	DropTables    []string   `json:"dropTables"`
 	AttackStats   struct {
 		Crush   int `json:"crush"`
 		Slash   int `json:"slash"`

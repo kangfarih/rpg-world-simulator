@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"rpg-world-server/internal/entity"
 	"rpg-world-server/internal/protocol"
 )
 
@@ -306,11 +307,10 @@ type InventoryAdmin interface {
 	AppendBank(username, key string, count int)
 }
 
-// Drop is one exact loot item (m5Drop parity, no drop-table roll).
-type Drop struct {
-	Key   string
-	Count int
-}
+// Drop is one exact loot item (m5Drop parity, no drop-table roll). The loot
+// registry owns the canonical shape (internal/entity); this aliases it so
+// the LootAdmin seam and the double-drops probe share one type.
+type Drop = entity.Drop
 
 // LootAdmin abstracts the shared loot registry (/drop + /lootbag spawn the
 // exact items with no killer gate).

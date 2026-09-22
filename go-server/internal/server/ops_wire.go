@@ -1,0 +1,158 @@
+// Ops wiring (API + console) — thin root adapter over internal/app.
+//
+// Canonical owner: internal/app (ops.go: REST surface + stdin console over
+// internal/api, internal/console, internal/net and internal/world). This
+// file only wires the package seams to the root globals (players map,
+// dbConn/dbMu, m5/m9 helpers, Hub accept-gate) and keeps the entry points
+// main.go calls — with UNCHANGED signatures — delegating to the package.
+// Output strings and limiter budgets are identical (owned by the package).
+package server
+
+import (
+	"net"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/gorilla/websocket"
+
+	"rpg-world-server/internal/app"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
+)
+
+// opsGameVersion / opsMaxPlayers feed the API status snapshot (the stub has
+// no config file; the handshake gVer is client-supplied so there is no
+// server constant to reuse).
+const (
+	opsGameVersion = app.GameVersion
+	opsMaxPlayers  = app.MaxPlayers
+)
+
+// Transport + accept-gate state moved to internal/net (D2a): the Hub owns
+// the limiter, the update-mode gate, the admitted-conn table and the IP ban
+// set. The accept/release/budget entry points live there as package funcs
+// (gnet.Accept/Release/AllowMsg/AllowChat); console commands below drive
+// the Hub via the app Ban seams (gnet.SetAccepting/gnet.BanIP/
+// gnet.BannedIPs).
+
+// Transport + accept-gate entry points moved to internal/net (D2a): use
+// gnet.Accept/gnet.Release/gnet.AllowMsg/gnet.AllowChat at the former
+// opsAccept/opsRelease/opsAllowMsg/opsAllowChat call sites (main.go
+// handler, handleConn read path, m7 chat path).
+
+// opsConfigure wires the ops seams (called once from m5Init, before the
+// API/console start).
+func opsConfigure() {
+	port := 9001
+	if p := os.Getenv("PORT"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			port = n
+		}
+	}
+	app.ConfigureOps(app.OpsDeps{
+		Port:       port,
+		ConsoleOff: app.ConsoleDisabled(os.Getenv("CONSOLE")),
+		Usernames:  m7PlayerUsernames,
+		LookupPlayer: func(name string) (string, int, bool) {
+			for _, n := range m7PlayerUsernames() {
+				if strings.EqualFold(n, name) {
+					return n, opsPlayerLevel(n), true
+				}
+			}
+			return "", 0, false
+		},
+		PlayerCount: worldcore.PlayerCount,
+		HaveDB:      func() bool { return dbConn != nil },
+		CountPlayers: func() (int, error) {
+			dbMu.Lock()
+			defer dbMu.Unlock()
+			var n int
+			if err := dbConn.QueryRow(`SELECT COUNT(*) FROM players`).Scan(&n); err != nil {
+				return 0, err
+			}
+			return n, nil
+		},
+		BeginUpdate: func() int {
+			gnet.SetAccepting(false)
+			conns := worldcore.AllWS()
+			for _, k := range conns {
+				worldcore.RemoveClient(k)
+			}
+			return len(conns)
+		},
+		KillPlayer: func(username string) (string, bool) {
+			target := m7PlayerByName(username)
+			if target == nil {
+				return "", false
+			}
+			m9DamagePlayer(target, m9PlayerHP(target), nil)
+			return target.Username, true
+		},
+		DropPlayer: func(username string) (string, bool) {
+			target := m7PlayerByName(username)
+			if target == nil {
+				return "", false
+			}
+			name := target.Username
+			worldcore.RemoveClient(target.Conn.WS)
+			return name, true
+		},
+		SetPlayerRank: func(username string, rank int) (string, bool) {
+			target := m7PlayerByName(username)
+			if target == nil {
+				return "", false
+			}
+			target.rank = rank
+			chatStateFor(target).rank = rank
+			return target.Username, true
+		},
+		AdminRank:     RankAdmin,
+		ModeratorRank: RankModerator,
+		BannedIPs:     gnet.BannedIPs,
+		BanIP: func(ip string) int {
+			gnet.BanIP(ip)
+			var conns []*websocket.Conn
+			for _, k := range worldcore.AllWS() {
+				host, _, err := net.SplitHostPort(gnet.AddrID(k))
+				if err != nil {
+					host = gnet.AddrID(k)
+				}
+				if host == ip {
+					conns = append(conns, k)
+				}
+			}
+			for _, k := range conns {
+				worldcore.RemoveClient(k)
+			}
+			return len(conns)
+		},
+		SaveWorld: flushDirty,
+	})
+}
+
+// opsPlayerUsernames snapshots online usernames via the world Registry
+// (the Registry mutex is released before the caller touches player state,
+// preserving the old playersMu/pstateMu order).
+func opsPlayerUsernames() []string {
+	return m7PlayerUsernames()
+}
+
+func opsPlayerLevel(username string) int {
+	if st := m5StateFor(username); st != nil && st.Level > 0 {
+		return st.Level
+	}
+	return 1
+}
+
+// opsStartAPI starts the read-only REST surface when API_PORT is set
+// (default off). A busy port logs and the game boots without the API.
+func opsStartAPI() {
+	app.StartAPI()
+}
+
+// opsStartConsole starts the stdin console loop unless CONSOLE=0 or stdin is
+// not a TTY (pipes — tests, harnesses, CI — never block on stdin).
+func opsStartConsole() {
+	app.StartConsole()
+}

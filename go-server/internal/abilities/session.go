@@ -1,5 +1,5 @@
-// Ability + status wiring (behavior-additive root glue over
-// internal/abilities and internal/status).
+// Ability + status sessions, extracted behavior-frozen from the root
+// abilities_wire.go adapter (task D2b item 2).
 //
 // TS sources: abilities.ts (add/has/setLevel/use + Add/Update/Batch/Toggle
 // packets), ability.ts (activate gating: passive rejection, mana, cooldown,
@@ -17,9 +17,27 @@
 //	S->C Ability Toggle=5 {key,level:-1} (activate + deactivate)
 //	C->S Ability [22,{opcode,key,index?}] Use=3 QuickSlot=4 (menu.ts
 //	  handleAbility -> socket.send(Packets.Ability,{opcode,key,index})).
-package main
+//
+// Everything transport/world/state related stays with the root adapter and
+// is reached only through Conn (per-connection delivery) and SessionDeps:
+//
+//	Send/Broadcast        -> gnet.Send / worldcore.Broadcast (frames)
+//	Notify                -> m6Notify (unlock + misc:* notifies)
+//	DB/DataPath/Test      -> abilities table handle, resourceDataPath,
+//	                         testMode gate
+//	MarkDirty             -> persist dirty set
+//	DummyInstance         -> combatDummyInstance (RequiresTarget liveness)
+//	TargetAlive           -> combatMu/combatDead + m9MobFor liveness
+//	FindPlayer/Damage*    -> worldcore.Find + m9DamagePlayer/m9PlayerHit
+//	HeroWeaponPoisonous   -> m5/m6 equipped-weapon poisonous flag
+//
+// Frames are built with internal/protocol (the same constructors the root
+// pkt/pktOp shims wrap), so wire bytes are identical. All log strings and
+// TESTMAP debug ops are kept verbatim.
+package abilities
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"sort"
@@ -28,10 +46,8 @@ import (
 	"sync"
 	"time"
 
-	"rpg-world-server/internal/abilities"
-	gnet "rpg-world-server/internal/net"
+	"rpg-world-server/internal/protocol"
 	"rpg-world-server/internal/status"
-	worldcore "rpg-world-server/internal/world"
 )
 
 // Ability opcodes (Opcodes.Ability in opcodes.ts): Batch0 Add1 Update2
@@ -52,9 +68,56 @@ const (
 )
 
 const (
-	abMaxMana      = 50 // welcomePlayer mana/maxMana (m5 persists no mana)
-	abFreezeSuffix = "|freeze"
+	maxMana      = 50 // welcomePlayer mana/maxMana (m5 persists no mana)
+	freezeSuffix = "|freeze"
 )
+
+// Conn is the minimal per-connection view for ability delivery. Nil = no
+// frames (quest/achievement reward paths with no live conn).
+type Conn struct {
+	Instance string
+	Username string
+	// Send delivers frames to this conn (gnet.Send parity).
+	Send func(frames ...[]any)
+	// Notify sends a client text notification (m6Notify parity).
+	Notify func(message string)
+}
+
+// SessionDeps bundles the ability-session seams (implemented by the root
+// adapter; never by this package).
+type SessionDeps struct {
+	// DB is the abilities table handle (nil = persistence disabled).
+	DB *sql.DB
+	// DataPath resolves abilities.json (resourceDataPath parity).
+	DataPath func(name string) string
+	// Test gates the TESTMAP debug dispatcher (testMode parity).
+	Test bool
+	// MarkDirty flags the player row for the 10s persist flush.
+	MarkDirty func(key string)
+	// Broadcast fans frames out (worldcore.Broadcast parity).
+	Broadcast func(frames ...[]any)
+	// TargetAlive reports combat-target liveness: (alive, checkable).
+	// The root checks the combat dummy first (combatMu/combatDead), then
+	// engine mobs (m9MobFor dead flag); checkable=false = unknown entity
+	// kind (players/NPCs: no liveness data, treated as live —
+	// abLiveTarget parity).
+	TargetAlive func(target string) (alive, checkable bool)
+	// DamagePlayer applies DoT damage to a player instance, returning HP
+	// after (m9DamagePlayer + m9PlayerHP parity). ok=false = unknown.
+	DamagePlayer func(instance string, dmg int) (hp int, ok bool)
+	// DamageMob applies DoT damage to a killable mob (m9PlayerHit parity).
+	// false = not a mob.
+	DamageMob func(instance string, dmg int) bool
+	// HeroWeaponPoisonous reports the items.json `poisonous` flag on the
+	// hero's equipped weapon (combat.ts poison-on-hit parity).
+	HeroWeaponPoisonous func(username string) bool
+}
+
+var sdeps SessionDeps
+
+// ConfigureSessions installs the ability-session seams (called once from
+// the root boot, before login batches or ticks run).
+func ConfigureSessions(d SessionDeps) { sdeps = d }
 
 // abilityEntry mirrors AbilityData (impl/ability.ts): serialize(true)
 // carries key/level/quickSlot/type, Update omits type.
@@ -72,7 +135,7 @@ type abilityToggle struct {
 
 var (
 	abOnce     sync.Once
-	abRegistry *abilities.Registry
+	abRegistry *Registry
 
 	abMu        sync.Mutex
 	abLevels    = map[string]map[string]int{} // username -> ability -> level
@@ -87,11 +150,21 @@ var (
 	abStatus = status.NewTracker()
 )
 
-// abLoadRegistry loads abilities.json once (resourceDataPath so RES_abilities
+func abIntp(v int) *int { return &v }
+
+// LoadRegistry loads abilities.json once (resourceDataPath so RES_abilities
 // overrides like every other data table).
-func abLoadRegistry() *abilities.Registry {
+func LoadRegistry() *Registry { return loadRegistry() }
+
+// loadRegistry loads abilities.json once (resourceDataPath so RES_abilities
+// overrides like every other data table).
+func loadRegistry() *Registry {
 	abOnce.Do(func() {
-		r, err := abilities.Load(resourceDataPath("abilities"))
+		path := "abilities"
+		if sdeps.DataPath != nil {
+			path = sdeps.DataPath("abilities")
+		}
+		r, err := Load(path)
 		if err != nil {
 			log.Printf("abilities: %v (ability engine disabled)", err)
 			return
@@ -102,28 +175,28 @@ func abLoadRegistry() *abilities.Registry {
 	return abRegistry
 }
 
-// abEnsureTables creates the abilities table (m13 flags-table precedent;
+// EnsureTables creates the abilities table (m13 flags-table precedent;
 // synchronous INSERT OR REPLACE on grant, SELECT into memory on login).
-func abEnsureTables() {
-	if dbConn == nil {
+func EnsureTables() {
+	if sdeps.DB == nil {
 		return
 	}
-	if _, err := dbConn.Exec(`CREATE TABLE IF NOT EXISTS abilities(player TEXT, ability TEXT, level INT, PRIMARY KEY(player, ability))`); err != nil {
+	if _, err := sdeps.DB.Exec(`CREATE TABLE IF NOT EXISTS abilities(player TEXT, ability TEXT, level INT, PRIMARY KEY(player, ability))`); err != nil {
 		log.Printf("abilities: ddl: %v", err)
 	}
 }
 
-// abGrantAbility ports abilities.add + the quest/achievement reward calls
+// GrantAbility ports abilities.add + the quest/achievement reward calls
 // (quest.ts givePlayerAbility, achievement.ts finishCallback): unknown keys
 // are refused with a log (TS: `Ability <key> does not exist.`), re-grants
 // raise the level via an Update frame (TS: has() -> setLevel), first grants
 // send Add. Level mirrors `abilityLevel || 1` (0/negative -> 1) with the
 // registry 1-4 clamp applied by ForKey.
-func abGrantAbility(c *playerConn, username, key string, level int) bool {
+func GrantAbility(c *Conn, username, key string, level int) bool {
 	if username == "" || key == "" {
 		return false
 	}
-	r := abLoadRegistry()
+	r := loadRegistry()
 	if r == nil {
 		return false
 	}
@@ -153,13 +226,15 @@ func abGrantAbility(c *playerConn, username, key string, level int) bool {
 	}
 	quick := qm[key]
 	abMu.Unlock()
-	if dbConn != nil {
-		if _, err := dbConn.Exec(`INSERT OR REPLACE INTO abilities(player,ability,level) VALUES(?,?,?)`,
+	if sdeps.DB != nil {
+		if _, err := sdeps.DB.Exec(`INSERT OR REPLACE INTO abilities(player,ability,level) VALUES(?,?,?)`,
 			username, key, a.Level); err != nil {
 			log.Printf("abilities: save %s/%s: %v", username, key, err)
 		}
 	}
-	markDirty(username)
+	if sdeps.MarkDirty != nil {
+		sdeps.MarkDirty(username)
+	}
 	if c == nil {
 		return true
 	}
@@ -168,34 +243,34 @@ func abGrantAbility(c *playerConn, username, key string, level int) bool {
 		typ = AbilityTypePassive
 	}
 	if had {
-		_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityUpdate, abilityEntry{
+		c.Send(protocol.PktOp(protocol.PacketAbility, AbilityUpdate, abilityEntry{
 			Key: key, Level: a.Level, QuickSlot: quick,
 		}))
 	} else {
-		_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityAdd, abilityEntry{
-			Key: key, Level: a.Level, QuickSlot: quick, Type: intp(typ),
+		c.Send(protocol.PktOp(protocol.PacketAbility, AbilityAdd, abilityEntry{
+			Key: key, Level: a.Level, QuickSlot: quick, Type: abIntp(typ),
 		}))
 	}
-	m6Notify(c, "You have unlocked the "+key+" ability.")
+	c.Notify("You have unlocked the " + key + " ability.")
 	log.Printf("abilities: %s granted %s lv%d", username, key, a.Level)
 	return true
 }
 
-// abHas reports whether username unlocked key.
-func abHas(username, key string) bool {
+// Has reports whether username unlocked key.
+func Has(username, key string) bool {
 	abMu.Lock()
 	defer abMu.Unlock()
 	return abLevels[username][key] > 0
 }
 
-// abLoadAbilities restores persisted unlocks into memory (m11LoadQuests
+// LoadAbilities restores persisted unlocks into memory (m11LoadQuests
 // precedent — called before the login batches are built).
-func abLoadAbilities(username string) {
-	if dbConn == nil || username == "" {
+func LoadAbilities(username string) {
+	if sdeps.DB == nil || username == "" {
 		return
 	}
-	abLoadRegistry()
-	rows, err := dbConn.Query(`SELECT ability,level FROM abilities WHERE player=?`, username)
+	loadRegistry()
+	rows, err := sdeps.DB.Query(`SELECT ability,level FROM abilities WHERE player=?`, username)
 	if err != nil {
 		return
 	}
@@ -214,10 +289,10 @@ func abLoadAbilities(username string) {
 	}
 }
 
-// abLoginBatch builds the Ability Batch frame queued after the Welcome
+// LoginBatch builds the Ability Batch frame queued after the Welcome
 // extras (handler.ts onLoaded ability serialize — empty list when nothing
 // unlocked; previously the server never sent packet 22).
-func abLoginBatch(username string) []any {
+func LoginBatch(username string) []any {
 	abMu.Lock()
 	m := abLevels[username]
 	keys := make([]string, 0, len(m))
@@ -234,7 +309,7 @@ func abLoginBatch(username string) []any {
 			if !r.IsActive(k) {
 				typ = AbilityTypePassive
 			}
-			e.Type = intp(typ)
+			e.Type = abIntp(typ)
 		}
 		list = append(list, e)
 	}
@@ -242,21 +317,21 @@ func abLoginBatch(username string) []any {
 	if list == nil {
 		list = []abilityEntry{}
 	}
-	return pktOp(PacketAbility, AbilityBatch, map[string]any{"abilities": list})
+	return protocol.PktOp(protocol.PacketAbility, AbilityBatch, map[string]any{"abilities": list})
 }
 
-// abManaFor returns the current mana for an instance (welcome default).
-func abManaFor(instance string) int {
+// ManaFor returns the current mana for an instance (welcome default).
+func ManaFor(instance string) int {
 	abMu.Lock()
 	defer abMu.Unlock()
 	if m, ok := abMana[instance]; ok {
 		return m
 	}
-	return abMaxMana
+	return maxMana
 }
 
-// abSetTarget records the hero's last attack target (RequiresTarget gate).
-func abSetTarget(instance, target string) {
+// SetTarget records the hero's last attack target (RequiresTarget gate).
+func SetTarget(instance, target string) {
 	if instance == "" {
 		return
 	}
@@ -269,38 +344,26 @@ func abSetTarget(instance, target string) {
 	abMu.Unlock()
 }
 
-// abLiveTarget resolves the recorded target when it is still alive.
-func abLiveTarget(instance string) string {
+// LiveTarget resolves the recorded target when it is still alive.
+func LiveTarget(instance string) string {
 	abMu.Lock()
 	t := abTarget[instance]
 	abMu.Unlock()
 	if t == "" {
 		return ""
 	}
-	if t == combatDummyInstance {
-		combatMu.Lock()
-		dead := combatDead
-		combatMu.Unlock()
-		if !dead {
-			return t
-		}
-	} else if m := m9MobFor(t); m != nil {
-		m.mu.Lock()
-		dead := m.dead
-		m.mu.Unlock()
-		if !dead {
-			return t
-		}
-	} else {
+	if alive, checkable := sdeps.TargetAlive(t); !checkable {
 		return t // unknown entity kinds (players/NPCs): no liveness data
+	} else if alive {
+		return t
 	}
-	abSetTarget(instance, "")
+	SetTarget(instance, "")
 	return ""
 }
 
-// abHandleAbility routes C->S Ability frames [22,{opcode,key,index?}]
+// HandleAbility routes C->S Ability frames [22,{opcode,key,index?}]
 // (incoming.ts handleAbility): Use activates, QuickSlot stores the slot.
-func abHandleAbility(c *playerConn, data []byte) {
+func HandleAbility(c *Conn, data []byte) {
 	var d struct {
 		Opcode int    `json:"opcode"`
 		Key    string `json:"key"`
@@ -311,7 +374,7 @@ func abHandleAbility(c *playerConn, data []byte) {
 	}
 	switch d.Opcode {
 	case AbilityUse:
-		abUse(c, d.Key)
+		Use(c, d.Key)
 	case AbilityQuickSlot:
 		if d.Index == nil {
 			return
@@ -327,17 +390,17 @@ func abHandleAbility(c *playerConn, data []byte) {
 	}
 }
 
-// abUse ports Ability.activate gating (ability.ts): passive rejection,
+// Use ports Ability.activate gating (ability.ts): passive rejection,
 // RequiresTarget combat gate (misc:NEED_COMBAT), mana (misc:NOT_ENOUGH_MANA)
 // + cooldown via abilities.CanCast (misc:NEED_WAIT_ABILITY). On success the
 // mana decrements (Points mana emit), a Toggle frame goes out, server-side
 // effects ride the status tracker + Effect Add, and the TS setTimeout
 // deactivate becomes a time.AfterFunc Toggle (+ EffectRemove).
-func abUse(c *playerConn, key string) {
+func Use(c *Conn, key string) {
 	if c == nil {
 		return
 	}
-	r := abLoadRegistry()
+	r := loadRegistry()
 	if r == nil {
 		return
 	}
@@ -354,17 +417,17 @@ func abUse(c *playerConn, key string) {
 	if !ok {
 		return
 	}
-	if r.RequiresTarget(key) && abLiveTarget(c.Instance) == "" {
-		m6Notify(c, "misc:NEED_COMBAT")
+	if r.RequiresTarget(key) && LiveTarget(c.Instance) == "" {
+		c.Notify("misc:NEED_COMBAT")
 		return
 	}
 	nowMs := time.Now().UnixMilli()
-	mana := abManaFor(c.Instance)
+	mana := ManaFor(c.Instance)
 	abMu.Lock()
 	last := abLastCast[c.Username+"\x00"+key]
 	abMu.Unlock()
 	if mana < a.ManaCost {
-		m6Notify(c, "misc:NOT_ENOUGH_MANA")
+		c.Notify("misc:NOT_ENOUGH_MANA")
 		return
 	}
 	if !a.CanCast(mana, nowMs, last) {
@@ -372,7 +435,7 @@ func abUse(c *playerConn, key string) {
 		if wait < 1 {
 			wait = 1
 		}
-		m6Notify(c, "misc:NEED_WAIT_ABILITY;duration="+itoa(wait))
+		c.Notify("misc:NEED_WAIT_ABILITY;duration=" + Itoa(wait))
 		return
 	}
 	mana -= a.ManaCost
@@ -380,17 +443,17 @@ func abUse(c *playerConn, key string) {
 	abMana[c.Instance] = mana
 	abLastCast[c.Username+"\x00"+key] = nowMs
 	abMu.Unlock()
-	_ = gnet.Send(c.Conn, pkt(PacketPoints, pointsData{
-		Instance: c.Instance, Mana: intp(mana), MaxMana: intp(abMaxMana),
+	c.Send(protocol.Pkt(protocol.PacketPoints, protocol.PointsData{
+		Instance: c.Instance, Mana: abIntp(mana), MaxMana: abIntp(maxMana),
 	}))
-	_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+	c.Send(protocol.PktOp(protocol.PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 	fx := a.Effect()
-	if fx.Kind == abilities.EffectNone {
+	if fx.Kind == EffectNone {
 		// Client-visual window only (intimidate/hotshot/secretcalling):
 		// untoggle when the duration lapses, no server status.
 		if fx.DurationMs > 0 {
 			time.AfterFunc(time.Duration(fx.DurationMs)*time.Millisecond, func() {
-				_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+				c.Send(protocol.PktOp(protocol.PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 			})
 		}
 		log.Printf("abilities: %s cast %s (window %dms)", c.Username, key, fx.DurationMs)
@@ -406,16 +469,16 @@ func abUse(c *playerConn, key string) {
 	}
 	m[effectID] = true
 	abFxMu.Unlock()
-	worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{Instance: c.Instance, Effect: effectID}))
+	sdeps.Broadcast(protocol.PktOp(protocol.PacketEffect, protocol.EffectAdd, protocol.EffectData{Instance: c.Instance, Effect: effectID}))
 	log.Printf("abilities: %s cast %s effect=%d dur=%dms", c.Username, key, effectID, fx.DurationMs)
 	if fx.DurationMs > 0 {
 		time.AfterFunc(time.Duration(fx.DurationMs)*time.Millisecond, func() {
-			_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+			c.Send(protocol.PktOp(protocol.PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 			abFxMu.Lock()
 			if abFx[c.Instance][effectID] {
 				delete(abFx[c.Instance], effectID)
 				abFxMu.Unlock()
-				worldcore.Broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: c.Instance, Effect: effectID}))
+				sdeps.Broadcast(protocol.PktOp(protocol.PacketEffect, protocol.EffectRemove, protocol.EffectData{Instance: c.Instance, Effect: effectID}))
 				return
 			}
 			abFxMu.Unlock()
@@ -423,76 +486,68 @@ func abUse(c *playerConn, key string) {
 	}
 }
 
-func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+func Itoa(v int64) string { return strconv.FormatInt(v, 10) }
 
-// abApplyPoison records Venom on an instance (character.ts setPoison default
+// ApplyPoison records Venom on an instance (character.ts setPoison default
 // in handlePoisonDamage — replace, no stacking). No frames here: damage
 // surfaces as Points ticks, expiry is silent (TS clears with no final hit).
-func abApplyPoison(instance string) {
+func ApplyPoison(instance string) {
 	if instance == "" {
 		return
 	}
 	abStatus.Apply(status.Instance(instance), status.KindPoison, 0, 0, time.Now().UnixMilli())
 }
 
-// abHeroWeaponPoisonous reports whether the hero's equipped weapon carries
+// HeroWeaponPoisonous reports whether the hero's equipped weapon carries
 // the items.json `poisonous` flag (combat.ts poison-on-hit parity).
-func abHeroWeaponPoisonous(username string) bool {
-	st := m5StateFor(username)
-	if len(st.Equip) <= EquipmentWeapon {
+func HeroWeaponPoisonous(username string) bool {
+	if sdeps.HeroWeaponPoisonous == nil {
 		return false
 	}
-	key := st.Equip[EquipmentWeapon].Key
-	if key == "" {
-		return false
-	}
-	it := m6ItemInfoFor(key)
-	return it != nil && it.Poisonous
+	return sdeps.HeroWeaponPoisonous(username)
 }
 
-// abFreezeApply/Clear bridge the m10 freezing area (area.ts addPlayer/
+// FreezeApply/Clear bridge the m10 freezing area (area.ts addPlayer/
 // removePlayer -> status Freezing) into the tracker so EFFECT_RATE damage
 // flows through the Points pipeline. The visual Effect frames stay owned by
 // m10SetFreezing; the tracker entry rides a derived key so leaving the area
 // clears exactly the freezing entry (Clear is per-instance).
-func abFreezeApply(instance string) {
+func FreezeApply(instance string) {
 	if instance == "" {
 		return
 	}
-	abStatus.Apply(status.Instance(instance+abFreezeSuffix), status.KindFreezing, 0, -1, time.Now().UnixMilli())
+	abStatus.Apply(status.Instance(instance+freezeSuffix), status.KindFreezing, 0, -1, time.Now().UnixMilli())
 	abFxMu.Lock()
 	abFreezeSet[instance] = true
 	abFxMu.Unlock()
 }
 
-func abFreezeClear(instance string) {
+func FreezeClear(instance string) {
 	if instance == "" {
 		return
 	}
-	abStatus.Clear(status.Instance(instance + abFreezeSuffix))
+	abStatus.Clear(status.Instance(instance + freezeSuffix))
 	abFxMu.Lock()
 	delete(abFreezeSet, instance)
 	abFxMu.Unlock()
 }
 
-// abStatusTick drains due DoT ticks into the existing Points pipeline and
+// StatusTick drains due DoT ticks into the existing Points pipeline and
 // reaps expired ability effects into EffectRemove frames. Called from the
 // central 20Hz tick loop (additive: empty tracker = Tick only).
-func abStatusTick() {
+func StatusTick() {
 	nowMs := time.Now().UnixMilli()
 	for _, ex := range abStatus.Tick(nowMs) {
 		inst := string(ex.Instance)
 		base := inst
-		if strings.HasSuffix(inst, abFreezeSuffix) {
-			base = strings.TrimSuffix(inst, abFreezeSuffix)
+		if strings.HasSuffix(inst, freezeSuffix) {
+			base = strings.TrimSuffix(inst, freezeSuffix)
 		}
-		if c, _ := worldcore.Find[*playerConn](base); c != nil {
-			m9DamagePlayer(c, ex.Damage, nil)
-			log.Printf("abilities: dot %s kind=%d dmg=%d hp=%d", base, int(ex.Kind), ex.Damage, m9PlayerHP(c))
+		if hp, ok := sdeps.DamagePlayer(base, ex.Damage); ok {
+			log.Printf("abilities: dot %s kind=%d dmg=%d hp=%d", base, int(ex.Kind), ex.Damage, hp)
 			continue
 		}
-		if m := m9MobFor(base); m != nil {
-			m9PlayerHit(m, nil, ex.Damage)
+		if sdeps.DamageMob(base, ex.Damage) {
 			log.Printf("abilities: dot mob %s kind=%d dmg=%d", base, int(ex.Kind), ex.Damage)
 		}
 	}
@@ -504,7 +559,7 @@ func abStatusTick() {
 		for effectID := range effs {
 			if !abStatus.Has(status.Instance(inst), status.Kind(effectID)) {
 				delete(effs, effectID)
-				worldcore.Broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: inst, Effect: effectID}))
+				sdeps.Broadcast(protocol.PktOp(protocol.PacketEffect, protocol.EffectRemove, protocol.EffectData{Instance: inst, Effect: effectID}))
 			}
 		}
 		if len(effs) == 0 {
@@ -514,20 +569,20 @@ func abStatusTick() {
 	abFxMu.Unlock()
 }
 
-// abForgetPlayer drops per-conn ability state on disconnect (m13ForgetPlayer
+// ForgetPlayer drops per-conn ability state on disconnect (m13ForgetPlayer
 // precedent) including any leaked freeze-tracker keys.
-func abForgetPlayer(c *playerConn) {
-	if c == nil {
+func ForgetPlayer(instance string) {
+	if instance == "" {
 		return
 	}
-	abStatus.Clear(status.Instance(c.Instance + abFreezeSuffix))
+	abStatus.Clear(status.Instance(instance + freezeSuffix))
 	abMu.Lock()
-	delete(abMana, c.Instance)
-	delete(abTarget, c.Instance)
+	delete(abMana, instance)
+	delete(abTarget, instance)
 	abMu.Unlock()
 	abFxMu.Lock()
-	delete(abFx, c.Instance)
-	delete(abFreezeSet, c.Instance)
+	delete(abFx, instance)
+	delete(abFreezeSet, instance)
 	abFxMu.Unlock()
 }
 
@@ -535,12 +590,12 @@ func abForgetPlayer(c *playerConn) {
 // TESTMAP debug dispatcher (m9test/m11test precedent, rides [46 {abtest}]).
 // ---------------------------------------------------------------------------
 
-// abTestHandler processes TESTMAP debug ops: grant/echo for the unlock leg,
+// TestHandler processes TESTMAP debug ops: grant/echo for the unlock leg,
 // apply for deterministic DoT legs (kind poison|burning|freezing,
 // power/durationMs optional, kind defaults apply), mana to set the session
 // mana directly.
-func abTestHandler(c *playerConn, data []byte) {
-	if !testMode || c == nil {
+func TestHandler(c *Conn, data []byte) {
+	if !sdeps.Test || c == nil {
 		return
 	}
 	var d struct {
@@ -561,8 +616,11 @@ func abTestHandler(c *playerConn, data []byte) {
 		if level < 1 {
 			level = 1
 		}
-		if abGrantAbility(c, c.Username, d.Key, level) {
-			m6Notify(c, "ab:grant "+d.Key+"="+itoa(int64(abLevels[c.Username][d.Key])))
+		if GrantAbility(c, c.Username, d.Key, level) {
+			abMu.Lock()
+			lv := abLevels[c.Username][d.Key]
+			abMu.Unlock()
+			c.Notify("ab:grant " + d.Key + "=" + Itoa(int64(lv)))
 		}
 	case "apply":
 		var kind status.Kind
@@ -577,24 +635,24 @@ func abTestHandler(c *playerConn, data []byte) {
 			return
 		}
 		abStatus.Apply(status.Instance(c.Instance), kind, d.Power, d.DurationMs, time.Now().UnixMilli())
-		m6Notify(c, "ab:applied "+strings.ToLower(d.Kind))
+		c.Notify("ab:applied " + strings.ToLower(d.Kind))
 	case "mana":
 		abMu.Lock()
 		abMana[c.Instance] = d.Value
 		abMu.Unlock()
-		m6Notify(c, "ab:mana="+itoa(int64(d.Value)))
+		c.Notify("ab:mana=" + Itoa(int64(d.Value)))
 	case "echo":
 		abMu.Lock()
 		keys := make([]string, 0, len(abLevels[c.Username]))
 		for k, lv := range abLevels[c.Username] {
-			keys = append(keys, k+"="+itoa(int64(lv)))
+			keys = append(keys, k+"="+Itoa(int64(lv)))
 		}
 		sort.Strings(keys)
 		mana, ok := abMana[c.Instance]
 		abMu.Unlock()
 		if !ok {
-			mana = abMaxMana
+			mana = maxMana
 		}
-		m6Notify(c, "ab:abilities ["+strings.Join(keys, ",")+"] mana="+itoa(int64(mana)))
+		c.Notify("ab:abilities [" + strings.Join(keys, ",") + "] mana=" + Itoa(int64(mana)))
 	}
 }

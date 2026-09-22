@@ -8,11 +8,17 @@ verbatim from the experiment (`main.go`, `packets.go`).
 ```sh
 cd go-server
 go mod tidy
-go run .                 # TESTMAP showcase (default ON), ws://127.0.0.1:9001
-TESTMAP=0 go run .       # pure 9 real regions, no overlays
-CLEAN=1 go run .         # clean mode: pure terrain + one equipped adventurer
-COMBAT=1 go run .        # combat party mode: 4 bots + BossDummy
+go run ./cmd/server     # canonical runner: TESTMAP showcase (default ON), ws://127.0.0.1:9001
+go run .                 # same server via the root shim (identical boot)
+TESTMAP=0 go run ./cmd/server  # pure 9 real regions, no overlays
+CLEAN=1 go run ./cmd/server    # clean mode: pure terrain + one equipped adventurer
+COMBAT=1 go run ./cmd/server   # combat party mode: 4 bots + BossDummy
 ```
+
+The game boot lives in `internal/server` (driven by `internal/app`
+`Run`); both entries above run the exact same steps. Run from this
+directory: map/persist paths (`../packages/server/data`, `data.db`) are
+resolved relative to it.
 
 Flags also work: `--clean` / `--noclean`, `--combat`, `--testmap=false` /
 `--notestmap`. `CLEAN=0` / `COMBAT=` turn modes off (default OFF).
@@ -26,11 +32,11 @@ Flags also work: `--clean` / `--noclean`, `--combat`, `--testmap=false` /
 ## Checks
 
 ```sh
-go run . &                 # TESTMAP=1 default
+go run ./cmd/server &      # TESTMAP=1 default (or `go run .` — same boot)
 go run ./e2e/testmap       # showcase check
-COMBAT=1 go run . &        # restart server first
+COMBAT=1 go run ./cmd/server &  # restart server first
 go run ./e2e/combat        # combat check
-CLEAN=1 go run . &         # restart server first
+CLEAN=1 go run ./cmd/server &   # restart server first
 go run ./e2e/clean         # clean check
 ```
 

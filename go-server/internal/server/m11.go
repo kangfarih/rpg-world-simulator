@@ -13,7 +13,7 @@
 // inventory helpers over pstates/pstateMu, also called by m12.go/m13.go
 // directly), playerConn transport (send/connByInstance), m5 XP/item helpers,
 // m6Notify, abGrantAbility, dbConn, and the testMode gate.
-package main
+package server
 
 import (
 	gnet "rpg-world-server/internal/net"

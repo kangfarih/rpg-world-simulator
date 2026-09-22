@@ -5,7 +5,7 @@
 // routing over the entity + connection tables), RegionOf/Interested ->
 // internal/world region math. It introduces no behavior change; the world
 // Registry owns the maps and the net Hub owns the sockets.
-package main
+package server
 
 import (
 	opsnet "rpg-world-server/internal/net"

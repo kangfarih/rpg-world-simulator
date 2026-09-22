@@ -23,7 +23,7 @@
 // GameWorld seam.
 // ---------------------------------------------------------------------------
 
-package main
+package server
 
 import (
 	"encoding/json"

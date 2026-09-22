@@ -8,7 +8,7 @@
 // pets hooks) and keeps the entry points main.go/m11/m12/m13 call — with
 // UNCHANGED signatures — delegating to the controller. Packet shapes, prices,
 // roll logic and tick cadence are identical.
-package main
+package server
 
 import (
 	"encoding/json"
@@ -38,21 +38,86 @@ var (
 // controller.EconomyConn seam (*playerConn satisfies it).
 // ---------------------------------------------------------------------------
 
-func (c *playerConn) StoreOpen() string { return c.storeOpen }
+func (c *playerConn) StoreOpen() string {
+	if c == nil {
+		return ""
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.storeOpen
+}
 func (c *playerConn) SetStoreOpen(s string) {
+	if c == nil {
+		return
+	}
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
 	c.storeOpen = s
 }
-func (c *playerConn) CanAccess() bool { return c.canAccessContainer }
+func (c *playerConn) CanAccess() bool {
+	if c == nil {
+		return false
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.canAccessContainer
+}
 func (c *playerConn) SetCanAccess(b bool) {
+	if c == nil {
+		return
+	}
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
 	c.canAccessContainer = b
 }
-func (c *playerConn) TalkKey() string { return c.talkNPC }
+func (c *playerConn) TalkKey() string {
+	if c == nil {
+		return ""
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.talkNPC
+}
 func (c *playerConn) SetTalkKey(s string) {
+	if c == nil {
+		return
+	}
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
 	c.talkNPC = s
 }
-func (c *playerConn) TalkIndex() int { return c.talkIndex }
+func (c *playerConn) TalkIndex() int {
+	if c == nil {
+		return 0
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.talkIndex
+}
 func (c *playerConn) SetTalkIndex(i int) {
+	if c == nil {
+		return
+	}
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
 	c.talkIndex = i
+}
+
+// withTalk runs fn with the talk cursor held under the session lock so
+// read-modify-write cursor updates (world sign TalkWith parity) stay atomic
+// with the concurrent store-ticker reads above.
+func (c *playerConn) withTalk(fn func(npc *string, idx *int)) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	fn(&c.talkNPC, &c.talkIndex)
+}
+
+// resetTalk clears the talk cursor (sign debug path parity).
+func (c *playerConn) resetTalk() {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	c.talkNPC = ""
+	c.talkIndex = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +219,11 @@ type m6peers struct{ m12peers }
 func (m6peers) WithStoreOpen(key string) []controller.EconomyConn {
 	var out []controller.EconomyConn
 	for _, c := range worldcore.AllOf[*playerConn]() {
-		if c.storeOpen == key {
+		// StoreOpen() takes the session read lock: the 20s ticker reads
+		// off-goroutine while conn goroutines write via SetStoreOpen
+		// (controller ClearAccess/OpenStore path). Never read c.storeOpen
+		// directly here (-race under e2e/m6 load).
+		if c.StoreOpen() == key {
 			out = append(out, c)
 		}
 	}

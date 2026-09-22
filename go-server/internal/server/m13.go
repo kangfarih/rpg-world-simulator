@@ -15,15 +15,16 @@
 // Stayed (shared state the controller must not own): the m13flags SQLite
 // table DDL exec + load/save over dbConn/dbMu, and the loot-spawn helpers
 // (m5SpawnLootAt/m5SpawnLootBag) over the shared loot registry.
-package main
+package server
 
 import (
-	"fmt"
 	"log"
 	"time"
 
 	"rpg-world-server/internal/controller"
+	"rpg-world-server/internal/entity"
 	gnet "rpg-world-server/internal/net"
+	"rpg-world-server/internal/social"
 	worldcore "rpg-world-server/internal/world"
 )
 
@@ -186,7 +187,7 @@ func m13CheckBan(username string) bool {
 type m13guilds struct{}
 
 func (m13guilds) InGuild(username string) bool {
-	_, err := socGuilds.GuildOf(username)
+	_, err := social.GuildOf(username)
 	return err == nil
 }
 func (m13guilds) Invite(c controller.CommandConn, target string) {
@@ -517,33 +518,17 @@ func (m13loot) SpawnLootBag(owner string, x, y int, items []controller.Drop) {
 }
 
 // m5SpawnLootAt wraps m5SpawnLoot with an explicit tile (the /drop path
-// spawns without a killer gate — no drop-table roll, the exact key).
+// spawns without a killer gate — no drop-table roll, the exact key;
+// canonical owner: internal/entity SpawnLootAt).
 func m5SpawnLootAt(owner, key string, count, x, y int) {
-	m5SpawnLootBag(owner, x, y, []m5Drop{{Key: key, Count: count}})
+	entity.SpawnLootAt(owner, key, count, x, y)
 }
 
 // m5SpawnLootBag creates a loot entity with the given exact items (used by
-// /drop and /lootbag; TS spawns Item/LootBag entities directly).
+// /drop and /lootbag; TS spawns Item/LootBag entities directly; canonical
+// owner: internal/entity SpawnLootBag).
 func m5SpawnLootBag(owner string, cx, cy int, items []m5Drop) {
-	if len(items) == 0 {
-		return
-	}
-	lx, ly := m5NearWalkable(cx, cy)
-	lootMu.Lock()
-	lootSeq++
-	inst := fmt.Sprintf("loot-%d", lootSeq)
-	l := &m5Loot{Instance: inst, Bag: len(items) > 1, Items: items, X: lx, Y: ly, Owner: owner}
-	loots[inst] = l
-	lootMu.Unlock()
-	worldcore.SetEntityPos(inst, lx, ly)
-	var payload EntityData
-	if l.Bag {
-		payload = EntityData{Instance: inst, Type: EntityLootBag, Key: "lootbag", Name: "Loot Bag", X: lx, Y: ly}
-	} else {
-		payload = EntityData{Instance: inst, Type: EntityItem, Key: items[0].Key, Name: items[0].Key, X: lx, Y: ly, Count: intp(items[0].Count)}
-	}
-	worldcore.Broadcast(pkt(PacketSpawn, payload))
-	log.Printf("m13: loot %s spawned (%s x%d) at %d,%d owner=%s bag=%v", inst, items[0].Key, items[0].Count, lx, ly, owner, l.Bag)
+	entity.SpawnLootBag(owner, cx, cy, items)
 }
 
 // ---------------------------------------------------------------------------

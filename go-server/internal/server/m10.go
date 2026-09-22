@@ -17,7 +17,7 @@
 // wiring call the same public functions, so the debug frames are frozen).
 // ---------------------------------------------------------------------------
 
-package main
+package server
 
 import (
 	"encoding/json"

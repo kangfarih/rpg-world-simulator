@@ -1,4 +1,4 @@
-package main
+package server
 
 // M8 — minigames (coursing + teamwar, the minigames slice of the clone).
 //

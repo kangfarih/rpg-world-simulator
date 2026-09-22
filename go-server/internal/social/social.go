@@ -1,5 +1,7 @@
-// Social wiring (friends + guilds + hub) — behavior-additive root glue over
-// internal/friends, internal/guilds and internal/hub.
+// Social orchestration (friends + guilds + hub), extracted behavior-frozen
+// from the root social_wire.go adapter (task D2b item 2: social_wire.go ->
+// internal/social, the new package home for friends/guilds/hub
+// orchestration; the friends/guilds/hub packages are re-exported below).
 //
 // TS sources (all read-only recon, no invented opcodes or packet shapes):
 //   - packages/common/network/impl/friends.ts — FriendInfo {online, serverId}
@@ -49,7 +51,7 @@
 //	C->S Chat [19, [text]] carries `/guild invite <user>` (the invite path —
 //	  TS has no invite RPC, so no new packet shape is invented for it).
 //
-// Divergences from TS (documented):
+// Divergences from TS (documented, inherited from the root wire):
 //   - No economy/progression gates on create (30k gold, tutorial, guests):
 //     the stub has no tutorial state and harness accounts carry no gold, so
 //     Create checks membership + name uniqueness only (the registry-level
@@ -71,26 +73,57 @@
 //     itself is exact-match per its docs; the stub's PM path lowercases names
 //     before lookup, so registration normalizes the same way to keep
 //     Route/lookup consistent).
-package main
+//
+// Everything transport/world/state related stays with the root adapter and
+// is reached only through Conn (per-connection delivery) and Deps. Frames
+// are built with internal/protocol (the same constructors the root pkt/pktOp
+// shims wrap), so wire bytes are identical. All log strings and TESTMAP
+// debug ops are kept verbatim.
+package social
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
 	"rpg-world-server/internal/friends"
 	"rpg-world-server/internal/guilds"
 	"rpg-world-server/internal/hub"
-	gnet "rpg-world-server/internal/net"
-	worldcore "rpg-world-server/internal/world"
+	"rpg-world-server/internal/protocol"
 )
 
-// socServerID mirrors config.serverId on the wire (the stub handshake sends
-// ServerID 1; offline presence is -1 per friends.ts load/add/setStatus).
-const socServerID = 1
+// Re-exports from the orchestrated packages (the new home re-exports the
+// existing homes so callers keep one import for social state).
+type (
+	// Guild is one guild (internal/guilds parity).
+	Guild = guilds.Guild
+	// FriendInfo mirrors FriendInfo (internal/friends parity).
+	FriendInfo = friends.FriendInfo
+	// Router is the all-in-one presence router (internal/hub parity).
+	Router = hub.Router
+	// HubMessage is one relay unit (internal/hub parity).
+	HubMessage = hub.Message
+)
+
+// Re-exported friends limits (internal/friends parity).
+const (
+	// MaxUsernameLen caps friend names (friends.ts parity).
+	MaxUsernameLen = friends.MaxUsernameLen
+	// OfflineServerID marks offline presence (friends.ts parity).
+	OfflineServerID = friends.OfflineServerID
+)
+
+// Hub message kinds (internal/hub parity).
+const (
+	KindChat   = hub.KindChat
+	KindGuild  = hub.KindGuild
+	KindGlobal = hub.KindGlobal
+)
 
 // Friend opcodes (Opcodes.Friends): List0 Add1 Remove2 Status3 Sync4.
 const (
@@ -121,6 +154,52 @@ const (
 	GuildDemote     = guilds.OpDemote
 	GuildKick       = guilds.OpKick
 )
+
+// Conn is the minimal per-connection view for social delivery.
+type Conn struct {
+	Instance string
+	Username string
+	// Send delivers frames to this conn (gnet.Send parity).
+	Send func(frames ...[]any)
+	// Notify sends a client text notification (m6Notify parity).
+	Notify func(message string)
+}
+
+// Deps bundles the social seams (implemented by the root adapter; never by
+// this package).
+type Deps struct {
+	// DB is the guilds + friends table handle (nil = persistence disabled).
+	DB *sql.DB
+	// LockDB/UnlockDB guard every Exec/Query (dbMu parity; never nested
+	// inside the social mutex).
+	LockDB   func()
+	UnlockDB func()
+	// ServerID mirrors config.serverId on the wire (offline presence is -1
+	// per friends.ts load/add/setStatus).
+	ServerID int
+	// Test gates the TESTMAP debug dispatcher (testMode parity).
+	Test bool
+	// Broadcast fans frames out (worldcore.Broadcast parity; the
+	// RouteGlobal empty-router fallback).
+	Broadcast func(frame []any)
+	// PlayerConn resolves an online player to its conn view
+	// (m7PlayerByName parity). ok=false = offline.
+	PlayerConn func(name string) (*Conn, bool)
+	// PlayerNames snapshots online usernames (m7PlayerUsernames parity).
+	PlayerNames func() []string
+	// Sanitize escapes chat text (m7Sanitize parity).
+	Sanitize func(string) string
+	// IsNonBlank reports displayable text (whitespaceRe parity).
+	IsNonBlank func(string) bool
+	// FormatName formats a display name (m7FormatName parity).
+	FormatName func(string) string
+}
+
+var sdeps Deps
+
+// Configure installs the social seams (called once from the root boot,
+// before tables, logins or ticks run).
+func Configure(d Deps) { sdeps = d }
 
 var (
 	// socHub is the all-in-one Router: Register on login, Unregister on
@@ -168,47 +247,61 @@ type socGuildMember struct {
 	ServerID *int   `json:"serverId,omitempty"`
 }
 
+func socIntp(v int) *int { return &v }
+
+func lockDB() {
+	if sdeps.LockDB != nil {
+		sdeps.LockDB()
+	}
+}
+
+func unlockDB() {
+	if sdeps.UnlockDB != nil {
+		sdeps.UnlockDB()
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tables + persistence (m11EnsureTables/m13EnsureTables precedent; single
-// writer: every Exec/Query runs under dbMu, never nested inside socMu).
+// writer: every Exec/Query runs under the DB lock, never nested inside socMu).
 // ---------------------------------------------------------------------------
 
-// socEnsureTables executes guilds.SchemaSQL() plus the friends table (same
+// EnsureTables executes guilds.SchemaSQL() plus the friends table (same
 // TEXT/INT column style). Called at boot and on login like m11EnsureTables.
-func socEnsureTables() {
-	if dbConn == nil {
+func EnsureTables() {
+	if sdeps.DB == nil {
 		return
 	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
+	lockDB()
+	defer unlockDB()
 	for _, ddl := range strings.Split(guilds.SchemaSQL(), "\n") {
 		if strings.TrimSpace(ddl) == "" {
 			continue
 		}
-		if _, err := dbConn.Exec(ddl); err != nil {
+		if _, err := sdeps.DB.Exec(ddl); err != nil {
 			log.Printf("social: ddl: %v", err)
 		}
 	}
-	if _, err := dbConn.Exec(
+	if _, err := sdeps.DB.Exec(
 		`CREATE TABLE IF NOT EXISTS friends(player TEXT, friend TEXT, PRIMARY KEY(player, friend))`); err != nil {
 		log.Printf("social: ddl friends: %v", err)
 	}
 }
 
-// socLoadGuilds rebuilds the registry from the guild tables (boot only, while
+// LoadGuilds rebuilds the registry from the guild tables (boot only, while
 // single-threaded). Members rejoin via Invite+AcceptInvite+SetRank so the
 // one-guild rule and ranks restore exactly.
-func socLoadGuilds() {
-	if dbConn == nil {
+func LoadGuilds() {
+	if sdeps.DB == nil {
 		return
 	}
 	type grow struct {
 		id, name, owner string
 		xp              int
 	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	rows, err := dbConn.Query(`SELECT id,name,owner FROM guilds`)
+	lockDB()
+	defer unlockDB()
+	rows, err := sdeps.DB.Query(`SELECT id,name,owner FROM guilds`)
 	if err != nil {
 		return
 	}
@@ -223,7 +316,7 @@ func socLoadGuilds() {
 	// xp column predates some DBs; tolerate its absence (zero value).
 	for i := range gs {
 		var xp int
-		if err := dbConn.QueryRow(`SELECT xp FROM guilds WHERE id=?`, gs[i].id).Scan(&xp); err == nil {
+		if err := sdeps.DB.QueryRow(`SELECT xp FROM guilds WHERE id=?`, gs[i].id).Scan(&xp); err == nil {
 			gs[i].xp = xp
 		}
 	}
@@ -234,7 +327,7 @@ func socLoadGuilds() {
 		}
 		socGuildIDs[created.ID] = true
 		socDeco[created.ID] = socDefaultDeco()
-		mrows, merr := dbConn.Query(`SELECT player,rank FROM guild_members WHERE guild=?`, created.ID)
+		mrows, merr := sdeps.DB.Query(`SELECT player,rank FROM guild_members WHERE guild=?`, created.ID)
 		if merr != nil {
 			continue
 		}
@@ -276,64 +369,64 @@ func socLoadGuilds() {
 	}
 }
 
-// socSaveGuildRows persists one guild snapshot (caller holds no locks).
-func socSaveGuildRows(g *guilds.Guild) {
-	if dbConn == nil || g == nil {
+// saveGuildRows persists one guild snapshot (caller holds no locks).
+func saveGuildRows(g *guilds.Guild) {
+	if sdeps.DB == nil || g == nil {
 		return
 	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	if _, err := dbConn.Exec(`INSERT INTO guilds(id,name,owner,xp) VALUES(?,?,?,?) `+
+	lockDB()
+	defer unlockDB()
+	if _, err := sdeps.DB.Exec(`INSERT INTO guilds(id,name,owner,xp) VALUES(?,?,?,?) `+
 		`ON CONFLICT(id) DO UPDATE SET name=?,owner=?,xp=?`,
 		g.ID, g.Name, g.Owner, g.XP, g.Name, g.Owner, g.XP); err != nil {
 		log.Printf("social: save guild %s: %v", g.ID, err)
 		return
 	}
-	if _, err := dbConn.Exec(`DELETE FROM guild_members WHERE guild=?`, g.ID); err != nil {
+	if _, err := sdeps.DB.Exec(`DELETE FROM guild_members WHERE guild=?`, g.ID); err != nil {
 		return
 	}
 	for user, rank := range g.Members {
-		if _, err := dbConn.Exec(`INSERT INTO guild_members(guild,player,rank) VALUES(?,?,?)`,
+		if _, err := sdeps.DB.Exec(`INSERT INTO guild_members(guild,player,rank) VALUES(?,?,?)`,
 			g.ID, user, int(rank)); err != nil {
 			log.Printf("social: save member %s/%s: %v", g.ID, user, err)
 		}
 	}
 }
 
-// socDropGuildRows deletes one guild's rows (disband path).
-func socDropGuildRows(id string) {
-	if dbConn == nil || id == "" {
+// dropGuildRows deletes one guild's rows (disband path).
+func dropGuildRows(id string) {
+	if sdeps.DB == nil || id == "" {
 		return
 	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	if _, err := dbConn.Exec(`DELETE FROM guild_members WHERE guild=?`, id); err != nil {
+	lockDB()
+	defer unlockDB()
+	if _, err := sdeps.DB.Exec(`DELETE FROM guild_members WHERE guild=?`, id); err != nil {
 		log.Printf("social: drop members %s: %v", id, err)
 	}
-	if _, err := dbConn.Exec(`DELETE FROM guilds WHERE id=?`, id); err != nil {
+	if _, err := sdeps.DB.Exec(`DELETE FROM guilds WHERE id=?`, id); err != nil {
 		log.Printf("social: drop guild %s: %v", id, err)
 	}
 }
 
-// socPersistGuildID saves or drops the guild by identifier depending on
+// persistGuildID saves or drops the guild by identifier depending on
 // whether it still exists (leave/disband/kick paths).
-func socPersistGuildID(id string) {
+func persistGuildID(id string) {
 	if id == "" {
 		return
 	}
 	if g, err := socGuilds.Get(id); err == nil {
-		socSaveGuildRows(g)
+		saveGuildRows(g)
 		return
 	}
 	socMu.Lock()
 	delete(socGuildIDs, id)
 	delete(socDeco, id)
 	socMu.Unlock()
-	socDropGuildRows(id)
+	dropGuildRows(id)
 }
 
-// socFriendsFor returns the in-memory list for username, creating it empty.
-func socFriendsFor(username string) *friends.List {
+// friendsFor returns the in-memory list for username, creating it empty.
+func friendsFor(username string) *friends.List {
 	socMu.Lock()
 	defer socMu.Unlock()
 	if l := socFriends[username]; l != nil {
@@ -344,17 +437,46 @@ func socFriendsFor(username string) *friends.List {
 	return l
 }
 
-// socLoadFriends restores username's rows into memory and resolves presence
-// against the online map (friends.ts load() parity). Called on login.
-func socLoadFriends(username string) {
-	l := socFriendsFor(username)
-	if dbConn == nil || username == "" {
+// playerOnline reports whether name is online (PlayerConn parity).
+func playerOnline(name string) bool {
+	if sdeps.PlayerConn == nil {
+		return false
+	}
+	_, ok := sdeps.PlayerConn(name)
+	return ok
+}
+
+// playerSend unicasts a frame to an online player (nil-safe).
+func playerSend(name string, frame []any) {
+	if sdeps.PlayerConn == nil {
 		return
 	}
-	dbMu.Lock()
-	rows, err := dbConn.Query(`SELECT friend FROM friends WHERE player=?`, username)
+	if t, ok := sdeps.PlayerConn(name); ok && t != nil {
+		t.Send(frame)
+	}
+}
+
+// playerNotify notifies an online player (nil-safe).
+func playerNotify(name, message string) {
+	if sdeps.PlayerConn == nil {
+		return
+	}
+	if t, ok := sdeps.PlayerConn(name); ok && t != nil {
+		t.Notify(message)
+	}
+}
+
+// LoadFriends restores username's rows into memory and resolves presence
+// against the online map (friends.ts load() parity). Called on login.
+func loadFriends(username string) {
+	l := friendsFor(username)
+	if sdeps.DB == nil || username == "" {
+		return
+	}
+	lockDB()
+	rows, err := sdeps.DB.Query(`SELECT friend FROM friends WHERE player=?`, username)
 	if err != nil {
-		dbMu.Unlock()
+		unlockDB()
 		return
 	}
 	var names []string
@@ -365,10 +487,10 @@ func socLoadFriends(username string) {
 		}
 	}
 	rows.Close()
-	dbMu.Unlock()
+	unlockDB()
 	presence := map[string]bool{}
 	for _, n := range names {
-		presence[n] = m7PlayerByName(n) != nil
+		presence[n] = playerOnline(n)
 	}
 	socMu.Lock()
 	defer socMu.Unlock()
@@ -376,16 +498,16 @@ func socLoadFriends(username string) {
 	for n, online := range presence {
 		sid := friends.OfflineServerID
 		if online {
-			sid = socServerID
+			sid = sdeps.ServerID
 		}
 		l.SetStatus(n, online, sid)
 	}
 }
 
-// socPersistFriends flushes username's list (load-on-login/flush-on-change/
+// persistFriends flushes username's list (load-on-login/flush-on-change/
 // disconnect; caller holds no locks).
-func socPersistFriends(username string) {
-	if dbConn == nil || username == "" {
+func persistFriends(username string) {
+	if sdeps.DB == nil || username == "" {
 		return
 	}
 	socMu.Lock()
@@ -395,41 +517,59 @@ func socPersistFriends(username string) {
 		members = l.Members()
 	}
 	socMu.Unlock()
-	dbMu.Lock()
-	defer dbMu.Unlock()
-	if _, err := dbConn.Exec(`DELETE FROM friends WHERE player=?`, username); err != nil {
+	lockDB()
+	defer unlockDB()
+	if _, err := sdeps.DB.Exec(`DELETE FROM friends WHERE player=?`, username); err != nil {
 		return
 	}
 	for _, f := range members {
-		if _, err := dbConn.Exec(`INSERT INTO friends(player,friend) VALUES(?,?)`, username, f); err != nil {
+		if _, err := sdeps.DB.Exec(`INSERT INTO friends(player,friend) VALUES(?,?)`, username, f); err != nil {
 			log.Printf("social: save friend %s/%s: %v", username, f, err)
 		}
 	}
 }
 
-// socPlayerExists mirrors the TS database.exists gate: an online conn or a
+// PlayerExists mirrors the TS database.exists gate: an online conn or a
 // persisted players row (instance or name column; m5 keys rows by username).
-func socPlayerExists(username string) bool {
-	if m7PlayerByName(username) != nil {
+func PlayerExists(username string) bool {
+	if playerOnline(username) {
 		return true
 	}
-	if dbConn == nil || username == "" {
+	if sdeps.DB == nil || username == "" {
 		return false
 	}
-	dbMu.Lock()
-	defer dbMu.Unlock()
+	lockDB()
+	defer unlockDB()
 	var one int
-	if err := dbConn.QueryRow(`SELECT 1 FROM players WHERE instance=? OR name=?`, username, username).Scan(&one); err != nil {
+	if err := sdeps.DB.QueryRow(`SELECT 1 FROM players WHERE instance=? OR name=?`, username, username).Scan(&one); err != nil {
 		return false
 	}
 	return true
+}
+
+// GuildOf reports the caller's guild (registry parity, for the /guild
+// command gate in the root adapter).
+func GuildOf(username string) (*guilds.Guild, error) { return socGuilds.GuildOf(username) }
+
+// GuildByID fetches a guild snapshot by identifier (ops surface parity).
+func GuildByID(id string) (*guilds.Guild, error) { return socGuilds.Get(id) }
+
+// GuildIDs snapshots live guild identifiers (ops surface parity).
+func GuildIDs() []string {
+	socMu.Lock()
+	defer socMu.Unlock()
+	ids := make([]string, 0, len(socGuildIDs))
+	for id := range socGuildIDs {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // ---------------------------------------------------------------------------
 // S->C frame builders (TS handler.ts / guilds.ts emit parity).
 // ---------------------------------------------------------------------------
 
-func socFriendsListFrame(l *friends.List) []any {
+func friendsListFrame(l *friends.List) []any {
 	socMu.Lock()
 	members := l.Members()
 	info := make(map[string]socFriendInfo, len(members))
@@ -441,30 +581,30 @@ func socFriendsListFrame(l *friends.List) []any {
 	if info == nil {
 		info = map[string]socFriendInfo{}
 	}
-	return pktOp(PacketFriends, FriendList, map[string]any{"list": info})
+	return protocol.PktOp(protocol.PacketFriends, FriendList, map[string]any{"list": info})
 }
 
-func socSendFriendsAdd(c *playerConn, username string, online bool, serverID int) {
-	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendAdd, map[string]any{
+func sendFriendsAdd(c *Conn, username string, online bool, serverID int) {
+	c.Send(protocol.PktOp(protocol.PacketFriends, FriendAdd, map[string]any{
 		"username": username, "status": online, "serverId": serverID,
 	}))
 }
 
-func socSendFriendsRemove(c *playerConn, username string) {
-	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendRemove, map[string]any{
+func sendFriendsRemove(c *Conn, username string) {
+	c.Send(protocol.PktOp(protocol.PacketFriends, FriendRemove, map[string]any{
 		"username": username,
 	}))
 }
 
-func socSendFriendsStatus(c *playerConn, username string, online bool, serverID int) {
-	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendStatus, map[string]any{
+func sendFriendsStatus(c *Conn, username string, online bool, serverID int) {
+	c.Send(protocol.PktOp(protocol.PacketFriends, FriendStatus, map[string]any{
 		"username": username, "status": online, "serverId": serverID,
 	}))
 }
 
-// socGuildLoginFrame builds the connect/Login frame (guilds.ts create/connect
+// guildLoginFrame builds the connect/Login frame (guilds.ts create/connect
 // parity: {name, owner, members, decoration}).
-func socGuildLoginFrame(g *guilds.Guild) []any {
+func guildLoginFrame(g *guilds.Guild) []any {
 	names := make([]string, 0, len(g.Members))
 	for u := range g.Members {
 		names = append(names, u)
@@ -481,23 +621,23 @@ func socGuildLoginFrame(g *guilds.Guild) []any {
 	if !ok {
 		deco = socDefaultDeco()
 	}
-	return pktOp(PacketGuild, GuildLogin, map[string]any{
+	return protocol.PktOp(protocol.PacketGuild, GuildLogin, map[string]any{
 		"name": g.Name, "owner": g.Owner, "members": members, "decoration": deco,
 	})
 }
 
-func socSendGuildError(c *playerConn, message string) {
-	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildError, map[string]any{"message": message}))
+func sendGuildError(c *Conn, message string) {
+	c.Send(protocol.PktOp(protocol.PacketGuild, GuildError, map[string]any{"message": message}))
 }
 
-// socOnlineGuildmates snapshots the online members of g excluding skip.
-func socOnlineGuildmates(g *guilds.Guild, skip string) []string {
+// onlineGuildmates snapshots the online members of g excluding skip.
+func onlineGuildmates(g *guilds.Guild, skip string) []string {
 	var out []string
 	for u := range g.Members {
 		if u == skip {
 			continue
 		}
-		if m7PlayerByName(u) != nil {
+		if playerOnline(u) {
 			out = append(out, u)
 		}
 	}
@@ -505,16 +645,16 @@ func socOnlineGuildmates(g *guilds.Guild, skip string) []string {
 	return out
 }
 
-// socDeliverGuildChat fans a Chat frame out to the Router-resolved online
+// deliverGuildChat fans a Chat frame out to the Router-resolved online
 // subset (all-in-one: Route filters the candidate roster; offline members are
 // skipped — no hub socket exists to relay further, and a global broadcast
 // fallback would leak guild chat to non-members).
-func socDeliverGuildChat(from, message string, members []string) {
+func deliverGuildChat(from, message string, members []string) {
 	recips, _ := socHub.Route(hub.Message{From: from, Kind: hub.KindGuild, Payload: members})
 	for _, name := range recips {
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildChat, map[string]any{
-				"username": from, "serverId": socServerID, "message": message,
+		if t, ok := sdeps.PlayerConn(name); ok && t != nil {
+			t.Send(protocol.PktOp(protocol.PacketGuild, GuildChat, map[string]any{
+				"username": from, "serverId": sdeps.ServerID, "message": message,
 			}))
 		}
 	}
@@ -524,9 +664,9 @@ func socDeliverGuildChat(from, message string, members []string) {
 // C->S dispatch.
 // ---------------------------------------------------------------------------
 
-// socHandleFriends routes C->S Friends frames [48,{opcode,username}]
+// HandleFriends routes C->S Friends frames [48,{opcode,username}]
 // (incoming.ts handleFriends parity: Add/Remove only, the rest ignored).
-func socHandleFriends(c *playerConn, data []byte) {
+func HandleFriends(c *Conn, data []byte) {
 	if c == nil {
 		return
 	}
@@ -539,75 +679,75 @@ func socHandleFriends(c *playerConn, data []byte) {
 	}
 	switch *d.Opcode {
 	case FriendAdd:
-		socFriendAdd(c, d.Username)
+		friendAdd(c, d.Username)
 	case FriendRemove:
-		socFriendRemove(c, d.Username)
+		friendRemove(c, d.Username)
 	}
 }
 
-// socFriendAdd ports friends.ts add() with the misc:FRIENDS_* notify mapping
+// friendAdd ports friends.ts add() with the misc:FRIENDS_* notify mapping
 // (caller-owned per the friends package docs).
-func socFriendAdd(c *playerConn, username string) {
+func friendAdd(c *Conn, username string) {
 	key := strings.ToLower(strings.TrimSpace(username))
 	if len(key) > friends.MaxUsernameLen {
-		m6Notify(c, "misc:FRIENDS_USERNAME_TOO_LONG")
+		c.Notify("misc:FRIENDS_USERNAME_TOO_LONG")
 		return
 	}
 	if key == strings.ToLower(c.Username) {
-		m6Notify(c, "misc:FRIENDS_ADD_SELF")
+		c.Notify("misc:FRIENDS_ADD_SELF")
 		return
 	}
-	l := socFriendsFor(c.Username)
+	l := friendsFor(c.Username)
 	socMu.Lock()
 	dup := l.IsFriend(key)
 	socMu.Unlock()
 	if dup {
-		m6Notify(c, "misc:FRIENDS_ALREADY_ADDED")
+		c.Notify("misc:FRIENDS_ALREADY_ADDED")
 		return
 	}
-	if !socPlayerExists(key) && !socPlayerExists(username) {
-		m6Notify(c, "misc:FRIENDS_USER_DOES_NOT_EXIST")
+	if !PlayerExists(key) && !PlayerExists(username) {
+		c.Notify("misc:FRIENDS_USER_DOES_NOT_EXIST")
 		return
 	}
 	socMu.Lock()
 	added := l.Add(key)
 	socMu.Unlock()
 	if !added {
-		m6Notify(c, "misc:FRIENDS_USER_DOES_NOT_EXIST")
+		c.Notify("misc:FRIENDS_USER_DOES_NOT_EXIST")
 		return
 	}
-	online := m7PlayerByName(key) != nil
+	online := playerOnline(key)
 	sid := friends.OfflineServerID
 	if online {
-		sid = socServerID
+		sid = sdeps.ServerID
 	}
 	socMu.Lock()
 	l.SetStatus(key, online, sid)
 	socMu.Unlock()
-	socPersistFriends(c.Username)
-	socSendFriendsAdd(c, key, online, sid)
+	persistFriends(c.Username)
+	sendFriendsAdd(c, key, online, sid)
 	log.Printf("social: %s added friend %s online=%v", c.Username, key, online)
 }
 
-// socFriendRemove ports friends.ts remove().
-func socFriendRemove(c *playerConn, username string) {
+// friendRemove ports friends.ts remove().
+func friendRemove(c *Conn, username string) {
 	key := strings.ToLower(strings.TrimSpace(username))
-	l := socFriendsFor(c.Username)
+	l := friendsFor(c.Username)
 	socMu.Lock()
 	removed := l.Remove(key)
 	socMu.Unlock()
 	if !removed {
-		m6Notify(c, "misc:FRIENDS_NOT_IN_LIST")
+		c.Notify("misc:FRIENDS_NOT_IN_LIST")
 		return
 	}
-	socPersistFriends(c.Username)
-	socSendFriendsRemove(c, key)
+	persistFriends(c.Username)
+	sendFriendsRemove(c, key)
 	log.Printf("social: %s removed friend %s", c.Username, key)
 }
 
-// socHandleGuild routes C->S Guild frames [35,{opcode,...}]
+// HandleGuild routes C->S Guild frames [35,{opcode,...}]
 // (incoming.ts handleGuild parity).
-func socHandleGuild(c *playerConn, data []byte) {
+func HandleGuild(c *Conn, data []byte) {
 	if c == nil {
 		return
 	}
@@ -629,11 +769,11 @@ func socHandleGuild(c *playerConn, data []byte) {
 	}
 	switch *d.Opcode {
 	case GuildCreate:
-		socGuildCreate(c, d.Name, d.Colour, d.Outline, d.OutlineColour, d.Crest)
+		CreateGuild(c, d.Name, d.Colour, d.Outline, d.OutlineColour, d.Crest)
 	case GuildJoin:
-		socGuildJoin(c, d.Identifier)
+		JoinGuild(c, d.Identifier)
 	case GuildLeave:
-		socGuildLeave(c)
+		LeaveGuild(c)
 	case GuildList:
 		from, to := 0, 50
 		if d.From != nil {
@@ -642,31 +782,31 @@ func socHandleGuild(c *playerConn, data []byte) {
 		if d.To != nil {
 			to = *d.To
 		}
-		socGuildList(c, from, to)
+		guildList(c, from, to)
 	case GuildChat:
-		socGuildChat(c, d.Message)
+		ChatGuild(c, d.Message)
 	case GuildPromote:
-		socGuildSetRankDelta(c, d.Username, +1)
+		guildSetRankDelta(c, d.Username, +1)
 	case GuildDemote:
-		socGuildSetRankDelta(c, d.Username, -1)
+		guildSetRankDelta(c, d.Username, -1)
 	case GuildKick:
-		socGuildKick(c, d.Username, false)
+		KickGuild(c, d.Username, false)
 	}
 }
 
-// socGuildCreate ports guilds.ts create() minus the economy/progression gates
+// guildCreate ports guilds.ts create() minus the economy/progression gates
 // (documented divergence): membership + name-uniqueness checks only.
-func socGuildCreate(c *playerConn, name, colour string, outline *int, outlineColour, crest string) {
+func CreateGuild(c *Conn, name, colour string, outline *int, outlineColour, crest string) {
 	if _, err := socGuilds.GuildOf(c.Username); err == nil {
-		m6Notify(c, "guilds:ALREADY_IN_GUILD")
+		c.Notify("guilds:ALREADY_IN_GUILD")
 		return
 	}
 	g, err := socGuilds.Create(c.Username, name)
 	if err != nil {
 		if err == guilds.ErrAlreadyInGuild {
-			m6Notify(c, "guilds:ALREADY_IN_GUILD")
+			c.Notify("guilds:ALREADY_IN_GUILD")
 		} else if err == guilds.ErrExists {
-			socSendGuildError(c, "A guild with that name already exists.")
+			sendGuildError(c, "A guild with that name already exists.")
 		}
 		return
 	}
@@ -687,30 +827,30 @@ func socGuildCreate(c *playerConn, name, colour string, outline *int, outlineCol
 	}
 	socDeco[g.ID] = deco
 	socMu.Unlock()
-	socSaveGuildRows(g)
-	_ = gnet.Send(c.Conn, socGuildLoginFrame(g))
+	saveGuildRows(g)
+	c.Send(guildLoginFrame(g))
 	log.Printf("social: %s created guild %s (%s)", c.Username, g.Name, g.ID)
 }
 
-// socGuildJoin ports the join flow over a pending invite (invite-only
+// guildJoin ports the join flow over a pending invite (invite-only
 // divergence): AcceptInvite, then connect parity (Login + Update of online
 // members to the joiner) plus a Join sync to the other online members.
-func socGuildJoin(c *playerConn, identifier string) {
+func JoinGuild(c *Conn, identifier string) {
 	if _, err := socGuilds.GuildOf(c.Username); err == nil {
-		m6Notify(c, "guilds:ALREADY_IN_GUILD")
+		c.Notify("guilds:ALREADY_IN_GUILD")
 		return
 	}
 	id := strings.ToLower(identifier)
 	if err := socGuilds.AcceptInvite(c.Username, id); err != nil {
 		switch err {
 		case guilds.ErrAlreadyInGuild:
-			m6Notify(c, "guilds:ALREADY_IN_GUILD")
+			c.Notify("guilds:ALREADY_IN_GUILD")
 		case guilds.ErrFull:
-			m6Notify(c, "guilds:GUILD_FULL")
+			c.Notify("guilds:GUILD_FULL")
 		case guilds.ErrNotFound:
-			socGuildList(c, 0, 10) // TS join-miss resends the guild list
+			guildList(c, 0, 10) // TS join-miss resends the guild list
 		default: // ErrNoInvite / ErrInvalid
-			m6Notify(c, "guilds:NO_INVITE")
+			c.Notify("guilds:NO_INVITE")
 		}
 		return
 	}
@@ -718,43 +858,44 @@ func socGuildJoin(c *playerConn, identifier string) {
 	if err != nil {
 		return
 	}
-	socPersistGuildID(g.ID)
-	_ = gnet.Send(c.Conn, socGuildLoginFrame(g))
-	socSendGuildUpdateOnline(c)
-	for _, name := range socOnlineGuildmates(g, c.Username) {
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildJoin, map[string]any{
-				"username": c.Username, "serverId": socServerID,
-			}))
-		}
+	persistGuildID(g.ID)
+	c.Send(guildLoginFrame(g))
+	sendGuildUpdateOnline(c)
+	for _, name := range onlineGuildmates(g, c.Username) {
+		playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildJoin, map[string]any{
+			"username": c.Username, "serverId": sdeps.ServerID,
+		}))
 	}
 	log.Printf("social: %s joined guild %s", c.Username, g.ID)
 }
 
-// socSendGuildUpdateOnline sends the joiner the online roster
+// sendGuildUpdateOnline sends the joiner the online roster
 // (guilds.ts updateStatus parity: Update {members:[{username, serverId}]}).
-func socSendGuildUpdateOnline(c *playerConn) {
+func sendGuildUpdateOnline(c *Conn) {
 	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
 	var online []socGuildMember
 	for u := range g.Members {
-		if m7PlayerByName(u) == nil {
+		if !playerOnline(u) {
 			continue
 		}
-		sid := socServerID
+		sid := sdeps.ServerID
 		online = append(online, socGuildMember{Username: u, ServerID: &sid})
 	}
 	sort.Slice(online, func(a, b int) bool { return online[a].Username < online[b].Username })
 	if online == nil {
 		online = []socGuildMember{}
 	}
-	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{"members": online}))
+	c.Send(protocol.PktOp(protocol.PacketGuild, GuildUpdate, map[string]any{"members": online}))
 }
 
-// socGuildLeave ports guilds.ts leave() (owner leaving disbands).
-func socGuildLeave(c *playerConn) {
+// GuildLeave ports guilds.ts leave() (owner leaving disbands).
+func LeaveGuild(c *Conn) {
+	if c == nil {
+		return
+	}
 	before, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
@@ -767,25 +908,23 @@ func socGuildLeave(c *playerConn) {
 	if err := socGuilds.Leave(c.Username); err != nil {
 		return
 	}
-	socPersistGuildID(before.ID)
-	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildLeave, nil))
+	persistGuildID(before.ID)
+	c.Send(protocol.PktOp(protocol.PacketGuild, GuildLeave, nil))
 	for _, name := range members {
 		if name == c.Username {
 			continue
 		}
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, map[string]any{
-				"username": c.Username,
-			}))
-		}
+		playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildLeave, map[string]any{
+			"username": c.Username,
+		}))
 	}
 	log.Printf("social: %s left guild %s disband=%v", c.Username, before.ID, ownerLeaving)
 }
 
-// socGuildList ports guilds.ts get() from the persisted rows (the registry
+// guildList ports guilds.ts get() from the persisted rows (the registry
 // has no enumerate API; the DB is the list source like the TS loader).
-func socGuildList(c *playerConn, from, to int) {
-	if dbConn == nil {
+func guildList(c *Conn, from, to int) {
+	if sdeps.DB == nil {
 		return
 	}
 	if from < 0 {
@@ -794,14 +933,10 @@ func socGuildList(c *playerConn, from, to int) {
 	if to <= from {
 		to = from + 50
 	}
-	type entry struct {
-		name string
-		n    int
-	}
-	dbMu.Lock()
-	rows, err := dbConn.Query(`SELECT id,name,owner FROM guilds`)
+	lockDB()
+	rows, err := sdeps.DB.Query(`SELECT id,name,owner FROM guilds`)
 	if err != nil {
-		dbMu.Unlock()
+		unlockDB()
 		return
 	}
 	var ids []string
@@ -819,7 +954,7 @@ func socGuildList(c *playerConn, from, to int) {
 	total := 0
 	for _, id := range ids {
 		var n int
-		if err := dbConn.QueryRow(`SELECT COUNT(*) FROM guild_members WHERE guild=?`, id).Scan(&n); err != nil {
+		if err := sdeps.DB.QueryRow(`SELECT COUNT(*) FROM guild_members WHERE guild=?`, id).Scan(&n); err != nil {
 			continue
 		}
 		if n >= guilds.MaxMembers {
@@ -827,15 +962,15 @@ func socGuildList(c *playerConn, from, to int) {
 		}
 		total++
 	}
-	dbMu.Unlock()
+	unlockDB()
 	for i, id := range ids {
 		if i < from || i >= to {
 			continue
 		}
 		var n int
-		dbMu.Lock()
-		_ = dbConn.QueryRow(`SELECT COUNT(*) FROM guild_members WHERE guild=?`, id).Scan(&n)
-		dbMu.Unlock()
+		lockDB()
+		_ = sdeps.DB.QueryRow(`SELECT COUNT(*) FROM guild_members WHERE guild=?`, id).Scan(&n)
+		unlockDB()
 		if n >= guilds.MaxMembers {
 			continue
 		}
@@ -852,19 +987,19 @@ func socGuildList(c *playerConn, from, to int) {
 	if list == nil {
 		list = []map[string]any{}
 	}
-	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildList, map[string]any{
+	c.Send(protocol.PktOp(protocol.PacketGuild, GuildList, map[string]any{
 		"guilds": list, "total": total,
 	}))
 }
 
-// socGuildChat ports guilds.ts chat() through the Router fanout.
-func socGuildChat(c *playerConn, message string) {
+// guildChat ports guilds.ts chat() through the Router fanout.
+func ChatGuild(c *Conn, message string) {
 	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
-	text := m7Sanitize(message)
-	if !whitespaceRe.MatchString(text) {
+	text := sdeps.Sanitize(message)
+	if !sdeps.IsNonBlank(text) {
 		return
 	}
 	members := make([]string, 0, len(g.Members))
@@ -872,12 +1007,12 @@ func socGuildChat(c *playerConn, message string) {
 		members = append(members, u)
 	}
 	sort.Strings(members)
-	socDeliverGuildChat(c.Username, text, members)
+	deliverGuildChat(c.Username, text, members)
 	log.Printf("social: guild %s chat from %s", g.ID, c.Username)
 }
 
-// socGuildSetRankDelta ports promote/demote via SetRank(rank +/- 1).
-func socGuildSetRankDelta(c *playerConn, username string, delta int) {
+// guildSetRankDelta ports promote/demote via SetRank(rank +/- 1).
+func guildSetRankDelta(c *Conn, username string, delta int) {
 	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
@@ -888,204 +1023,209 @@ func socGuildSetRankDelta(c *playerConn, username string, delta int) {
 	}
 	if err := socGuilds.SetRank(c.Username, username, cur+guilds.Rank(delta)); err != nil {
 		if err == guilds.ErrNoPermission {
-			m6Notify(c, "guilds:NO_PERMISSION_RANK")
+			c.Notify("guilds:NO_PERMISSION_RANK")
 		}
 		return
 	}
-	socPersistGuildID(g.ID)
+	persistGuildID(g.ID)
 	rank := int(cur + guilds.Rank(delta))
-	for _, name := range socOnlineGuildmates(g, "") {
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildRank, map[string]any{
-				"username": username, "rank": rank,
-			}))
-		}
+	for _, name := range onlineGuildmates(g, "") {
+		playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildRank, map[string]any{
+			"username": username, "rank": rank,
+		}))
 	}
 	log.Printf("social: %s set %s rank to %d in %s", c.Username, username, rank, g.ID)
 }
 
-// socGuildKick ports guilds.ts kick(). Packet path is silent like TS
+// guildKick ports guilds.ts kick(). Packet path is silent like TS
 // incoming (the /guild command path notifies separately).
-func socGuildKick(c *playerConn, username string, viaCommand bool) {
+func KickGuild(c *Conn, username string, viaCommand bool) {
+	if c == nil {
+		if viaCommand {
+			return
+		}
+		return
+	}
 	before, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		if viaCommand {
-			m6Notify(c, "You are not in a guild.")
+			c.Notify("You are not in a guild.")
 		}
 		return
 	}
 	if err := socGuilds.Kick(c.Username, username); err != nil {
 		if viaCommand {
 			if err == guilds.ErrNoPermission {
-				m6Notify(c, "guilds:NO_PERMISSION")
+				c.Notify("guilds:NO_PERMISSION")
 			} else {
-				m6Notify(c, "guilds:NO_PERMISSION")
+				c.Notify("guilds:NO_PERMISSION")
 			}
 		}
 		return
 	}
-	socPersistGuildID(before.ID)
-	if t := m7PlayerByName(username); t != nil {
-		_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, nil))
+	persistGuildID(before.ID)
+	if t, ok := sdeps.PlayerConn(username); ok && t != nil {
+		t.Send(protocol.PktOp(protocol.PacketGuild, GuildLeave, nil))
 	}
-	for _, name := range socOnlineGuildmates(before, username) {
+	for _, name := range onlineGuildmates(before, username) {
 		if name == c.Username {
 			continue
 		}
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, map[string]any{
-				"username": username,
-			}))
-		}
+		playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildLeave, map[string]any{
+			"username": username,
+		}))
 	}
 	if viaCommand {
-		m6Notify(c, "You have kicked "+username+" from your guild.")
+		c.Notify("You have kicked " + username + " from your guild.")
 	}
 	log.Printf("social: %s kicked %s from %s", c.Username, username, before.ID)
 }
 
-// socBroadcastGuildRank fans a Rank frame to every online member of g.
-func socBroadcastGuildRank(g *guilds.Guild, username string, rank int) {
-	for _, name := range socOnlineGuildmates(g, "") {
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildRank, map[string]any{
-				"username": username, "rank": rank,
-			}))
-		}
+// broadcastGuildRank fans a Rank frame to every online member of g.
+func broadcastGuildRank(g *guilds.Guild, username string, rank int) {
+	for _, name := range onlineGuildmates(g, "") {
+		playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildRank, map[string]any{
+			"username": username, "rank": rank,
+		}))
 	}
 }
 
-// socGuildRankCommand ports the /guild rank subcommand strings
+// GuildRankCommand ports the /guild rank subcommand strings
 // (commands.ts:129-158): landlord guard, member lookup, rank set + ack.
-func socGuildRankCommand(c *playerConn, rankStr, username string) {
+func GuildRankCommand(c *Conn, rankStr, username string) {
+	if c == nil {
+		return
+	}
 	if rankStr == "7" || rankStr == "landlord" {
-		m6Notify(c, "You cannot set a rank to landlord.")
+		c.Notify("You cannot set a rank to landlord.")
 		return
 	}
 	var n int
 	if _, err := fmt.Sscanf(rankStr, "%d", &n); err != nil {
-		m6Notify(c, "Malformed command, expected /guild rank [rank 0-6] [username]")
+		c.Notify("Malformed command, expected /guild rank [rank 0-6] [username]")
 		return
 	}
 	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
-		m6Notify(c, "You are not in a guild.")
+		c.Notify("You are not in a guild.")
 		return
 	}
 	if _, ok := g.Members[username]; !ok {
-		m6Notify(c, "Could not find a member with the name: "+username+".")
+		c.Notify("Could not find a member with the name: " + username + ".")
 		return
 	}
 	if serr := socGuilds.SetRank(c.Username, username, guilds.Rank(n)); serr != nil {
 		if serr == guilds.ErrNoPermission {
-			m6Notify(c, "guilds:NO_PERMISSION_RANK")
+			c.Notify("guilds:NO_PERMISSION_RANK")
 		}
 		return
 	}
-	socPersistGuildID(g.ID)
-	socBroadcastGuildRank(g, username, n)
-	m6Notify(c, "You have set "+username+"'s rank to "+rankStr+".")
+	persistGuildID(g.ID)
+	broadcastGuildRank(g, username, n)
+	c.Notify("You have set " + username + "'s rank to " + rankStr + ".")
 }
 
-// socGuildInvite records a pending invite (owner-only gate mirrors kick's).
+// GuildInvite records a pending invite (owner-only gate mirrors kick's).
 // There is no TS invite RPC, so invites ride `/guild invite` (no new packet
 // shape) with plain-text notifies on both ends.
-func socGuildInvite(c *playerConn, target string) {
+func GuildInvite(c *Conn, target string) {
+	if c == nil {
+		return
+	}
 	name := strings.TrimSpace(target)
 	if name == "" {
-		m6Notify(c, "Malformed command, expected /guild invite [username]")
+		c.Notify("Malformed command, expected /guild invite [username]")
 		return
 	}
 	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
-		m6Notify(c, "You are not in a guild.")
+		c.Notify("You are not in a guild.")
 		return
 	}
 	if err := socGuilds.Invite(c.Username, name); err != nil {
 		switch err {
 		case guilds.ErrNoPermission:
-			m6Notify(c, "guilds:NO_PERMISSION")
+			c.Notify("guilds:NO_PERMISSION")
 		case guilds.ErrAlreadyInGuild:
-			m6Notify(c, "guilds:ALREADY_IN_GUILD")
+			c.Notify("guilds:ALREADY_IN_GUILD")
 		default:
-			m6Notify(c, "guilds:NO_PERMISSION")
+			c.Notify("guilds:NO_PERMISSION")
 		}
 		return
 	}
-	m6Notify(c, "You have invited "+name+" to your guild.")
-	if t := m7PlayerByName(name); t != nil {
-		m6Notify(t, "You have been invited to guild "+g.Name+".")
-	}
+	c.Notify("You have invited " + name + " to your guild.")
+	playerNotify(name, "You have been invited to guild "+g.Name+".")
 	log.Printf("social: %s invited %s to %s", c.Username, name, g.ID)
 }
+
+// GuildKickCommand ports the /guild kick subcommand (m13 command path).
+func GuildKickCommand(c *Conn, username string) { KickGuild(c, username, true) }
 
 // ---------------------------------------------------------------------------
 // Login / logout (world.ts syncFriendsList/syncGuildMembers parity) + hub
 // presence + disconnect cleanup for all three subsystems.
 // ---------------------------------------------------------------------------
 
-// socOnLogin registers hub presence, restores friends, and builds the login
+// OnLogin registers hub presence, restores friends, and builds the login
 // frames (Friends List + guild Login/Update when guilded). Presence fanout to
 // other conns goes out directly; the returned frames join the Welcome bulk.
-func socOnLogin(c *playerConn) [][]any {
+func OnLogin(c *Conn) [][]any {
 	if c == nil || c.Username == "" {
 		return nil
 	}
 	socHub.Register(strings.ToLower(c.Username))
-	socLoadFriends(c.Username)
-	l := socFriendsFor(c.Username)
+	loadFriends(c.Username)
+	l := friendsFor(c.Username)
 	var frames [][]any
-	frames = append(frames, socFriendsListFrame(l))
+	frames = append(frames, friendsListFrame(l))
 	if g, err := socGuilds.GuildOf(c.Username); err == nil {
-		frames = append(frames, socGuildLoginFrame(g))
-		socSendGuildUpdateOnline(c)
-		for _, name := range socOnlineGuildmates(g, c.Username) {
-			if t := m7PlayerByName(name); t != nil {
-				_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
-					"members": []socGuildMember{{Username: c.Username, ServerID: intp(socServerID)}},
-				}))
-			}
+		frames = append(frames, guildLoginFrame(g))
+		sendGuildUpdateOnline(c)
+		for _, name := range onlineGuildmates(g, c.Username) {
+			playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildUpdate, map[string]any{
+				"members": []socGuildMember{{Username: c.Username, ServerID: socIntp(sdeps.ServerID)}},
+			}))
 		}
 	}
 	// Friends online fanout: every online owner listing this user gets a
 	// Status update (world.ts syncFriendsList parity).
-	for _, name := range m7PlayerUsernames() {
+	for _, name := range sdeps.PlayerNames() {
 		if name == c.Username {
 			continue
 		}
-		o := m7PlayerByName(name)
-		if o == nil {
+		o, ok := sdeps.PlayerConn(name)
+		if !ok || o == nil {
 			continue
 		}
-		ol := socFriendsFor(name)
+		ol := friendsFor(name)
 		socMu.Lock()
 		has := ol.IsFriend(c.Username)
 		if has {
-			ol.SetStatus(c.Username, true, socServerID)
+			ol.SetStatus(c.Username, true, sdeps.ServerID)
 		}
 		socMu.Unlock()
 		if has {
-			socSendFriendsStatus(o, c.Username, true, socServerID)
+			sendFriendsStatus(o, c.Username, true, sdeps.ServerID)
 		}
 	}
 	return frames
 }
 
-// socOnDisconnect unregisters hub presence, flushes friends, and fans logout
+// OnDisconnect unregisters hub presence, flushes friends, and fans logout
 // presence out (Status offline + guild Update serverId -1). Called from
 // removeClient after the conn leaves the players map.
-func socOnDisconnect(c *playerConn) {
+func OnDisconnect(c *Conn) {
 	if c == nil || c.Username == "" {
 		return
 	}
 	socHub.Unregister(strings.ToLower(c.Username))
-	socPersistFriends(c.Username)
-	for _, name := range m7PlayerUsernames() {
-		o := m7PlayerByName(name)
-		if o == nil {
+	persistFriends(c.Username)
+	for _, name := range sdeps.PlayerNames() {
+		o, ok := sdeps.PlayerConn(name)
+		if !ok || o == nil {
 			continue
 		}
-		ol := socFriendsFor(name)
+		ol := friendsFor(name)
 		socMu.Lock()
 		has := ol.IsFriend(c.Username)
 		if has {
@@ -1093,51 +1233,47 @@ func socOnDisconnect(c *playerConn) {
 		}
 		socMu.Unlock()
 		if has {
-			socSendFriendsStatus(o, c.Username, false, friends.OfflineServerID)
+			sendFriendsStatus(o, c.Username, false, friends.OfflineServerID)
 		}
 	}
 	if g, err := socGuilds.GuildOf(c.Username); err == nil {
-		for _, name := range socOnlineGuildmates(g, c.Username) {
-			if t := m7PlayerByName(name); t != nil {
-				_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
-					"members": []socGuildMember{{Username: c.Username, ServerID: intp(friends.OfflineServerID)}},
-				}))
-			}
+		for _, name := range onlineGuildmates(g, c.Username) {
+			playerSend(name, protocol.PktOp(protocol.PacketGuild, GuildUpdate, map[string]any{
+				"members": []socGuildMember{{Username: c.Username, ServerID: socIntp(friends.OfflineServerID)}},
+			}))
 		}
 	}
 	log.Printf("social: %s disconnected (presence flushed)", c.Username)
 }
 
-// socRouteChat resolves a PM target through the Router (all-in-one: the
+// RouteChat resolves a PM target through the Router (all-in-one: the
 // single process owns every player, so ErrOffline falls back to the existing
-// local lookup + misc:NOT_ONLINE notify — behavior unchanged).
-func socRouteChat(target string) *playerConn {
-	if recips, err := socHub.Route(hub.Message{Kind: hub.KindChat, To: strings.ToLower(target)}); err == nil && len(recips) > 0 {
-		if t := m7PlayerByName(target); t != nil {
-			return t
-		}
-	}
-	return m7PlayerByName(target)
+// local lookup + misc:NOT_ONLINE notify — behavior unchanged). It reports
+// whether the hub routed; the caller always falls back to the local lookup
+// (the Route has no side effects).
+func RouteChat(target string) bool {
+	recips, err := socHub.Route(hub.Message{Kind: hub.KindChat, To: strings.ToLower(target)})
+	return err == nil && len(recips) > 0
 }
 
-// socRouteGlobal delivers a global chat line to the Router-resolved online
+// RouteGlobal delivers a global chat line to the Router-resolved online
 // set, falling back to the existing broadcast when the target set is offline
 // (empty router — same recipients either way in all-in-one mode).
-func socRouteGlobal(frame []any) {
+func RouteGlobal(frame []any) {
 	recips, _ := socHub.Route(hub.Message{Kind: hub.KindGlobal})
 	if len(recips) == 0 {
-		worldcore.Broadcast(frame)
+		sdeps.Broadcast(frame)
 		return
 	}
 	anySent := false
 	for _, name := range recips {
-		if t := m7PlayerByName(name); t != nil {
-			_ = gnet.Send(t.Conn, frame)
+		if t, ok := sdeps.PlayerConn(name); ok && t != nil {
+			t.Send(frame)
 			anySent = true
 		}
 	}
 	if !anySent {
-		worldcore.Broadcast(frame)
+		sdeps.Broadcast(frame)
 	}
 }
 
@@ -1145,10 +1281,10 @@ func socRouteGlobal(frame []any) {
 // TESTMAP debug dispatcher ([46 {socialtest:...}], abtest/pettest precedent).
 // ---------------------------------------------------------------------------
 
-// socTestHandler echoes friends/guild/hub state through m6Notify (the e2e
+// TestHandler echoes friends/guild/hub state through notifies (the e2e
 // greps these): ops "friends", "guild", "hub".
-func socTestHandler(c *playerConn, data []byte) {
-	if !testMode || c == nil {
+func TestHandler(c *Conn, data []byte) {
+	if !sdeps.Test || c == nil {
 		return
 	}
 	var d struct {
@@ -1159,7 +1295,7 @@ func socTestHandler(c *playerConn, data []byte) {
 	}
 	switch d.SocialTest {
 	case "friends":
-		l := socFriendsFor(c.Username)
+		l := friendsFor(c.Username)
 		socMu.Lock()
 		members := l.Members()
 		parts := make([]string, 0, len(members))
@@ -1170,21 +1306,24 @@ func socTestHandler(c *playerConn, data []byte) {
 		}
 		socMu.Unlock()
 		sort.Strings(parts)
-		m6Notify(c, "social:friends "+c.Username+"=["+strings.Join(parts, ",")+"]")
+		c.Notify("social:friends " + c.Username + "=[" + strings.Join(parts, ",") + "]")
 	case "guild":
 		g, err := socGuilds.GuildOf(c.Username)
 		if err != nil {
-			m6Notify(c, "social:guild "+c.Username+"=none")
+			c.Notify("social:guild " + c.Username + "=none")
 			return
 		}
 		names := make([]string, 0, len(g.Members))
 		for u, r := range g.Members {
-			names = append(names, u+"="+itoa(int64(int(r))))
+			names = append(names, u+"="+Itoa(int64(int(r))))
 		}
 		sort.Strings(names)
-		m6Notify(c, "social:guild "+g.ID+" ["+strings.Join(names, ",")+"]")
+		c.Notify("social:guild " + g.ID + " [" + strings.Join(names, ",") + "]")
 	case "hub":
 		recips, _ := socHub.Route(hub.Message{Kind: hub.KindGlobal})
-		m6Notify(c, "social:hub ["+strings.Join(recips, ",")+"]")
+		c.Notify("social:hub [" + strings.Join(recips, ",") + "]")
 	}
 }
+
+// Itoa formats an int64 (notify echo parity).
+func Itoa(v int64) string { return strconv.FormatInt(v, 10) }

@@ -9,7 +9,7 @@
 //
 // Re-homed: m6RemoveItemAt (defined here despite its m6* name) now delegates
 // to controller.RemoveItemAt.
-package main
+package server
 
 import (
 	"rpg-world-server/internal/controller"
@@ -37,7 +37,7 @@ func (c *playerConn) TileX() int         { return c.Sess.PlayerX }
 func (c *playerConn) TileY() int         { return c.Sess.PlayerY }
 
 // GrantContainerAccess sets canAccessContainer (enchanter NPC branch).
-func (c *playerConn) GrantContainerAccess() { c.canAccessContainer = true }
+func (c *playerConn) GrantContainerAccess() { c.SetCanAccess(true) }
 
 // m12conn unwraps the controller.Conn back to the root conn (frame-emitting
 // store ops need it); falls back to an instance lookup for foreign impls.
