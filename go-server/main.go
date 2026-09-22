@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -28,17 +27,31 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"rpg-world-server/internal/app"
 	"rpg-world-server/internal/meta"
+	"rpg-world-server/internal/sim"
+	worldcore "rpg-world-server/internal/world"
 	"rpg-world-server/internal/worldmap"
 )
+
+// E9b split notes (behavior frozen):
+//   - boot/env (TESTMAP/CLEAN/COMBAT, PORT addr, DUMMY_* tuning) parses via
+//     internal/app + internal/world; the root vars below keep their exact
+//     names/defaults because frozen m5-m13.go and *_wire.go files read them.
+//   - movement/anticheat verify math delegates to internal/world (pure).
+//   - the 20Hz tick loop runs subsystems through an internal/world Engine.
+//   - showcase/combat-scene layout math delegates to internal/sim (pure).
+//   - transport (upgrader/subs/broadcast/send), the entity registry maps,
+//     the dispatch switch, the combat brain and the boot sequence stay in
+//     package main: frozen files lock entitiesMu/playersMu and call
+//     broadcast/send/setEntityPos directly, so moving them would change
+//     shared state ownership. internal/world.Store is the staged registry
+//     for the follow-up once those call sites leave package main.
 
 // addr resolves the listen address: PORT env (e.g. PORT=9002 for a side-by-side
 // run while the TS dev server occupies 9001) or the client-server default 9001.
 func addr() string {
-	if p := os.Getenv("PORT"); p != "" {
-		return "127.0.0.1:" + p
-	}
-	return "127.0.0.1:9001"
+	return app.ListenAddr(os.Getenv("PORT"))
 }
 
 var upgrader = websocket.Upgrader{
@@ -79,21 +92,13 @@ const (
 	pondRX, pondRY = 4, 3
 )
 
+// bootModes is the E9b-parsed TESTMAP/CLEAN/COMBAT selection (internal/world
+// truth tables, identical to the inline parsing below it replaced). The
+// individual vars keep their names for the frozen root files.
+var bootModes = worldcore.ParseModes(os.Getenv, os.Args[1:])
+
 // testMode defaults ON for now; env wins, then CLI flags.
-var testMode = func() bool {
-	if v := os.Getenv("TESTMAP"); v != "" {
-		return v != "0" && v != "false" && v != "off" && v != "no"
-	}
-	for _, a := range os.Args[1:] {
-		switch a {
-		case "--testmap", "--testmap=true", "--testmap=1":
-			return true
-		case "--testmap=false", "--testmap=0", "--notestmap":
-			return false
-		}
-	}
-	return true
-}()
+var testMode = bootModes.Test
 
 // cleanMode serves pure original terrain with zero overlays plus ONE
 // fully-equipped adventurer showcase. Select with CLEAN=1/true/on/yes or
@@ -103,25 +108,7 @@ var testMode = func() bool {
 // showcase grid, demos, guest p2, rat) and the showcase anim ticker — only
 // the Welcome hero + one adventurer Spawn + one Equipment Batch remain.
 // Collision/movement/gather handlers stay wired but dormant (no resources).
-var cleanMode = func() bool {
-	if v := os.Getenv("CLEAN"); v != "" {
-		switch v {
-		case "0", "false", "off", "no":
-			return false
-		default:
-			return true
-		}
-	}
-	for _, a := range os.Args[1:] {
-		switch a {
-		case "--clean", "--clean=true", "--clean=1":
-			return true
-		case "--clean=false", "--clean=0", "--noclean":
-			return false
-		}
-	}
-	return false
-}()
+var cleanMode = bootModes.Clean
 
 // combatMode serves pure original terrain (like CLEAN) plus a combat test
 // scene: a boss dummy + a 4-bot party (warrior, archer, mage, support) that
@@ -132,31 +119,11 @@ var cleanMode = func() bool {
 // guest p2, rat); only the Welcome hero + 4 bot Spawns + Boss Spawn remain.
 // The party brain (startCombat) ticks independently of clients; broadcasts
 // are no-ops with no subscribers.
-var combatMode = func() bool {
-	if v := os.Getenv("COMBAT"); v != "" {
-		switch v {
-		case "0", "false", "off", "no":
-			return false
-		default:
-			return true
-		}
-	}
-	for _, a := range os.Args[1:] {
-		switch a {
-		case "--combat", "--combat=true", "--combat=1":
-			return true
-		case "--combat=false", "--combat=0", "--nocombat":
-			return false
-		}
-	}
-	return false
-}()
+var combatMode = bootModes.Combat
 
 // isTestWater reports whether (x,y) is pond water (ellipse test).
 func isTestWater(x, y int) bool {
-	dx := float64(x - pondCX)
-	dy := float64(y - pondCY)
-	return (dx*dx)/float64(pondRX*pondRX)+(dy*dy)/float64(pondRY*pondRY) <= 1
+	return sim.IsWater(x, y, pondCX, pondCY, pondRX, pondRY)
 }
 
 // isTestGrass reports whether (x,y) is a forced-walkable overlay tile in
@@ -174,14 +141,9 @@ func isTestGrass(x, y int) bool {
 	if (x == 98 && y == 108) || (x == 100 && y == 108) {
 		return true
 	}
-	if x >= showOX && y >= showOY && (x-showOX)%showStep == 0 && (y-showOY)%showStep == 0 {
-		col := (x - showOX) / showStep
-		row := (y - showOY) / showStep
-		if col < showCols {
-			if row*showCols+col < len(showMobs)+len(showNPCs) {
-				return true
-			}
-		}
+	// Showcase-grid slots are forced walkable (grid math in internal/sim).
+	if sim.InGrid(x, y, showOX, showOY, showCols, showStep, len(showMobs)+len(showNPCs)) {
+		return true
 	}
 	return false
 }
@@ -603,9 +565,9 @@ var showNPCs = []string{
 }
 
 // showPos returns the grid tile for showcase index i (mobs 0-155, NPCs
-// continue at 156-231).
+// continue at 156-231). Layout math lives in internal/sim.
 func showPos(i int) (int, int) {
-	return showOX + (i%showCols)*showStep, showOY + (i/showCols)*showStep
+	return sim.GridPos(i, showOX, showOY, showCols, showStep)
 }
 
 // showAnimTick broadcasts the rotating showcase anims: Animation{action:Attack}
@@ -933,24 +895,10 @@ const (
 
 // dummyMaxHP/dummyRespawnDelay are env-overridable for fast scripted checks
 // (DUMMY_HP/DUMMY_RESPAWN seconds); defaults are the spec values (BossDummy
-// 5000 HP, 15s respawn).
-var dummyMaxHP = func() int {
-	if v := os.Getenv("DUMMY_HP"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 5000
-}()
+// 5000 HP, 15s respawn). Parsing lives in internal/app.
+var dummyMaxHP = app.ParseDummyHP(os.Getenv("DUMMY_HP"))
 
-var dummyRespawnDelay = func() time.Duration {
-	if v := os.Getenv("DUMMY_RESPAWN"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 15 * time.Second
-}()
+var dummyRespawnDelay = app.ParseDummyRespawn(os.Getenv("DUMMY_RESPAWN"))
 
 // Bot MaxHP (spawn full; support heals cap here). Boss deals no damage, so
 // heals are observable as Heal + Healing-FX + Points packets.
@@ -1256,11 +1204,8 @@ func spawnRangedStrikeLocked(owner string, dmg, typ int, skills []string, effect
 	bossAggroNote(owner)
 	gen := combatGen
 	ox, oy := botTile(owner)
-	dist := int(math.Ceil(math.Hypot(float64(combatDummyX-ox), float64(combatDummyY-oy))))
-	if dist < 1 {
-		dist = 1
-	}
-	travel := time.Duration(dist*90) * time.Millisecond
+	// Flight time follows the projectile.ts rule (distance*90ms, internal/sim).
+	travel := sim.TravelBetween(ox, oy, combatDummyX, combatDummyY)
 	hit := HitData{Type: typ, Damage: dmg, Skills: skills, Ranged: boolp(true)}
 	projSeq++
 	inst := fmt.Sprintf("pr-%d", projSeq)
@@ -1799,16 +1744,7 @@ const (
 // resource occupying (x,y). Empty occupant never matches, so static
 // collisions are always rejected even with no target set.
 func targetsResource(x, y int, targets ...string) bool {
-	occ := resourceAt(x, y)
-	if occ == "" {
-		return false
-	}
-	for _, t := range targets {
-		if t != "" && t == occ {
-			return true
-		}
-	}
-	return false
+	return worldcore.TargetsOccupant(resourceAt(x, y), targets...)
 }
 
 // rejectLocked records one cheat/collision strike: teleport-back + Positions
@@ -1832,35 +1768,12 @@ func rejectLocked(conn *websocket.Conn, c *playerConn, reason string) bool {
 // Returns true when the step is too fast (caller rejects).
 // Divergence note: truth uses a 1.5s region grace with latency subtracted
 // from the interval; here we keep the coarser 2-tile + 2s idle leniency.
+// The math lives in internal/world; this adapts the root session to it.
 func checkSpeed(s *session, tiles int) bool {
-	if s.movementSpeed <= 0 {
-		s.movementSpeed = 220
-	}
-	now := time.Now()
-	if s.lastStep.IsZero() {
-		s.lastStep = now
-		return false
-	}
-	// Grace: first step after idle (>2s) always passes (region-change rule).
-	if now.Sub(s.lastStep) > 2*time.Second {
-		s.lastStep = now
-		return false
-	}
-	if tiles < 1 {
-		tiles = 1
-	}
-	minInterval := time.Duration(s.movementSpeed) * time.Millisecond
-	// 5% margin like verifyMovement, per-tile with no +2 padding:
-	// allow tiles worth of interval before flagging.
-	allowance := time.Duration(float64(minInterval) * 0.95 * float64(tiles))
-	if now.Sub(s.lastStep) < allowance {
-		// Sliding window: advance lastStep even on reject so legit
-		// players paced at the legal rate never accumulate cheatScore.
-		s.lastStep = now
-		return true
-	}
-	s.lastStep = now
-	return false
+	st := worldcore.SpeedState{MovementSpeed: s.movementSpeed, LastStep: s.lastStep}
+	violation := worldcore.CheckSpeed(&st, tiles, time.Now())
+	s.movementSpeed, s.lastStep = st.MovementSpeed, st.LastStep
+	return violation
 }
 
 // handleMovement enforces collisions the client grid cannot: resource-entity
@@ -1892,7 +1805,7 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 		}
 		dx := abs(*mv.RequestX - s.playerX)
 		dy := abs(*mv.RequestY - s.playerY)
-		if (dx > 2 || dy > 2) && !m13NoclipAllowed(c.username) {
+		if worldcore.JumpTooFar(dx, dy) && !m13NoclipAllowed(c.username) {
 			// Noclip jump (player.ts handleMovementRequest diff>2). m13:
 			// player.noclip bypasses the jump check (movement.ts noclip).
 			return rejectLocked(conn, c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.playerX, s.playerY, *mv.RequestX, *mv.RequestY))
@@ -1908,7 +1821,7 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 		if mv.PlayerX != nil && mv.PlayerY != nil {
 			dx := abs(*mv.PlayerX - s.playerX)
 			dy := abs(*mv.PlayerY - s.playerY)
-			if dx > 2 || dy > 2 {
+			if worldcore.JumpTooFar(dx, dy) {
 				// Started mismatch: silent resync only (no cheatScore).
 				stopPlayer(conn, s, c.instance)
 				updateClientRegion(c)
@@ -1956,12 +1869,7 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 	return false
 }
 
-func abs(v int) int {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
+func abs(v int) int { return worldcore.Abs(v) }
 
 // handleTarget accepts the click-to-interact packet the client sends on
 // arrival: [14, [opcode, instance, x?, y?]] (player/handler.ts handleStopPathing
@@ -2438,19 +2346,28 @@ func broadcast(frames ...[]any) {
 }
 
 // startTickLoop launches the central 20Hz flush loop (one ticker per
-// process): every 50ms each conn's queued frames flush as a single bulk
-// write (5s write deadline; dead conns dropped + Despawn broadcast).
+// process): every FlushInterval each conn's queued frames flush as a single
+// bulk write (5s write deadline; dead conns dropped + Despawn broadcast).
+// Subsystem ticks run through the internal/world Engine in frozen order
+// (abilities -> pets -> events); the Engine only sequences the existing
+// entry points owned by the frozen *_wire.go files.
 var tickOnce sync.Once
+
+// tickEngine sequences the per-flush subsystem ticks (E9b orchestrator seam;
+// same functions, same order as the inline calls it replaces).
+var tickEngine = &worldcore.Engine{Subs: []worldcore.Subsystem{
+	{Name: "abilities", Tick: abStatusTick}, // DoT ticks -> Points, expiries -> EffectRemove
+	{Name: "pets", Tick: petTick},           // pet follow steps / teleports (no-op with no pets)
+	{Name: "events", Tick: worldEventTick},  // event rotation -> global notices (no-op when none due)
+}}
 
 func startTickLoop() {
 	tickOnce.Do(func() {
 		go func() {
-			t := time.NewTicker(50 * time.Millisecond)
+			t := time.NewTicker(worldcore.FlushInterval)
 			defer t.Stop()
 			for range t.C {
-				abStatusTick()   // DoT ticks -> Points, expiries -> EffectRemove
-				petTick()        // pet follow steps / teleports (no-op with no pets)
-				worldEventTick() // event rotation -> global notices (no-op when none due)
+				tickEngine.Tick()
 				playersMu.Lock()
 				conns := make([]*playerConn, 0, len(players))
 				for _, c := range players {
