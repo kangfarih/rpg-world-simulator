@@ -64,11 +64,14 @@
 //   - Decoration (banner/outline/crest) is kept in memory only: SchemaSQL has
 //     no decoration column, so banner choices do not survive a reboot (Login
 //     frames echo the in-memory choice, client fallbacks apply otherwise).
-//   - Hub relay for offline members is a skip: TS synchronize() relays to
-//     offline members over the hub socket; all-in-one the Router resolves the
-//     online subset and offline members get nothing (no cross-server socket
-//     exists). Guild chat therefore never falls back to a global broadcast —
-//     that would leak guild chat to non-members.
+//   - Hub relay for offline members is a skip in all-in-one: TS
+//     synchronize() relays to offline members over the hub socket; all-in-one
+//     the Router resolves the online subset and offline members get nothing
+//     (no cross-server socket exists). In hub mode (R2) guild/global fan out
+//     to hub-known remote members via ForwardTo (one relay envelope each);
+//     members online nowhere still get nothing. Guild chat therefore never
+//     falls back to a global broadcast — that would leak guild chat to
+//     non-members.
 //   - Hub usernames are lowercase-normalized at the boundary (the Router
 //     itself is exact-match per its docs; the stub's PM path lowercases names
 //     before lookup, so registration normalizes the same way to keep
@@ -187,6 +190,13 @@ type Deps struct {
 	PlayerConn func(name string) (*Conn, bool)
 	// PlayerNames snapshots online usernames (m7PlayerUsernames parity).
 	PlayerNames func() []string
+	// ForwardTo relays one game frame to the shard owning username (R2
+	// cross-shard fanout via the hub; nil = all-in-one, remote members are
+	// skipped exactly as before).
+	ForwardTo func(username string, frame []any)
+	// RemotePlayers snapshots the hub-known online set minus local players
+	// (R2 cross-shard audience; nil = all-in-one, no remote audience).
+	RemotePlayers func() []string
 	// Sanitize escapes chat text (m7Sanitize parity).
 	Sanitize func(string) string
 	// IsNonBlank reports displayable text (whitespaceRe parity).
@@ -653,16 +663,47 @@ func onlineGuildmates(g *guilds.Guild, skip string) []string {
 // deliverGuildChat fans a Chat frame out to the Router-resolved online
 // subset (all-in-one: Route filters the candidate roster; offline members are
 // skipped — no hub socket exists to relay further, and a global broadcast
-// fallback would leak guild chat to non-members).
+// fallback would leak guild chat to non-members). In hub mode (R2) members
+// owned by remote shards are relayed one [53, ...] envelope each via
+// ForwardTo (same per-username scope as direct chat, D4 parity).
 func deliverGuildChat(from, message string, members []string) {
 	recips, _ := socHub.Route(hub.Message{From: from, Kind: hub.KindGuild, Payload: members})
+	frame := protocol.PktOp(protocol.PacketGuild, GuildChat, map[string]any{
+		"username": from, "serverId": sdeps.ServerID, "message": message,
+	})
+	local := make(map[string]struct{}, len(recips))
 	for _, name := range recips {
+		local[name] = struct{}{}
 		if t, ok := sdeps.PlayerConn(name); ok && t != nil {
-			t.Send(protocol.PktOp(protocol.PacketGuild, GuildChat, map[string]any{
-				"username": from, "serverId": sdeps.ServerID, "message": message,
-			}))
+			t.Send(frame)
 		}
 	}
+	if sdeps.ForwardTo == nil {
+		return
+	}
+	remote := remoteSet()
+	for _, name := range members {
+		if _, ok := local[name]; ok {
+			continue
+		}
+		if _, ok := remote[name]; ok {
+			sdeps.ForwardTo(name, frame)
+		}
+	}
+}
+
+// remoteSet snapshots the hub-known remote audience (nil-safe).
+func remoteSet() map[string]struct{} {
+	out := map[string]struct{}{}
+	if sdeps.RemotePlayers == nil {
+		return out
+	}
+	for _, u := range sdeps.RemotePlayers() {
+		if u != "" {
+			out[u] = struct{}{}
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,7 +1304,9 @@ func RouteChat(target string) bool {
 
 // RouteGlobal delivers a global chat line to the Router-resolved online
 // set, falling back to the existing broadcast when the target set is offline
-// (empty router — same recipients either way in all-in-one mode).
+// (empty router — same recipients either way in all-in-one mode). In hub
+// mode (R2) the hub-known remote audience gets one relayed copy each via
+// ForwardTo.
 func RouteGlobal(frame []any) {
 	recips, _ := socHub.Route(hub.Message{Kind: hub.KindGlobal})
 	if len(recips) == 0 {
@@ -1279,6 +1322,11 @@ func RouteGlobal(frame []any) {
 	}
 	if !anySent {
 		sdeps.Broadcast(frame)
+	}
+	if sdeps.ForwardTo != nil {
+		for _, name := range sdeps.RemotePlayers() {
+			sdeps.ForwardTo(name, frame)
+		}
 	}
 }
 

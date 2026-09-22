@@ -119,6 +119,12 @@ func preShutdownFlush() {
 // with build/gVer/state/load stamps for the router server-list). All-in-one
 // (default) starts no client: the default path stays exactly as today. A
 // shard without HUB_ADDR serves standalone (log + continue).
+//
+// R2 wiring: the client reports the explicit VERSION tag + SHARD_REGIONS
+// scope, delivers hub-relayed frames to local conns (direct-chat parity for
+// guild/global fanout), answers handoff requests (pre-load + ack), checks
+// local presence through the game registry, and sweeps the refresh banner on
+// preferred-version changes.
 func startShardClient() {
 	if app.ParseRole(os.Getenv, os.Args[1:]) != app.RoleShard {
 		return
@@ -128,11 +134,15 @@ func startShardClient() {
 		log.Printf("shard: ROLE=shard without HUB_ADDR (standalone; no hub registration)")
 		return
 	}
-	c := hub.NewClient(addr, hub.SharedToken(), hub.ShardName(), hub.NewRouter(), nil, nil)
+	c := hub.NewClient(addr, hub.SharedToken(), hub.ShardName(), hub.NewRouter(), nil, deliverRelayToLocal)
 	c.SetBuild(version.BuildID, version.GVer, app.ListenAddr(os.Getenv("PORT")))
 	c.SetPlayersProvider(m7PlayerUsernames)
+	c.SetRegions(hub.ShardRegions())
+	c.SetLocalCheck(func(username string) bool { return m7PlayerByName(username) != nil })
+	c.SetHandoffHandler(applyHandoffRequest)
+	c.SetOnPreferred(func(string) { bannerOnPreferredAll() })
 	shardHubClient = c
 	go c.Start(context.Background())
-	log.Printf("shard: hub client -> %s as %q (buildID=%s gVer=%s)",
-		addr, hub.ShardName(), version.BuildID, version.GVer)
+	log.Printf("shard: hub client -> %s as %q (buildID=%s gVer=%s version=%s)",
+		addr, hub.ShardName(), version.BuildID, version.GVer, ownVersion())
 }

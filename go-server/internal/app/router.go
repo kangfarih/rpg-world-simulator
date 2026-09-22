@@ -5,10 +5,11 @@
 //   - / (any non-GET path too): hub shard sockets (hub.Server: register +
 //     heartbeat + relay + roster; 3-miss eviction).
 //   - GET /servers: login/hub server-list directing NEW sessions to the
-//     newest healthy RUNNING shard: {"preferred":<addr>,
-//     "shards":[{name,addr,buildId,gVer,state,load,newest}]}. preferred is
-//     "" when no RUNNING shard is registered (clients keep their current
-//     session / retry).
+//     newest healthy RUNNING version: {"preferred":<addr>,
+//     "shards":[{name,addr,buildId,gVer,state,load,newest,version,regions}]}.
+//     preferred is "" when no RUNNING shard is registered (clients keep
+//     their current session / retry). Old versions keep serving existing
+//     sessions (no new logins).
 //   - GET /healthz: instance state/load (+ stamps); 503 once DRAINING.
 //
 // Env contract:
@@ -72,6 +73,14 @@ type ServerEntry struct {
 	State   string `json:"state"`
 	Load    int    `json:"load"`
 	Newest  bool   `json:"newest,omitempty"`
+	// Version is the R2 world version (explicit VERSION tag or the
+	// buildID+gVer pair; "" = unknown). New sessions go to the newest
+	// healthy RUNNING version (Preferred); old versions keep serving
+	// existing sessions only.
+	Version string `json:"version,omitempty"`
+	// Regions is the shard's reported scope for the region->shard lookup
+	// (nil = unscoped).
+	Regions []int `json:"regions,omitempty"`
 }
 
 // ServerList is the GET /servers shape.
@@ -81,7 +90,7 @@ type ServerList struct {
 }
 
 // BuildServerList renders the hub table for login routing: shards newest
-// first, Preferred pointing at the newest healthy RUNNING shard ("" when
+// first, Preferred pointing at the newest healthy RUNNING version ("" when
 // none — clients must not start new sessions anywhere).
 func BuildServerList(h *hub.Server) ServerList {
 	out := ServerList{}
@@ -94,6 +103,7 @@ func BuildServerList(h *hub.Server) ServerList {
 		out.Shards = append(out.Shards, ServerEntry{
 			Name: in.Name, Addr: in.Addr, BuildID: in.BuildID,
 			GVer: in.GVer, State: in.State, Load: in.Load, Newest: in.Newest,
+			Version: in.Version, Regions: in.Regions,
 		})
 	}
 	if pref, ok := h.NewestRunning(); ok {

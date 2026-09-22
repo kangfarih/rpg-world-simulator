@@ -11,6 +11,8 @@
 package server
 
 import (
+	"encoding/json"
+
 	"rpg-world-server/internal/guilds"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/social"
@@ -95,6 +97,26 @@ func socConfigure() {
 		Sanitize:    m7Sanitize,
 		IsNonBlank:  whitespaceRe.MatchString,
 		FormatName:  m7FormatName,
+		// R2 cross-shard fanout (hub-gated, nil-safe no-ops in all-in-one:
+		// the funcs close over shardHubClient and check it per call, since
+		// the client starts after this wiring runs).
+		ForwardTo: func(username string, frame []any) {
+			c := shardHubClient
+			if c == nil || !c.Connected() {
+				return
+			}
+			inner, err := json.Marshal(frame)
+			if err != nil {
+				return
+			}
+			c.ForwardTo(username, inner)
+		},
+		RemotePlayers: func() []string {
+			if c := shardHubClient; c != nil {
+				return c.RemotePlayers()
+			}
+			return nil
+		},
 	})
 }
 

@@ -40,6 +40,46 @@
 //	           an Authorization: Bearer header. When empty, all shards are
 //	           accepted (dev default).
 //	SHARD_NAME shard identity in register/heartbeat frames (default "shard").
+//	VERSION    explicit world version tag. When set, the shard reports it as
+//	           its version instead of the derived buildID+gVer pair, and the
+//	           router prefers the newest healthy RUNNING version. Distinct
+//	           VERSION values (e.g. rolling deploys) coexist: old versions
+//	           keep serving existing sessions (no new logins).
+//	SHARD_REGIONS comma-separated region ids this shard simulates
+//	           (e.g. "25,26,27"; empty = unscoped). Reported in register/
+//	           heartbeat frames; the hub serves the region->shard lookup
+//	           (LookupRegion) that handoff senders use to pick a target.
+//
+// R2 architecture (GO-PLAN §12 R2 / REWRITE-V2 V2-M2):
+//
+//	version rows: the hub tracks version (= explicit VERSION tag, else the
+//	  buildID+gVer pair via VersionOf) per shard; multiple versions coexist.
+//	  Router preferred = the newest healthy RUNNING version (NewestRunning:
+//	  newest version wins; within a version the lowest-load shard wins, ties
+//	  by latest registration then name). Old versions keep heartbeating and
+//	  serving existing sessions but take no new logins.
+//	handoff RPC: same-build shard-to-shard player transfer as JSON control
+//	  objects on the existing hub sockets (no new packet opcode, relay
+//	  envelope reuse for chat only): sender -> hub {"t":"handoff",...} ->
+//	  target; target -> hub {"t":"handoff-ack",...} -> sender. The hub gates
+//	  on version equality (mismatch => immediate reject ack; the transfer
+//	  must go disconnect+reconnect via login/hub, never a bare Teleport
+//	  across builds) and forwards to the target's live socket. The payload
+//	  is opaque to the hub (player persist snapshot + quests + region/pos).
+//	  Same-build move = seamless socket re-point: the target pre-loads the
+//	  transferred rows, the sender notifies its client (existing
+//	  Notification-25) with the target addr, despawns and disconnects; the
+//	  client re-opens its game WS at the target (no page reload, no asset
+//	  refetch — same build) and logs in normally, landing on the
+//	  transferred state; the only Teleport emitted lives inside the target
+//	  shard's own socket flow.
+//	refresh banner: the hub pushes the preferred version inside every roster
+//	  push; shards compare it with their own version and emit the existing
+//	  Chat-19 frame ("new version available — refresh when ready", no new
+//	  opcode), rate-limited to once per session per version change.
+//	fanout: guild/global resolve across shards via hub presence: the sender
+//	  relays one [53, ...] envelope per remote recipient (direct-chat scope
+//	  parity, D4) and each owning shard delivers locally.
 //
 // Wire conventions (mirrors the TS reference, read-only):
 //
@@ -69,6 +109,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -91,6 +132,12 @@ const (
 	EnvHubToken = "HUB_TOKEN"
 	// EnvShardName is the shard identity (default "shard").
 	EnvShardName = "SHARD_NAME"
+	// EnvVersion is the explicit world version tag (default: derived
+	// buildID+gVer pair via VersionOf).
+	EnvVersion = "VERSION"
+	// EnvShardRegions is the comma-separated region-id list the shard
+	// simulates (default: unscoped).
+	EnvShardRegions = "SHARD_REGIONS"
 )
 
 // Transport cadence. HeartbeatInterval mirrors the TS 5s hub retry cadence;
@@ -126,6 +173,44 @@ func ShardName() string {
 		return n
 	}
 	return "shard"
+}
+
+// VersionTag returns the explicit VERSION tag ("" = derive from the
+// buildID+gVer pair via VersionOf).
+func VersionTag() string { return strings.TrimSpace(os.Getenv(EnvVersion)) }
+
+// VersionOf resolves the world version for one shard: the explicit tag when
+// set, else the buildID+gVer pair (either half alone when only one is
+// stamped, "" when neither is — pre-R1 shards group as unknown).
+func VersionOf(buildID, gVer, tag string) string {
+	if tag != "" {
+		return tag
+	}
+	switch {
+	case buildID != "" && gVer != "":
+		return buildID + "+" + gVer
+	case buildID != "":
+		return buildID
+	default:
+		return gVer
+	}
+}
+
+// ShardRegions parses the SHARD_REGIONS region-id list (comma/space
+// separated; empty = unscoped). Malformed entries are skipped.
+func ShardRegions() []int { return ParseRegions(os.Getenv(EnvShardRegions)) }
+
+// ParseRegions parses a comma/space-separated region-id list (testable core
+// of ShardRegions).
+func ParseRegions(raw string) []int {
+	var out []int
+	for _, f := range strings.Fields(strings.ReplaceAll(raw, ",", " ")) {
+		var n int
+		if _, err := fmt.Sscanf(f, "%d", &n); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // ErrOfflineAuth is returned when a shard registration carries a bad token.
@@ -167,6 +252,12 @@ type HubHandshake struct {
 	// Addr is the shard's game address for login redirect
 	// (e.g. "127.0.0.1:9001"; "" falls back to the shard name).
 	Addr string `json:"addr,omitempty"`
+	// Version is the explicit VERSION tag (R2). When empty the hub derives
+	// the version via VersionOf(BuildID, GVer, "").
+	Version string `json:"version,omitempty"`
+	// Regions is the SHARD_REGIONS scope (R2 region->shard lookup). Nil =
+	// unscoped (no constraint); non-nil replaces the stored scope.
+	Regions []int `json:"regions,omitempty"`
 }
 
 // encodeFrame serializes a TS-style [packet, opcode, data] array frame.
@@ -244,13 +335,109 @@ type heartbeatMsg struct {
 	Players []string `json:"players,omitempty"`
 	State   string   `json:"state,omitempty"`
 	Load    int      `json:"load,omitempty"`
+	// Version is the R2 world version ("" = no change, like State).
+	Version string `json:"version,omitempty"`
+	// Regions is the R2 scope (nil = no change; non-nil replaces).
+	Regions []int `json:"regions,omitempty"`
 }
 
 // rosterMsg is the hub->shard roster push: every known online player and the
-// shard hosting them (drives RouteOrForward remote decisions).
+// shard hosting them (drives RouteOrForward remote decisions), plus the
+// preferred world version (drives the refresh banner).
 type rosterMsg struct {
-	Type    string            `json:"t"` // "roster"
-	Players map[string]string `json:"players"`
+	Type      string            `json:"t"` // "roster"
+	Players   map[string]string `json:"players"`
+	Preferred string            `json:"preferred,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Cross-shard handoff (R2)
+// ---------------------------------------------------------------------------
+
+// Handoff control object types (JSON objects on the hub socket, heartbeat/
+// roster parity — no packet-shape changes).
+const (
+	handoffType    = "handoff"
+	handoffAckType = "handoff-ack"
+)
+
+// HandoffRequest is one same-build player transfer: the sender flushes its
+// persist rows (players/inventory/quests), packs the snapshot opaquely, and
+// the receiver pre-loads it so the re-pointed client lands on live state.
+// State/Quests are opaque to the hub (game-owned JSON).
+type HandoffRequest struct {
+	ID      string          `json:"id"`
+	From    string          `json:"from"`
+	To      string          `json:"to"`
+	Player  string          `json:"player"`
+	BuildID string          `json:"buildId,omitempty"`
+	GVer    string          `json:"gVer,omitempty"`
+	Version string          `json:"version,omitempty"`
+	State   json.RawMessage `json:"state,omitempty"`
+	Quests  json.RawMessage `json:"quests,omitempty"`
+	Region  int             `json:"region,omitempty"`
+	X       int             `json:"x,omitempty"`
+	Y       int             `json:"y,omitempty"`
+}
+
+// HandoffAck answers a HandoffRequest (To = the original sender shard).
+// Ok=false (e.g. build mismatch, unknown/unavailable target) means the
+// transfer never started: the sender keeps its session (cross-build moves
+// must go disconnect+reconnect via login/hub, never a bare Teleport).
+// Addr is the receiver's game address for the client socket re-point.
+type HandoffAck struct {
+	ID     string `json:"id"`
+	To     string `json:"to"`
+	Ok     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+	Addr   string `json:"addr,omitempty"`
+}
+
+// handoffMsg is the on-socket form of HandoffRequest (t="handoff").
+type handoffMsg struct {
+	Type string `json:"t"`
+	HandoffRequest
+}
+
+// handoffAckMsg is the on-socket form of HandoffAck (t="handoff-ack").
+type handoffAckMsg struct {
+	Type string `json:"t"`
+	HandoffAck
+}
+
+// encodeHandoff wraps req in its control object.
+func encodeHandoff(req HandoffRequest) ([]byte, error) {
+	return json.Marshal(handoffMsg{Type: handoffType, HandoffRequest: req})
+}
+
+// decodeHandoff parses a control object into its request.
+func decodeHandoff(raw []byte) (HandoffRequest, error) {
+	var m handoffMsg
+	if err := json.Unmarshal(raw, &m); err != nil || m.Type != handoffType {
+		return HandoffRequest{}, errors.New("hub: not a handoff frame")
+	}
+	return m.HandoffRequest, nil
+}
+
+// encodeHandoffAck wraps ack in its control object.
+func encodeHandoffAck(ack HandoffAck) ([]byte, error) {
+	return json.Marshal(handoffAckMsg{Type: handoffAckType, HandoffAck: ack})
+}
+
+// decodeHandoffAck parses a control object into its ack.
+func decodeHandoffAck(raw []byte) (HandoffAck, error) {
+	var m handoffAckMsg
+	if err := json.Unmarshal(raw, &m); err != nil || m.Type != handoffAckType {
+		return HandoffAck{}, errors.New("hub: not a handoff-ack frame")
+	}
+	return m.HandoffAck, nil
+}
+
+// HandoffCompatible reports whether a transfer may proceed on version
+// grounds: equal versions pass; either side unknown ("") passes at the hub
+// (the receiver still enforces its exact build/gVer gate on the payload).
+func HandoffCompatible(fromVersion, toVersion string) bool {
+	return fromVersion == "" || toVersion == "" || fromVersion == toVersion
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +622,11 @@ type shardEntry struct {
 	load      int
 	addr      string
 	firstSeen time.Time // registration order = build newness
+	// R2 version + region scope. version is the explicit VERSION tag or the
+	// derived buildID+gVer pair ("" = unknown, pre-R1); regions is nil when
+	// the shard never reported a scope (unscoped).
+	version string
+	regions []int
 }
 
 // ShardInfo is the transport-free snapshot of one shardEntry for the
@@ -446,9 +638,14 @@ type ShardInfo struct {
 	GVer    string
 	State   string
 	Load    int
-	// Newest is true on the NewestRunning pick (login target for NEW
+	// Newest is true on the preferred-version pick (login target for NEW
 	// sessions) when rendered via ListShards.
 	Newest bool
+	// Version is the R2 world version (explicit VERSION tag or the
+	// buildID+gVer pair; "" = unknown).
+	Version string
+	// Regions is the shard's reported scope (nil = unscoped).
+	Regions []int
 }
 
 // effectiveState normalizes "" (pre-R1 shard) to RUNNING.
@@ -523,12 +720,13 @@ func bearerToken(r *http.Request) string {
 
 // Register records (or refreshes) a shard from its handshake: verifies
 // auth, upserts the entry, adopts the handshake player list, records the R1
-// routing stamps (buildID/gVer/state/load/addr), and stamps last-heartbeat.
+// routing stamps (buildID/gVer/state/load/addr) plus the R2 version
+// (explicit tag or derived pair) and region scope, and stamps last-heartbeat.
 // firstSeen tracks registration order (build newness for NewestRunning): a
-// brand-new name sets it; a re-register keeps it unless the buildID changed
-// (same-name redeploy of a new build counts as new). Transport-free
-// (unit-testable); the socket is attached separately by ServeHTTP via
-// Attach.
+// brand-new name sets it; a re-register keeps it unless the buildID or the
+// version changed (same-name redeploy of a new build counts as new).
+// Transport-free (unit-testable); the socket is attached separately by
+// ServeHTTP via Attach.
 func (s *Server) Register(hs HubHandshake) error {
 	if hs.Name == "" || hs.Type != "hub" {
 		return errors.New("hub: bad handshake")
@@ -540,6 +738,10 @@ func (s *Server) Register(hs HubHandshake) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
+	ver := hs.Version
+	if ver == "" {
+		ver = VersionOf(hs.BuildID, hs.GVer, "")
+	}
 	e := s.shards[hs.Name]
 	if e == nil {
 		e = &shardEntry{
@@ -548,7 +750,8 @@ func (s *Server) Register(hs HubHandshake) error {
 			firstSeen: now,
 		}
 		s.shards[hs.Name] = e
-	} else if hs.BuildID != "" && hs.BuildID != e.buildID {
+	} else if (hs.BuildID != "" && hs.BuildID != e.buildID) ||
+		(hs.Version != "" && hs.Version != e.version) {
 		// Same-name redeploy of a new build: it is newer than everything
 		// registered before it.
 		e.firstSeen = now
@@ -572,6 +775,12 @@ func (s *Server) Register(hs HubHandshake) error {
 	if hs.Addr != "" {
 		e.addr = hs.Addr
 	}
+	if hs.Version != "" || hs.BuildID != "" || hs.GVer != "" {
+		e.version = ver
+	}
+	if hs.Regions != nil {
+		e.regions = append([]int(nil), hs.Regions...)
+	}
 	e.lastBeat = now
 	s.rebuildLocked()
 	return nil
@@ -588,7 +797,16 @@ func (s *Server) Heartbeat(name string, players []string) error {
 // HeartbeatEx is Heartbeat plus the R1 routing stamps: a non-"" state moves
 // the drain state (RUNNING/DRAINING), and a non-negative load replaces it.
 // Heartbeats carrying neither leave the stamps untouched (pre-R1 shape).
+// The R2 version/scope are preserved (use HeartbeatFull to move them).
 func (s *Server) HeartbeatEx(name string, players []string, state string, load int) error {
+	return s.HeartbeatFull(name, players, state, load, "", nil)
+}
+
+// HeartbeatFull is HeartbeatEx plus the R2 version and region scope: a
+// non-"" version replaces the world version, and a non-nil regions list
+// replaces the scope (nil preserves both, so plain heartbeats never clobber
+// the register stamps).
+func (s *Server) HeartbeatFull(name string, players []string, state string, load int, version string, regions []int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.shards[name]
@@ -606,6 +824,12 @@ func (s *Server) HeartbeatEx(name string, players []string, state string, load i
 	}
 	if load >= 0 {
 		e.load = load
+	}
+	if version != "" {
+		e.version = version
+	}
+	if regions != nil {
+		e.regions = append([]int(nil), regions...)
 	}
 	e.lastBeat = s.now()
 	s.rebuildLocked()
@@ -647,51 +871,166 @@ func (s *Server) ShardCount() int {
 	return len(s.shards)
 }
 
-// NewestRunning reports the newest healthy RUNNING shard for NEW sessions
-// (login routing): among entries whose effective state is RUNNING ("" counts
-// as RUNNING for pre-R1 shards), the latest firstSeen wins, ties broken by
-// name ascending. Evicted (3-miss) shards are gone from the table, so they
+// NewestRunning reports the login target for NEW sessions: a shard of the
+// newest healthy RUNNING world version (R2 — not just the newest shard).
+// Version newness is the latest firstSeen among the version's RUNNING
+// shards; within the winning version the lowest-load shard wins (ties: latest
+// firstSeen, then name ascending). DRAINING shards are skipped (they keep
+// existing players, take no new sessions); "" state counts as RUNNING for
+// pre-R1 shards. Evicted (3-miss) shards are gone from the table, so they
 // never win. ok is false when no RUNNING shard is registered — the caller
 // must not start new sessions anywhere (clients keep current sessions).
 // Transport-free.
 func (s *Server) NewestRunning() (ShardInfo, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var best *shardEntry
-	for _, e := range s.shards {
-		if effectiveState(e.state) != version.StateRunning {
-			continue
-		}
-		if best == nil || e.firstSeen.After(best.firstSeen) ||
-			(e.firstSeen.Equal(best.firstSeen) && e.name < best.name) {
-			best = e
-		}
-	}
-	if best == nil {
+	best, ok := s.newestRunningLocked()
+	if !ok {
 		return ShardInfo{}, false
 	}
 	return s.infoLocked(best, true), true
 }
 
-// ListShards snapshots every registered shard newest-first (same order as
-// NewestRunning), flagging the login target. Transport-free; backs the
-// router GET /servers server-list.
-func (s *Server) ListShards() []ShardInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var running *shardEntry
+// newestRunningLocked is NewestRunning under the lock (shared with
+// ListShards/PreferredVersion/pushRoster).
+func (s *Server) newestRunningLocked() (*shardEntry, bool) {
+	// Newness per version: latest firstSeen among its RUNNING shards.
+	newness := map[string]time.Time{}
 	for _, e := range s.shards {
 		if effectiveState(e.state) != version.StateRunning {
 			continue
 		}
-		if running == nil || e.firstSeen.After(running.firstSeen) ||
-			(e.firstSeen.Equal(running.firstSeen) && e.name < running.name) {
-			running = e
+		if t, ok := newness[e.version]; !ok || e.firstSeen.After(t) {
+			newness[e.version] = e.firstSeen
 		}
+	}
+	if len(newness) == 0 {
+		return nil, false
+	}
+	bestVer := ""
+	var bestNew time.Time
+	first := true
+	for ver, t := range newness {
+		if first || t.After(bestNew) || (t.Equal(bestNew) && ver > bestVer) {
+			bestVer, bestNew, first = ver, t, false
+		}
+	}
+	var best *shardEntry
+	for _, e := range s.shards {
+		if effectiveState(e.state) != version.StateRunning || e.version != bestVer {
+			continue
+		}
+		if best == nil || e.load < best.load ||
+			(e.load == best.load && (e.firstSeen.After(best.firstSeen) ||
+				(e.firstSeen.Equal(best.firstSeen) && e.name < best.name))) {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil, false
+	}
+	return best, true
+}
+
+// PreferredVersion reports the newest healthy RUNNING world version (the
+// version NewestRunning serves; "" with ok=false when no RUNNING shard is
+// registered). Transport-free; pushed to shards inside every roster push
+// (drives the refresh banner).
+func (s *Server) PreferredVersion() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best, ok := s.newestRunningLocked()
+	if !ok {
+		return "", false
+	}
+	return best.version, true
+}
+
+// RegionsOf snapshots one shard's reported scope (nil = unscoped or
+// unknown shard). Transport-free.
+func (s *Server) RegionsOf(name string) []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e := s.shards[name]; e != nil {
+		return append([]int(nil), e.regions...)
+	}
+	return nil
+}
+
+// LookupRegion resolves a region id to its owning shard for handoff target
+// selection (R2 region->shard table): the RUNNING scoped shard claiming the
+// region (lowest load wins, ties by latest firstSeen then name). Unscoped
+// shards (nil regions) match nothing here — handoff senders fall back to an
+// explicit target or the preferred version. Transport-free.
+func (s *Server) LookupRegion(region int) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *shardEntry
+	for _, e := range s.shards {
+		if effectiveState(e.state) != version.StateRunning || e.regions == nil {
+			continue
+		}
+		claims := false
+		for _, r := range e.regions {
+			if r == region {
+				claims = true
+				break
+			}
+		}
+		if !claims {
+			continue
+		}
+		if best == nil || e.load < best.load ||
+			(e.load == best.load && (e.firstSeen.After(best.firstSeen) ||
+				(e.firstSeen.Equal(best.firstSeen) && e.name < best.name))) {
+			best = e
+		}
+	}
+	if best == nil {
+		return "", false
+	}
+	return best.name, true
+}
+
+// CheckHandoff gates one transfer on transport-free grounds (used by the
+// live relay and unit-testable): both shards registered, distinct, versions
+// compatible (see HandoffCompatible — mismatch must go
+// disconnect+reconnect, never a bare Teleport across builds).
+func (s *Server) CheckHandoff(from, to string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if from == "" || to == "" || from == to {
+		return errors.New("hub: bad handoff target")
+	}
+	src := s.shards[from]
+	dst := s.shards[to]
+	if src == nil || dst == nil {
+		return errors.New("hub: unknown handoff shard")
+	}
+	if !HandoffCompatible(src.version, dst.version) {
+		return fmt.Errorf("hub: handoff %s (%q) -> %s (%q): build mismatch",
+			from, src.version, to, dst.version)
+	}
+	return nil
+}
+
+// ListShards snapshots every registered shard newest-first (same order as
+// NewestRunning), flagging the login target: every RUNNING shard of the
+// preferred version. Transport-free; backs the router GET /servers
+// server-list.
+func (s *Server) ListShards() []ShardInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best, _ := s.newestRunningLocked()
+	var prefVer string
+	hasPref := best != nil
+	if hasPref {
+		prefVer = best.version
 	}
 	out := make([]ShardInfo, 0, len(s.shards))
 	for _, e := range s.shards {
-		out = append(out, s.infoLocked(e, running != nil && e == running))
+		out = append(out, s.infoLocked(e, hasPref &&
+			effectiveState(e.state) == version.StateRunning && e.version == prefVer))
 	}
 	// Newest-first by (firstSeen desc, name asc). firstSeen is not on the
 	// snapshot, so sort via the entries under the same lock.
@@ -713,6 +1052,7 @@ func (s *Server) infoLocked(e *shardEntry, newest bool) ShardInfo {
 	return ShardInfo{
 		Name: e.name, Addr: e.addr, BuildID: e.buildID, GVer: e.gVer,
 		State: effectiveState(e.state), Load: e.load, Newest: newest,
+		Version: e.version, Regions: append([]int(nil), e.regions...),
 	}
 }
 
@@ -873,18 +1213,24 @@ func (s *Server) deliverPending(name string) {
 	}
 }
 
-// pushRoster broadcasts the current roster to every attached shard.
+// pushRoster broadcasts the current roster plus the preferred world version
+// to every attached shard.
 func (s *Server) pushRoster() {
-	raw, err := json.Marshal(rosterMsg{Type: "roster", Players: s.Roster()})
-	if err != nil {
-		return
-	}
 	s.mu.Lock()
+	msg := rosterMsg{Type: "roster", Players: s.playerShardCopyLocked()}
+	// Preferred version rides the roster (refresh-banner + login routing).
+	if best, ok := s.newestRunningLocked(); ok {
+		msg.Preferred = best.version
+	}
+	raw, err := json.Marshal(msg)
 	entries := make([]*shardEntry, 0, len(s.shards))
 	for _, e := range s.shards {
 		entries = append(entries, e)
 	}
 	s.mu.Unlock()
+	if err != nil {
+		return
+	}
 	for _, e := range entries {
 		e.wmu.Lock()
 		if e.conn != nil {
@@ -892,6 +1238,104 @@ func (s *Server) pushRoster() {
 			_ = e.conn.WriteMessage(websocket.TextMessage, raw)
 		}
 		e.wmu.Unlock()
+	}
+}
+
+// playerShardCopyLocked snapshots the roster. Caller holds mu.
+func (s *Server) playerShardCopyLocked() map[string]string {
+	out := make(map[string]string, len(s.playerShard))
+	for u, sh := range s.playerShard {
+		out[u] = sh
+	}
+	return out
+}
+
+// sendToShard writes raw to one shard's live socket. Reports false when the
+// shard is unknown or its socket is down (caller decides: drop, reject, or
+// store as offline mail).
+func (s *Server) sendToShard(name string, raw []byte) bool {
+	s.mu.Lock()
+	e := s.shards[name]
+	s.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
+	if e.conn == nil {
+		return false
+	}
+	_ = e.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := e.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+		log.Printf("hub: send to shard %q: %v", name, err)
+		return false
+	}
+	return true
+}
+
+// rejectHandoff answers the sender with a failed ack (the transfer never
+// started; the sender keeps its session).
+func (s *Server) rejectHandoff(sender string, id, reason string) {
+	raw, err := encodeHandoffAck(HandoffAck{ID: id, To: sender, Reason: reason})
+	if err != nil {
+		return
+	}
+	if !s.sendToShard(sender, raw) {
+		log.Printf("hub: handoff reject for %q dropped (sender down): %s", sender, reason)
+	}
+}
+
+// handleHandoff relays one sender->hub handoff request: version-gate first
+// (mismatch => immediate reject ack, never forwarded — cross-build moves
+// must go disconnect+reconnect via login/hub), then forward verbatim to the
+// target's live socket. sender is the socket owner's shard name (the From
+// field must match it).
+func (s *Server) handleHandoff(sender string, raw []byte) {
+	req, err := decodeHandoff(raw)
+	if err != nil {
+		log.Printf("hub: bad handoff frame from %q", sender)
+		return
+	}
+	if req.From == "" {
+		req.From = sender
+	}
+	if req.From != sender {
+		log.Printf("hub: handoff From mismatch from %q", sender)
+		return
+	}
+	if req.To == "" || req.To == sender {
+		s.rejectHandoff(sender, req.ID, "bad handoff target")
+		return
+	}
+	if err := s.CheckHandoff(sender, req.To); err != nil {
+		s.rejectHandoff(sender, req.ID, err.Error())
+		return
+	}
+	fwd, err := encodeHandoff(req)
+	if err != nil {
+		s.rejectHandoff(sender, req.ID, "handoff encode failed")
+		return
+	}
+	if !s.sendToShard(req.To, fwd) {
+		s.rejectHandoff(sender, req.ID, "target shard unavailable")
+		return
+	}
+	log.Printf("hub: handoff %s (%q) -> %s", req.Player, req.Version, req.To)
+}
+
+// forwardAck relays one target->hub handoff ack to the original sender
+// shard named in its To field.
+func (s *Server) forwardAck(raw []byte) {
+	ack, err := decodeHandoffAck(raw)
+	if err != nil {
+		log.Printf("hub: bad handoff-ack frame")
+		return
+	}
+	if ack.To == "" {
+		return
+	}
+	if !s.sendToShard(ack.To, raw) {
+		log.Printf("hub: handoff-ack %q for %q dropped (sender down)", ack.ID, ack.To)
 	}
 }
 
@@ -954,12 +1398,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if isJSONObject(raw) {
 			var hb heartbeatMsg
 			if err := json.Unmarshal(raw, &hb); err != nil || hb.Type != "heartbeat" {
+				// R2 control objects (no packet-shape changes): handoff
+				// requests route to the target shard (version-gated),
+				// handoff acks route back to the sender shard.
+				var probe struct {
+					Type string `json:"t"`
+				}
+				if perr := json.Unmarshal(raw, &probe); perr != nil {
+					continue
+				}
+				switch probe.Type {
+				case handoffType:
+					s.handleHandoff(hs.Name, raw)
+				case handoffAckType:
+					s.forwardAck(raw)
+				}
 				continue
 			}
 			if hb.Name == "" {
 				hb.Name = hs.Name
 			}
-			if err := s.HeartbeatEx(hb.Name, hb.Players, hb.State, hb.Load); err != nil {
+			if err := s.HeartbeatFull(hb.Name, hb.Players, hb.State, hb.Load, hb.Version, hb.Regions); err != nil {
 				log.Printf("hub: heartbeat: %v", err)
 				continue
 			}
@@ -1019,6 +1478,26 @@ type Client struct {
 	game    string // shard game addr for login redirect
 	state   string // drain state override ("" = RUNNING)
 	players func() []string
+
+	// R2 world version + scope. version, when set, overrides both the
+	// VERSION env tag and the derived buildID+gVer pair in register/
+	// heartbeat frames; regions scopes the region->shard lookup.
+	version string
+	regions []int
+	// preferred is the hub-known preferred world version (latest roster
+	// push; "" = unknown). onPreferred fires on change (refresh banner).
+	preferred   string
+	onPreferred func(string)
+	// localCheck overrides the relay-delivery local test (shard role: the
+	// game owns login, so the client's own Router stays empty and the
+	// server supplies m7PlayerByName parity instead).
+	localCheck func(string) bool
+	// onHandoff answers inbound handoff requests (shard role: validate,
+	// pre-load rows, ack). Nil = reject ("no handler").
+	onHandoff func(HandoffRequest) HandoffAck
+	// pending tracks outbound handoff requests by id until their ack
+	// arrives (or the waiter gives up).
+	pending map[string]chan HandoffAck
 }
 
 // NewClient builds a shard client for addr (ws://host:port/path). router is
@@ -1094,6 +1573,77 @@ func (c *Client) SetPlayersProvider(players func() []string) {
 	c.players = players
 }
 
+// SetVersion overrides the reported world version (register + heartbeat).
+// When unset, the VERSION env tag wins, else the buildID+gVer pair derived
+// in SetBuild. Nil-safe.
+func (c *Client) SetVersion(tag string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.version = tag
+}
+
+// SetRegions reports the region scope for the region->shard lookup
+// (SHARD_REGIONS parity, programmatic form). Nil-safe.
+func (c *Client) SetRegions(regions []int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.regions = append([]int(nil), regions...)
+}
+
+// SetLocalCheck overrides the relay-delivery local test (shard role: the
+// game owns login, so the caller supplies live presence instead of the
+// client's own Router). Nil-safe (nil = Router parity).
+func (c *Client) SetLocalCheck(check func(string) bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localCheck = check
+}
+
+// SetOnPreferred installs the preferred-version change callback (refresh
+// banner). It fires on the read loop when a roster push moves the preferred
+// version (including the first known value). Nil-safe (nil disables).
+func (c *Client) SetOnPreferred(fn func(string)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onPreferred = fn
+}
+
+// PreferredVersion reports the hub-known preferred world version ("" =
+// unknown — all-in-one or no roster yet). The game compares it with its own
+// version for the refresh banner.
+func (c *Client) PreferredVersion() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preferred
+}
+
+// SetHandoffHandler installs the inbound handoff receiver (shard role:
+// validate the payload, pre-load rows, ack). Nil-safe (nil = reject every
+// request with "no handler").
+func (c *Client) SetHandoffHandler(fn func(HandoffRequest) HandoffAck) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onHandoff = fn
+}
+
 // Register marks username online locally and returns its pending offline
 // mail for the caller to deliver. Login-path hook (Router.Register +
 // Mailer.Deliver in one step).
@@ -1157,12 +1707,194 @@ func (c *Client) RemoteOf(username string) (string, bool) {
 	return shard, ok
 }
 
+// RemotePlayers snapshots the hub-known online set minus the local players
+// (the cross-shard audience for guild/global fanout), sorted. Nil-safe.
+func (c *Client) RemotePlayers() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	local := c.localSetLocked()
+	var out []string
+	for u := range c.remote {
+		if _, ok := local[u]; !ok {
+			out = append(out, u)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// localSetLocked snapshots the local online set. Caller holds mu (it may
+// invoke the players provider, matching localPlayers).
+func (c *Client) localSetLocked() map[string]struct{} {
+	if c.players != nil {
+		out := make(map[string]struct{})
+		for _, u := range c.players() {
+			if u != "" {
+				out[u] = struct{}{}
+			}
+		}
+		return out
+	}
+	out := make(map[string]struct{}, len(c.local))
+	for u := range c.local {
+		out[u] = struct{}{}
+	}
+	return out
+}
+
+// ForwardTo relays one game frame to the shard owning username (one [53,
+// ...] envelope, direct-chat parity). inner is the already-marshalled game
+// frame. Reports false when the target is local, unknown, or the socket is
+// down (caller keeps its local/all-in-one answer). Nil-safe.
+func (c *Client) ForwardTo(username string, inner json.RawMessage) bool {
+	if c == nil || username == "" {
+		return false
+	}
+	c.mu.Lock()
+	if _, ok := c.localSetLocked()[username]; ok {
+		c.mu.Unlock()
+		return false
+	}
+	_, remote := c.remote[username]
+	conn := c.conn
+	c.mu.Unlock()
+	if !remote || conn == nil {
+		return false
+	}
+	raw, err := encodeRelay(username, inner)
+	if err != nil {
+		return false
+	}
+	c.wmu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = conn.WriteMessage(websocket.TextMessage, raw)
+	c.wmu.Unlock()
+	if err != nil {
+		log.Printf("hub: fanout forward for %q: %v", username, err)
+		return false
+	}
+	return true
+}
+
+// FanoutGuild relays frame to the remote owners among members (per-username
+// [53, ...] envelopes): local members are skipped (the caller delivers them
+// directly) and unknown members are skipped (offline nowhere — no hub socket
+// exists to relay further, and a global broadcast fallback would leak guild
+// chat to non-members). Returns the sorted remote recipients handed off.
+// Nil-safe.
+func (c *Client) FanoutGuild(members []string, frame []any) []string {
+	if c == nil || len(members) == 0 {
+		return nil
+	}
+	inner, err := json.Marshal(frame)
+	if err != nil {
+		log.Printf("hub: fanout guild marshal: %v", err)
+		return nil
+	}
+	seen := make(map[string]struct{}, len(members))
+	var out []string
+	for _, m := range members {
+		if m == "" {
+			continue
+		}
+		if _, dup := seen[m]; dup {
+			continue
+		}
+		seen[m] = struct{}{}
+		if c.ForwardTo(m, inner) {
+			out = append(out, m)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// FanoutGlobal relays frame to every remote-known player (one [53, ...]
+// envelope each — hub-routed per username, owning shards deliver locally).
+// Returns the sorted recipients handed off. Nil-safe.
+func (c *Client) FanoutGlobal(frame []any) []string {
+	if c == nil {
+		return nil
+	}
+	inner, err := json.Marshal(frame)
+	if err != nil {
+		log.Printf("hub: fanout global marshal: %v", err)
+		return nil
+	}
+	var out []string
+	for _, u := range c.RemotePlayers() {
+		if c.ForwardTo(u, inner) {
+			out = append(out, u)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RequestHandoff sends one handoff request to target and waits for its ack
+// (or ctx expiry). A rejected ack (ok=false) is returned as the ack, not an
+// error — the transfer never started and the sender keeps its session.
+// Errors report transport failures only (nil client, down socket, encode or
+// write failure, ctx expiry).
+func (c *Client) RequestHandoff(ctx context.Context, target string, req HandoffRequest) (HandoffAck, error) {
+	if c == nil {
+		return HandoffAck{}, errors.New("hub: no hub client")
+	}
+	if target == "" {
+		return HandoffAck{}, errors.New("hub: bad handoff target")
+	}
+	if req.ID == "" {
+		req.ID = fmt.Sprintf("%s-%d", c.name, time.Now().UnixNano())
+	}
+	req.From = c.name
+	req.To = target
+	ch := make(chan HandoffAck, 1)
+	c.mu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[string]chan HandoffAck)
+	}
+	c.pending[req.ID] = ch
+	conn := c.conn
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if cur, ok := c.pending[req.ID]; ok && cur == ch {
+			delete(c.pending, req.ID)
+		}
+		c.mu.Unlock()
+	}()
+	if conn == nil {
+		return HandoffAck{}, errors.New("hub: hub socket down")
+	}
+	raw, err := encodeHandoff(req)
+	if err != nil {
+		return HandoffAck{}, err
+	}
+	c.wmu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = conn.WriteMessage(websocket.TextMessage, raw)
+	c.wmu.Unlock()
+	if err != nil {
+		return HandoffAck{}, err
+	}
+	select {
+	case <-ctx.Done():
+		return HandoffAck{}, ctx.Err()
+	case ack := <-ch:
+		return ack, nil
+	}
+}
+
 // RouteOrForward resolves m locally first (Route parity). On a local miss
 // of a direct message it forwards the [53, ...] relay envelope over the
 // socket when the hub roster places the target on a remote shard
 // (returning ErrForwarded — no local fallback), and otherwise stores
 // offline mail and returns ErrOffline (caller falls back exactly as in
-// all-in-one). Guild/global kinds resolve locally only. Nil-client (or
+// all-in-one). Guild/global kinds resolve locally only here (cross-shard
+// guild/global fanout goes through FanoutGuild/FanoutGlobal). Nil-client (or
 // offline-socket) behavior is exactly the all-in-one answer: local Route,
 // else store + ErrOffline.
 func (c *Client) RouteOrForward(m Message) ([]string, error) {
@@ -1243,6 +1975,27 @@ func (c *Client) clientStamps() (buildID, gVer, game, state string) {
 	return c.buildID, c.gVer, c.game, c.state
 }
 
+// reportedVersion snapshots the R2 world version under lock: the explicit
+// SetVersion override, else the VERSION env tag, else the buildID+gVer pair.
+func (c *Client) reportedVersion() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.version != "" {
+		return c.version
+	}
+	if tag := VersionTag(); tag != "" {
+		return tag
+	}
+	return VersionOf(c.buildID, c.gVer, "")
+}
+
+// reportedRegions snapshots the region scope under lock.
+func (c *Client) reportedRegions() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.regions...)
+}
+
 // handshakeFrame builds the [1, null, {...}] register frame.
 func (c *Client) handshakeFrame() ([]byte, error) {
 	players := c.localPlayers()
@@ -1250,6 +2003,7 @@ func (c *Client) handshakeFrame() ([]byte, error) {
 	hs := HubHandshake{
 		Type: "hub", Name: c.name, AccessToken: c.token, Players: players,
 		BuildID: buildID, GVer: gVer, State: state, Load: len(players), Addr: game,
+		Version: c.reportedVersion(), Regions: c.reportedRegions(),
 	}
 	return encodeFrame(frameHandshake, nil, hs)
 }
@@ -1261,6 +2015,7 @@ func (c *Client) heartbeatFrame() ([]byte, error) {
 	return json.Marshal(heartbeatMsg{
 		Type: "heartbeat", Name: c.name, Players: players,
 		State: state, Load: len(players),
+		Version: c.reportedVersion(), Regions: c.reportedRegions(),
 	})
 }
 
@@ -1394,7 +2149,10 @@ func (c *Client) detach(conn *websocket.Conn) {
 
 // readLoop serves inbound hub frames until the socket drops, then closes
 // done. Relay envelopes addressed to local players go to onRelay verbatim
-// (handleRelay parity); roster pushes refresh the remote map.
+// (handleRelay parity); roster pushes refresh the remote map and the
+// preferred version (onPreferred fires on change); handoff requests go to
+// the handoff handler and handoff acks resolve outbound RequestHandoff
+// waiters.
 func (c *Client) readLoop(conn *websocket.Conn, done chan struct{}) {
 	defer close(done)
 	for {
@@ -1405,19 +2163,7 @@ func (c *Client) readLoop(conn *websocket.Conn, done chan struct{}) {
 			return
 		}
 		if isJSONObject(raw) {
-			var rs rosterMsg
-			if err := json.Unmarshal(raw, &rs); err != nil || rs.Type != "roster" {
-				continue
-			}
-			remote := make(map[string]string, len(rs.Players))
-			for u, sh := range rs.Players {
-				if u != "" && sh != "" {
-					remote[u] = sh
-				}
-			}
-			c.mu.Lock()
-			c.remote = remote
-			c.mu.Unlock()
+			c.readObject(conn, raw)
 			continue
 		}
 		packet, _, _, err := decodeFrame(raw)
@@ -1428,7 +2174,7 @@ func (c *Client) readLoop(conn *websocket.Conn, done chan struct{}) {
 		if err != nil {
 			continue
 		}
-		if _, rerr := c.router.Route(Message{Kind: KindChat, To: to}); rerr != nil {
+		if !c.isLocal(to) {
 			// Target left between hub routing and delivery: keep it as
 			// offline mail instead of dropping it.
 			var payload any
@@ -1442,6 +2188,94 @@ func (c *Client) readLoop(conn *websocket.Conn, done chan struct{}) {
 			c.onRelay(to, inner)
 		} else {
 			log.Printf("hub: relay for %q dropped (no handler)", to)
+		}
+	}
+}
+
+// isLocal reports whether username is served locally: the shard-role hook
+// when set, else the client's own Router (Register/Unregister parity).
+func (c *Client) isLocal(username string) bool {
+	c.mu.Lock()
+	check := c.localCheck
+	c.mu.Unlock()
+	if check != nil {
+		return check(username)
+	}
+	if _, rerr := c.router.Route(Message{Kind: KindChat, To: username}); rerr != nil {
+		return false
+	}
+	return true
+}
+
+// readObject serves one inbound hub control object: roster pushes refresh
+// the remote map + preferred version, handoff requests go to the handler
+// (the ack routes back over the same socket), handoff acks resolve outbound
+// waiters.
+func (c *Client) readObject(conn *websocket.Conn, raw []byte) {
+	var probe struct {
+		Type string `json:"t"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return
+	}
+	switch probe.Type {
+	case "roster":
+		var rs rosterMsg
+		if err := json.Unmarshal(raw, &rs); err != nil {
+			return
+		}
+		remote := make(map[string]string, len(rs.Players))
+		for u, sh := range rs.Players {
+			if u != "" && sh != "" {
+				remote[u] = sh
+			}
+		}
+		var onPref func(string)
+		var pref string
+		c.mu.Lock()
+		c.remote = remote
+		if rs.Preferred != "" && rs.Preferred != c.preferred {
+			c.preferred = rs.Preferred
+			pref, onPref = rs.Preferred, c.onPreferred
+		}
+		c.mu.Unlock()
+		if onPref != nil {
+			onPref(pref)
+		}
+	case handoffType:
+		req, err := decodeHandoff(raw)
+		if err != nil {
+			return
+		}
+		c.mu.Lock()
+		fn := c.onHandoff
+		c.mu.Unlock()
+		ack := HandoffAck{ID: req.ID, To: req.From, Reason: "no handler"}
+		if fn != nil {
+			ack = fn(req)
+			ack.ID = req.ID
+			ack.To = req.From
+		}
+		if out, err := encodeHandoffAck(ack); err == nil {
+			c.wmu.Lock()
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_ = conn.WriteMessage(websocket.TextMessage, out)
+			c.wmu.Unlock()
+		}
+	case handoffAckType:
+		ack, err := decodeHandoffAck(raw)
+		if err != nil {
+			return
+		}
+		c.mu.Lock()
+		ch := c.pending[ack.ID]
+		delete(c.pending, ack.ID)
+		c.mu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- ack:
+			default:
+			}
 		}
 	}
 }

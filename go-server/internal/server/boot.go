@@ -2240,6 +2240,14 @@ func registerDisconnectHooks() {
 		if !ok || c == nil {
 			return
 		}
+		// R2: forget the refresh-banner session record (next login re-arms).
+		bannerForget(c.Username)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
 		m12ClearSession(c, nil)
 	})
 	worldcore.OnDisconnect(func(v any) {
@@ -2795,6 +2803,7 @@ func handleConn(conn *websocket.Conn) {
 					return
 				}
 				worldPushLights(c) // world: login region-enter Lamp fan-out
+				maybeBannerConn(c) // R2: refresh banner when behind preferred (hub-gated no-op)
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
 				sendSpawns()
 			case PacketList: // C List request -> Spawns + Positions
@@ -2830,6 +2839,9 @@ func handleConn(conn *websocket.Conn) {
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["socialtest"] != nil {
 						socTestHandler(c, frame[1])
+					}
+					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["handofftest"] != nil {
+						handoffTestHandler(c, frame[1])
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["worldtest"] != nil {
 						worldTestHandler(c, frame[1])
