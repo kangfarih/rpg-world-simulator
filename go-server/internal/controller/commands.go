@@ -305,6 +305,9 @@ type InventoryAdmin interface {
 	BankCount(username, key string) int
 	InvCount(username, key string) int
 	AppendBank(username, key string, count int)
+	// BankSlots snapshots the bank as plain slots (/openbank parity —
+	// the admin views the named player's bank).
+	BankSlots(username string) []CommandSlot
 }
 
 // Drop is one exact loot item (m5Drop parity, no drop-table roll). The loot
@@ -321,15 +324,21 @@ type LootAdmin interface {
 
 // CommandDeps bundles the command seams for one call.
 type CommandDeps struct {
-	Flags  Flags
-	Guilds GuildAdmin
-	World  AdminWorld
-	Mobs   MobAdmin
-	Quests QuestAdmin
-	Inv    InventoryAdmin
-	Loot   LootAdmin
-	Bus    CommandBus
-	Peers  CommandPeers
+	Flags     Flags
+	Guilds    GuildAdmin
+	World     AdminWorld
+	Mobs      MobAdmin
+	Quests    QuestAdmin
+	Inv       InventoryAdmin
+	Loot      LootAdmin
+	Bus       CommandBus
+	Peers     CommandPeers
+	Skills    SkillAdmin
+	Abilities AbilityAdmin
+	Ranks     RankAdmin
+	Pets      PetAdmin
+	Poison    PoisonAdmin
+	Misc      MiscAdmin
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +352,7 @@ func ParseCommand(c CommandConn, command string, blocks []string, d CommandDeps)
 	GuildCommand(c, command, blocks, d)
 	ModeratorCommands(c, command, blocks, d)
 	AdminCommands(c, command, blocks, d)
+	AdminProgressionCommands(c, command, blocks, d)
 }
 
 // firstBlock returns blocks[0] or "" (undostage/resetquest arg parity).

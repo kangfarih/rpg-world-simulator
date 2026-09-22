@@ -368,6 +368,9 @@ func (s *cmdInv) InvCount(username, key string) int {
 func (s *cmdInv) AppendBank(username, key string, count int) {
 	s.bank[username] = append(s.bank[username], CommandSlot{Key: key, Count: count})
 }
+func (s *cmdInv) BankSlots(username string) []CommandSlot {
+	return append([]CommandSlot(nil), s.bank[username]...)
+}
 
 type cmdLoot struct {
 	at  []string
@@ -392,6 +395,8 @@ func cmdDeps(bus *cmdBus, peers *cmdPeers, flags *cmdFlags) CommandDeps {
 		Loot:   &cmdLoot{},
 		Bus:    bus,
 		Peers:  peers,
+		Skills: newProgSkills(), Abilities: newProgAbilities(), Ranks: &progRanks{},
+		Pets: &progPets{}, Poison: newProgPoison(), Misc: newProgMisc(),
 	}
 }
 

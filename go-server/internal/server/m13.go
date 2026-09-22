@@ -18,11 +18,15 @@
 package server
 
 import (
+	"encoding/json"
 	"log"
+	"net"
+	"sync"
 	"time"
 
 	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/social"
 	worldcore "rpg-world-server/internal/world"
@@ -499,6 +503,16 @@ func (m13inv) AppendBank(username, key string, count int) {
 	st.Bank = append(st.Bank, m5Slot{Key: key, Count: count})
 	pstateMu.Unlock()
 }
+func (m13inv) BankSlots(username string) []controller.CommandSlot {
+	st := m5StateFor(username)
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	out := make([]controller.CommandSlot, 0, len(st.Bank))
+	for _, s := range st.Bank {
+		out = append(out, controller.CommandSlot{Key: s.Key, Count: s.Count})
+	}
+	return out
+}
 
 // ---------------------------------------------------------------------------
 // controller.LootAdmin seam (shared loot registry; bodies verbatim).
@@ -594,6 +608,8 @@ func m13deps() controller.CommandDeps {
 		Flags: m13flagsStore{}, Guilds: m13guilds{}, World: m13world{},
 		Mobs: m13mobs{}, Quests: m13quests{}, Inv: m13inv{},
 		Loot: m13loot{}, Bus: m13bus{}, Peers: m13peers{},
+		Skills: m13skills{}, Abilities: m13abilities{}, Ranks: m13ranks{},
+		Pets: m13pets{}, Poison: m13poisonStore{}, Misc: m13misc{},
 	}
 }
 
@@ -778,4 +794,415 @@ func m13TestHandler(c *playerConn, data []byte) {
 		return
 	}
 	controller.HandleCommandTest(c, data, m13deps())
+}
+
+// ---------------------------------------------------------------------------
+// controller.SkillAdmin seam (m5 skill state + XP frame paths).
+// ---------------------------------------------------------------------------
+
+type m13skills struct{}
+
+func (m13skills) MarkDirty(username string) { markDirty(username) }
+
+func (m13skills) SkillOf(c controller.CommandConn, skill int) (int, int, bool) {
+	pc := m13conn(c)
+	if pc == nil {
+		return 0, 1, false
+	}
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	s, ok := st.Skills[skill]
+	if !ok || s == nil {
+		return 0, 1, false
+	}
+	return s.XP, s.Level, true
+}
+
+func (m13skills) AddSkillXP(c controller.CommandConn, skill, amount int) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	m5AddXP(pc, pc.Username, skill, amount)
+}
+
+// m13SkillFrames builds the handleExperience withInfo pair: Experience
+// Skill + Skill Update with the full serialize (level/percentage/
+// nextExperience/combat).
+func m13SkillFrames(pc *playerConn, skill int, xp, level int) []gnet.Frame {
+	return []gnet.Frame{
+		pktOp(PacketExperience, ExperienceSkill, experienceData{
+			Instance: pc.Instance, Amount: intp(0), Skill: intp(skill),
+		}),
+		pktOp(PacketSkill, SkillUpdate, skillData{
+			Type: skill, Experience: xp, Level: intp(level),
+			Percentage: floatp(m5Percentage(xp)), NextExperience: intp(nextExp(xp)),
+			Combat: boolp(m5CombatSkill(skill)),
+		}),
+	}
+}
+
+// m13SkillBatch builds the Skill Batch over every earned skill (login
+// m5LoginWelcome shape parity) plus the Experience Sync carrying the
+// combat level (skills.sync parity).
+func m13SkillBatch(pc *playerConn) []gnet.Frame {
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	skills := make([]any, 0, len(st.Skills))
+	for id, s := range st.Skills {
+		skills = append(skills, map[string]any{
+			"type": id, "experience": s.XP, "level": s.Level,
+			"percentage": m5Percentage(s.XP), "nextExperience": nextExp(s.XP),
+			"combat": m5CombatSkill(id),
+		})
+	}
+	combatLevel := st.Level
+	pstateMu.Unlock()
+	return []gnet.Frame{
+		pktOp(PacketSkill, SkillBatch, map[string]any{"skills": skills, "cheater": false}),
+		pktOp(PacketExperience, ExperienceSync, experienceData{Instance: pc.Instance, Level: intp(combatLevel)}),
+	}
+}
+
+func (m13skills) SetSkillXP(c controller.CommandConn, skill, xp int) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	s, ok := st.Skills[skill]
+	if !ok || s == nil {
+		s = &m5Skill{Level: 1}
+		st.Skills[skill] = s
+	}
+	s.XP = xp
+	s.Level = expToLevel(xp)
+	if s.Level < 1 {
+		s.Level = 1
+	}
+	if m5CombatSkill(skill) {
+		st.Level = m5CombatLevelLocked(st)
+	}
+	level := s.Level
+	pstateMu.Unlock()
+	markDirty(pc.Username)
+	_ = gnet.Send(pc.Conn, m13SkillFrames(pc, skill, xp, level)...)
+}
+
+func (m13skills) ResetSkills(c controller.CommandConn) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	for _, id := range controller.ProgressionSkillIDs {
+		s, ok := st.Skills[id]
+		if !ok || s == nil {
+			s = &m5Skill{Level: 1}
+			st.Skills[id] = s
+		}
+		s.XP, s.Level = 0, 1 // setExperience(0) parity (silent part)
+	}
+	st.Level = m5CombatLevelLocked(st)
+	pstateMu.Unlock()
+	markDirty(pc.Username)
+	// addExperience(0) per skill is silent at level 1 (no level-up), then
+	// skills.sync() — the Batch + Experience Sync pair.
+	_ = gnet.Send(pc.Conn, m13SkillBatch(pc)...)
+}
+
+func (m13skills) MaxSkills(c controller.CommandConn) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	for _, id := range controller.ProgressionSkillIDs {
+		s, ok := st.Skills[id]
+		if !ok || s == nil {
+			s = &m5Skill{Level: 1}
+			st.Skills[id] = s
+		}
+		s.XP, s.Level = 0, 1 // setExperience(0) first, like TS
+	}
+	pstateMu.Unlock()
+	for _, id := range controller.ProgressionSkillIDs {
+		m5AddXP(pc, pc.Username, id, controller.MaxAwardXP)
+	}
+}
+
+func (m13skills) SyncSkills(c controller.CommandConn) {
+	if pc := m13conn(c); pc != nil {
+		_ = gnet.Send(pc.Conn, m13SkillBatch(pc)...)
+	}
+}
+
+func (m13skills) LevelsToExperience(fromLevel, toLevel int) int {
+	tbl := meta.BuildLevelExp(meta.MaxLevel)
+	if len(tbl) == 0 {
+		return 0
+	}
+	if fromLevel < 0 {
+		fromLevel = 0
+	}
+	if toLevel < 0 {
+		toLevel = 0
+	}
+	if fromLevel >= len(tbl) {
+		fromLevel = len(tbl) - 1
+	}
+	if toLevel >= len(tbl) {
+		toLevel = len(tbl) - 1
+	}
+	return tbl[toLevel] - tbl[fromLevel] // Formulas.levelsToExperience
+}
+
+// ---------------------------------------------------------------------------
+// controller.AbilityAdmin seam (abilities registry grant paths).
+// ---------------------------------------------------------------------------
+
+type m13abilities struct{}
+
+func (m13abilities) MarkDirty(username string) { markDirty(username) }
+func (m13abilities) HasAbility(username, key string) bool {
+	return abHas(username, key)
+}
+func (m13abilities) GrantAbility(c controller.CommandConn, username, key string, level int) bool {
+	return abGrantAbility(m13conn(c), username, key, level)
+}
+func (m13abilities) QuickSlotAbility(c controller.CommandConn, username, key string, slot int) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	// Same store the C->S Ability QuickSlot opcode writes (HandleAbility
+	// QuickSlot branch, owned-ability gate included).
+	raw, _ := json.Marshal(map[string]any{"opcode": AbilityQuickSlot, "key": key, "index": slot})
+	abHandleAbility(pc, raw)
+	markDirty(username)
+}
+func (m13abilities) ResetAbilities(c controller.CommandConn) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	// Client reload signal (abilities.reset loadCallback -> Ability Batch).
+	_ = gnet.Send(pc.Conn, abLoginBatch(pc.Username))
+	markDirty(pc.Username)
+	log.Printf("m13: %s reset abilities (client reload; registry clear needs abilities pkg support)", pc.Username)
+}
+
+// ---------------------------------------------------------------------------
+// controller.RankAdmin seam (player rank sets).
+// ---------------------------------------------------------------------------
+
+type m13ranks struct{}
+
+func (m13ranks) MarkDirty(username string) { markDirty(username) }
+func (m13ranks) SetRank(target controller.CommandConn, rank int) {
+	pc := m13conn(target)
+	if pc == nil {
+		return
+	}
+	pc.rank = rank
+	chatStateFor(pc).rank = rank
+	_ = gnet.Send(pc.Conn, pkt(PacketRank, rank)) // RankPacket(rank)
+	// player.sync() region fanout (SyncPacket serialize parity).
+	st := m5StateFor(pc.Username)
+	pstateMu.Lock()
+	x, y, level := st.X, st.Y, st.Level
+	pstateMu.Unlock()
+	ph := welcomePlayer(pc.Instance)
+	ph.X, ph.Y = x, y
+	ph.Level = intp(level)
+	worldcore.Broadcast(pkt(PacketSync, ph))
+	markDirty(pc.Username)
+}
+func (m13ranks) SetRankOffline(username string, rank int) {
+	// No durable rank column exists in the Go players table (rank is
+	// session state, seeded at login) — database.setRank has no
+	// equivalent; flag the row for the persist flush like every rank
+	// mutation and log the intent.
+	markDirty(username)
+	log.Printf("m13: setrank offline %s rank=%d (no durable rank store)", username, rank)
+}
+
+// ---------------------------------------------------------------------------
+// controller.PetAdmin seam (pet grant path).
+// ---------------------------------------------------------------------------
+
+type m13pets struct{}
+
+func (m13pets) GrantPet(c controller.CommandConn, key string) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	mob, item := petResolveKey(key)
+	petGrant(pc, mob, item) // duplicate-pet notify lives in the grant
+}
+
+// ---------------------------------------------------------------------------
+// controller.PoisonAdmin seam (status Tracker pipeline + region scan).
+// Poison Has/Clear bookkeeping lives here because the status engine owns
+// the tracker and exposes Apply only (abApplyPoison, the same call the
+// poisonous-weapon hook rides via gameWorldAdapter.ApplyPoison).
+// ---------------------------------------------------------------------------
+
+type m13poisonStore struct{}
+
+var (
+	m13poisonMu  sync.Mutex
+	m13poisoned  = map[string]int64{}
+	m13poisonGen int64
+)
+
+func (m13poisonStore) PoisonHas(instance string) bool {
+	m13poisonMu.Lock()
+	defer m13poisonMu.Unlock()
+	return m13poisoned[instance] != 0
+}
+func (m13poisonStore) PoisonApply(instance string) {
+	if instance == "" {
+		return
+	}
+	abApplyPoison(instance)
+	m13poisonMu.Lock()
+	m13poisonGen++
+	gen := m13poisonGen
+	m13poisoned[instance] = gen
+	m13poisonMu.Unlock()
+	// Natural Venom expiry clears the toggle state (30s default).
+	time.AfterFunc(controller.PoisonExpiry, func() {
+		m13poisonMu.Lock()
+		defer m13poisonMu.Unlock()
+		if m13poisoned[instance] == gen {
+			delete(m13poisoned, instance)
+		}
+	})
+}
+func (m13poisonStore) PoisonClear(instance string) {
+	m13poisonMu.Lock()
+	delete(m13poisoned, instance)
+	m13poisonMu.Unlock()
+}
+func (m13poisonStore) EntityKind(instance string) string {
+	if m9MobFor(instance) != nil {
+		return "mob"
+	}
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		return "player"
+	}
+	if _, _, ok := worldcore.EntityPos(instance); ok {
+		return "other"
+	}
+	return ""
+}
+func (m13poisonStore) RegionCharInstances(c controller.CommandConn) []string {
+	adminRegion := worldcore.TileRegion(c.TileX(), c.TileY())
+	var out []string
+	for _, e := range worldcore.EntitySnapshot() {
+		if worldcore.TileRegion(e.X, e.Y) != adminRegion {
+			continue
+		}
+		if m9MobFor(e.Instance) != nil {
+			out = append(out, e.Instance)
+			continue
+		}
+		if p, _ := worldcore.Find[*playerConn](e.Instance); p != nil {
+			out = append(out, e.Instance)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// controller.MiscAdmin seam (attack range, debug frame, region resend,
+// IP bans shared with the stdin console form).
+// ---------------------------------------------------------------------------
+
+type m13misc struct{}
+
+// m13AttackRange is the stub's canonical attack range (welcomePlayer
+// AttackRange intp(1) everywhere; player.sync recomputes it from the
+// weapon in TS, which the stub does not model).
+func (m13misc) AttackRange(c controller.CommandConn) int { return 1 }
+
+func (m13misc) SendDebug(c controller.CommandConn) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	// CommandPacket {command:'debug'}: [Packets.Command, data] (packet.ts
+	// serialize with no opcode; Packets.Command = 20).
+	_ = gnet.Send(pc.Conn, pkt(PacketCommand, map[string]any{"command": "debug"}))
+}
+
+func (m13misc) ResendRegions(c controller.CommandConn) {
+	pc := m13conn(c)
+	if pc == nil {
+		return
+	}
+	// regionsLoaded = [] + updateRegion() parity: recompute interest,
+	// then the login region-load burst scoped to the admin (List Spawns +
+	// Positions, then one Spawn per surrounding-region entity).
+	worldcore.UpdateRegion(pc, pc.Sess.PlayerX, pc.Sess.PlayerY)
+	handleList(pc)
+	regions := pc.Conn.Regions()
+	regionSet := make(map[int]bool, len(regions))
+	for _, r := range regions {
+		regionSet[r] = true
+	}
+	n := 0
+	for _, e := range worldcore.EntitySnapshot() {
+		if !regionSet[worldcore.TileRegion(e.X, e.Y)] {
+			continue
+		}
+		p, ok := spawnPayload(e.Instance)
+		if !ok {
+			continue
+		}
+		_ = gnet.Send(pc.Conn, pkt(PacketSpawn, p))
+		n++
+	}
+	log.Printf("m13: resetregions resent %d spawns to %s", n, pc.Instance)
+}
+
+func (m13misc) PlayerIP(username string) (string, bool) {
+	target := m7PlayerByName(username)
+	if target == nil {
+		return "", false
+	}
+	return m13ConnIP(target), true
+}
+
+// m13ConnIP resolves the remote host of a conn (ops_wire BanIP parity).
+func m13ConnIP(target *playerConn) string {
+	host, _, err := net.SplitHostPort(gnet.AddrID(target.Conn.WS))
+	if err != nil {
+		host = gnet.AddrID(target.Conn.WS)
+	}
+	return host
+}
+
+func (m13misc) BanIP(ip string) { m13BanIP(ip) }
+
+// m13BanIP records the IP ban + drops matching conns — the same list and
+// drop the stdin console /ipban drives (ops_wire BanIP closure parity;
+// kept as one helper so both forms share the implementation).
+func m13BanIP(ip string) {
+	gnet.BanIP(ip)
+	for _, k := range worldcore.AllWS() {
+		host, _, err := net.SplitHostPort(gnet.AddrID(k))
+		if err != nil {
+			host = gnet.AddrID(k)
+		}
+		if host == ip {
+			worldcore.RemoveClient(k)
+		}
+	}
 }

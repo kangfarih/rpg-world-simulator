@@ -69,7 +69,8 @@ In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/ch
 - M10 areas — DONE (`054659e` + E5 `internal/entity/areas`): music/overlay/pvp/camera/chest/dynamic (`e2e/m10`).
 - M11 quests+achievements — DONE (`9356043` + E7 `internal/player/quest`): 21 quests, gated drops, SQLite (`e2e/m11`).
 - M12 trade/craft/enchant — DONE (`c0d76ae` + E1 `internal/controller`): sessions, recipes, shards (`e2e/m12`).
-- M13 commands — DONE (`a42748a` + E8 `internal/controller`): full `commands.ts` port (`e2e/m13`).
+- M13 commands — DONE (`a42748a` + E8 `internal/controller`, + admin-cheat batch `internal/controller/progression.go`: all 117 `commands.ts` cases incl. addability/addexp/setlevel/max/resetskills/setability/setquickslot/resetabilities/setpet/setrank/openbank/poison/poisonarea/attackrange/debug/resetregions/ipban) (`e2e/m13`).
+- Explicit non-goals (no portable surface): hub account endpoints (`leaderboards`/`isOnline`/`requestReset`/`resetPassword` — Mongo user-account backed, Go login is name-only), admin web panel, NATS transport, background-asset streaming, cross-region atomic trades. Sentry opt-in, Discord hook, and profanity filter remain open optionals.
 - P-A abilities+status — DONE (`internal/abilities`, `internal/status`, quest rewards grant; `e2e/abilities`).
 - P-B pets — DONE (`internal/pets` + `internal/entity/pet`; `e2e/pets`).
 - P-C friends/guilds/hub — DONE (`internal/friends`, `internal/guilds`, `internal/hub` all-in-one Router; `e2e/social`).
