@@ -214,6 +214,9 @@ func applyHandoffRequest(req hub.HandoffRequest) hub.HandoffAck {
 	pstateMu.Lock()
 	pstates[req.Player] = persistToM5(st)
 	pstateMu.Unlock()
+	// Statistics counters install from the transferred snapshot (the
+	// snapshot is authoritative — writePlayer below persists it).
+	statsInstall(req.Player, st.Stats)
 	dbMu.Lock()
 	if inst := persistToM5(st); inst != nil {
 		writePlayer(req.Player, inst)
@@ -279,7 +282,14 @@ func handoffSend(c *playerConn, target string, region int) {
 		m6Notify(c, "handoff: no player state")
 		return
 	}
-	stateRaw, err := json.Marshal(m5ToPersist(st))
+	// Statistics counters ride the transfer snapshot (writePlayer parity).
+	ps := m5ToPersist(st)
+	snap := statsCopyOf(username)
+	ps.Stats = persist.StatsBlob{
+		MobKills: snap.MobKills, MobExamines: snap.MobExamines,
+		Resources: snap.Resources, Drops: snap.Drops,
+	}
+	stateRaw, err := json.Marshal(ps)
 	if err != nil {
 		m6Notify(c, "handoff: snapshot failed")
 		return

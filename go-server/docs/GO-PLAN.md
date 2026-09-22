@@ -61,7 +61,7 @@ In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/ch
 - M2 movement+anticheat — DONE (`ed1b2a0` + E9b `internal/world` verify funcs): speed check, teleport-back, noclip bypass, `List.Positions`.
 - M3 combat+projectiles+GCD — DONE (`955ca3e`): formulas (`internal/meta`), `Combat/Heal/Effect`, projectile flight, aggro/leash/respawn, DoT ticks (`internal/status`).
 - M4 resources+gathering — DONE (`5494a20`): all tables, tool tiers, deplete→respawn, `Animation` + `Resource` sync.
-- M5 drops/loot+XP/skills — DONE (`29e2cb5` + E9a `internal/persist`): drop tables → lootbag/chest, pickup, XP curves, SQLite persist.
+- M5 drops/loot+XP/skills — DONE (`29e2cb5` + E9a `internal/persist`): drop tables → lootbag/chest, pickup, XP curves, SQLite persist. Plus audit batch: C→S Examine (mob/item descriptions + `NO_IDEA`), `internal/player/stats` milestone achievements (skill/examiner, persisted JSON blob, schema v2), LootBag Open/Take lifecycle (Step opens, Target opens + take-all, per-index Take).
 - M6 stores/bank/NPC/equipment — DONE (`db20f81` + E6 `internal/controller`): buy/sell/select + 20s refresh, bank, containers, equip (`e2e/m6`).
 - M7 chat/commands — DONE (`f1b4246` + E3 `internal/player/chat`): region/global/PM, rank gates (`e2e/m7`).
 - M8 minigames — DONE (`9678f04` + E2 `internal/minigame` Manager): coursing/teamwar lobby/queue/score (`e2e/m8`).

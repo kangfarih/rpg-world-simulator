@@ -70,6 +70,20 @@ type Skill struct {
 	XP    int
 }
 
+// StatsBlob is one player's gameplay statistics snapshot (counters ported
+// from statistics.ts: mobKills/mobExamines/resources/drops). Stored as a
+// JSON blob in the additive `statistics` table (one row per player): a blob
+// keeps the counters schemaless like the TS StatisticsData object, so future
+// counter additions need no DDL. Time fields (creationTime/totalTimePlayed/
+// averageTimePlayed/lastLogin/loginCount) are intentionally not persisted —
+// see internal/player/stats for the skip rationale.
+type StatsBlob struct {
+	MobKills    map[string]int `json:"mobKills,omitempty"`
+	MobExamines []string       `json:"mobExamines,omitempty"`
+	Resources   map[string]int `json:"resources,omitempty"`
+	Drops       map[string]int `json:"drops,omitempty"`
+}
+
 // State is the persist snapshot for one player: position/level/vitals plus
 // the inventory, bank and equipment slot lists and the skills map.
 // Equipment is dense by type index (holes are zero Slots); LoadPlayer sizes
@@ -84,6 +98,7 @@ type State struct {
 	Bank   []Slot
 	Equip  []Slot
 	Skills map[int]Skill
+	Stats  StatsBlob
 }
 
 // Snapshot deep-copies a State (nil-safe for the Skills map).
@@ -157,6 +172,7 @@ func (s *Store) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS bank(player TEXT, slot INT, item TEXT, count INT, PRIMARY KEY(player, slot))`,
 		`CREATE TABLE IF NOT EXISTS equipment(player TEXT, type INT, item TEXT, count INT, PRIMARY KEY(player, type))`,
 		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
+		`CREATE TABLE IF NOT EXISTS statistics(player TEXT PRIMARY KEY, data TEXT)`,
 		`CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil {
@@ -295,8 +311,60 @@ func (s *Store) WritePlayer(key string, st State) error {
 			return err
 		}
 	}
+	if err := s.writeStatsLocked(key, st.Stats); err != nil {
+		return err
+	}
 	log.Printf("m5: saved %s (pos %d,%d level %d inv %d skills %d)", key, st.X, st.Y, st.Level, len(st.Inv), len(st.Skills))
 	return nil
+}
+
+// WriteStats upserts one player's statistics blob (JSON; empty blobs still
+// write a row so load-vs-never-played stays unambiguous).
+func (s *Store) WriteStats(key string, blob StatsBlob) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("m5: save stats %s: nil store", key)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeStatsLocked(key, blob)
+}
+
+// writeStatsLocked is WriteStats with the store lock already held
+// (WritePlayer calls it mid-write; Go mutexes are not reentrant).
+func (s *Store) writeStatsLocked(key string, blob StatsBlob) error {
+	raw, _ := json.Marshal(blob)
+	if _, err := s.db.Exec(
+		`INSERT INTO statistics(player,data) VALUES(?,?) `+
+			`ON CONFLICT(player) DO UPDATE SET data=excluded.data`,
+		key, string(raw)); err != nil {
+		log.Printf("m5: save stats %s: %v", key, err)
+		return err
+	}
+	return nil
+}
+
+// LoadStats reads one player's statistics blob (false when no row yet).
+func (s *Store) LoadStats(key string) (StatsBlob, bool) {
+	if s == nil || s.db == nil || key == "" {
+		return StatsBlob{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadStatsLocked(key)
+}
+
+// loadStatsLocked is LoadStats with the store lock already held
+// (LoadPlayer calls it mid-read).
+func (s *Store) loadStatsLocked(key string) (StatsBlob, bool) {
+	var raw string
+	if err := s.db.QueryRow(`SELECT data FROM statistics WHERE player=?`, key).Scan(&raw); err != nil {
+		return StatsBlob{}, false
+	}
+	var blob StatsBlob
+	if err := json.Unmarshal([]byte(raw), &blob); err != nil {
+		return StatsBlob{}, false
+	}
+	return blob, true
 }
 
 // LoadPlayer reads one player's full row set back (players + inventory +
@@ -386,6 +454,11 @@ func (s *Store) LoadPlayer(key string) (State, bool) {
 			continue
 		}
 		st.Skills[id] = Skill{Level: lv, XP: xp}
+	}
+	// Statistics blob (missing row = fresh counters, statistics table is
+	// additive — pre-v2 DBs simply have no rows yet).
+	if blob, ok := s.loadStatsLocked(key); ok {
+		st.Stats = blob
 	}
 	return st, true
 }

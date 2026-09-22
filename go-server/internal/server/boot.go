@@ -28,6 +28,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"rpg-world-server/internal/app"
+	"rpg-world-server/internal/entity"
 	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/sim"
@@ -1897,6 +1898,15 @@ func handleTarget(c *playerConn, frame clientFrame) {
 	log.Printf("target opcode=%d instance=%s", opcode, instance)
 	// M5: Target on a loot entity picks it up (in addition to Step).
 	if m5IsLoot(instance) {
+		// Bags additionally emit the Open frame (lootbag.open parity):
+		// the stock client never Targets bags (getTargetType -> None), so
+		// this only fires for scripted clients — take-all stays because
+		// the combat harness requires it.
+		if entity.IsBag(instance) {
+			if l, ok := entity.FindLoot(instance); ok && !lootBagOwnerDenied(c, l.Owner) {
+				sendLootBagOpen(c, instance)
+			}
+		}
 		m5Pickup(c, instance)
 		return
 	}
@@ -2366,9 +2376,12 @@ func hitResource(attacker, instance string) {
 	}
 	// M5: table experience lands on the real gathering skill.
 	m5GatherXP(attacker, skill, info.Experience)
+	// Statistics: successful exhausts count toward gather milestones
+	// (resourceskill.ts:121 handleSkill parity — after item + XP land).
+	attackerConn, _ := worldcore.Find[*playerConn](attacker)
+	statsHandleSkill(attackerConn, skill)
 	// M11: quest resource stages fire on exhaust (quest.ts resourceCallback
 	// from resourceskill.ts:131 — after the item + XP land).
-	attackerConn, _ := worldcore.Find[*playerConn](attacker)
 	m11Resource(attackerConn, skill, desc.Key)
 	resMu.Lock()
 	st.depleted = true
@@ -2904,6 +2917,10 @@ func handleConn(conn *websocket.Conn) {
 				m6HandleContainer(c, frame)
 			case PacketCombat: // C Combat {instance,target} -> hero swing on killables
 				handleCombatReq(c, frame)
+			case PacketExamine: // C Examine [instance] -> description notify (mob/item)
+				handleExamineReq(c, frame)
+			case PacketLootBag: // C LootBag {Take,index} -> single-stack take
+				handleLootBagReq(c, frame)
 			case PacketAnimation: // C Animation {resourceInstance} -> chop on that oak
 				handleAnimationReq(frame)
 			default:

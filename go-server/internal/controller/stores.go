@@ -167,6 +167,7 @@ func economyDataPath(name string) string {
 // ItemInfo mirrors m6ItemInfo: items.json catalogue entry.
 type ItemInfo struct {
 	Name         string
+	Description  string // items.json `description` (examine parity)
 	Price        int
 	Stackable    bool
 	MaxStackSize int
@@ -193,6 +194,7 @@ func LoadItems() error {
 		}
 		var items map[string]struct {
 			Name         string `json:"name"`
+			Description  string `json:"description"`
 			Price        int    `json:"price"`
 			Stackable    bool   `json:"stackable"`
 			MaxStackSize int    `json:"maxStackSize"`
@@ -211,7 +213,7 @@ func LoadItems() error {
 			if max <= 0 {
 				max = protocol.ModulesMaxStack
 			}
-			econItems[k] = &ItemInfo{Name: v.Name, Price: v.Price, Stackable: v.Stackable, MaxStackSize: max,
+			econItems[k] = &ItemInfo{Name: v.Name, Description: v.Description, Price: v.Price, Stackable: v.Stackable, MaxStackSize: max,
 				Type: v.Type, Skill: v.Skill, Level: v.Level, Poisonous: v.Poisonous, Undroppable: v.Undroppable}
 		}
 		log.Printf("m6: items=%d", len(econItems))

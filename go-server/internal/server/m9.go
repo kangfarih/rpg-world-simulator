@@ -273,6 +273,9 @@ func (gameWorldAdapter) SpawnLootItem(i entity.LootItem) {
 func (gameWorldAdapter) QuestKill(killerInstance, mobKey string) {
 	killer, _ := worldcore.Find[*playerConn](killerInstance)
 	m11Kill(killer, mobKey) // nil-safe (m11Kill guards nil)
+	// Statistics kill counter rides the same death signal (handler.ts:765
+	// addMobKill parity — counter only, no achievement).
+	statsRecordKill(killer, mobKey) // nil-safe
 }
 
 func (gameWorldAdapter) Notify(instance, msg string) {

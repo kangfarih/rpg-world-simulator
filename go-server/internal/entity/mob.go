@@ -101,10 +101,39 @@ const (
 	MaxLevel = 120
 )
 
+// DescText is a mobs.json description: a plain string, or (eye only) a
+// string[] from which Node picks one at random (mob.getDescription).
+type DescText []string
+
+// UnmarshalJSON accepts either a string or an array of strings.
+func (d *DescText) UnmarshalJSON(raw []byte) error {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		*d = DescText{s}
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return err
+	}
+	*d = DescText(arr)
+	return nil
+}
+
+// Pick returns one description (uniform, mob.getDescription parity).
+// ok=false when the profile carries no description.
+func (d DescText) Pick() (string, bool) {
+	if len(d) == 0 {
+		return "", false
+	}
+	return d[rand.Intn(len(d))], true
+}
+
 // MobProfile mirrors the mobs.json entry shape Node Mob.loadData consumes.
 // JSON tags are identical to the old root m9MobProfile (file shape frozen).
 type MobProfile struct {
 	Name          string     `json:"name"`
+	Description   DescText   `json:"description"`
 	Level         int        `json:"level"`
 	HitPoints     int        `json:"hitPoints"`
 	AggroRange    int        `json:"aggroRange"`

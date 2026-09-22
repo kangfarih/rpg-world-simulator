@@ -384,18 +384,28 @@ func m5Pickup(c *playerConn, inst string) bool {
 		log.Printf("m5: %s takes %s from %d tiles (lenient pickup)", c.Instance, inst, dx+dy)
 	}
 	for _, it := range l.Items {
+		if it.Key == "" {
+			continue // taken lootbag slot (hole — single-take path)
+		}
 		idx := m5AddItem(c.Username, it.Key, it.Count)
 		_ = gnet.Send(c.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
 			Slot: &slotData{Index: idx, Key: it.Key, Count: it.Count, Enchantments: map[string]any{}},
 		}))
+		// Statistics: owner pickups count as drops (player.ts:1268 parity —
+		// only when the loot owner matches the picker).
+		if l.Owner != "" && l.Owner == c.Username {
+			statsAddDrop(c, it.Key, it.Count)
+		}
 	}
 	markDirty(c.Username)
 	m5DestroyLoot(inst, "picked up by "+c.Instance)
 	return true
 }
 
-// m5PickupAt steps onto loot: any loot on the player's tile is taken.
+// m5PickupAt steps onto loot: any loot on the player's tile is taken —
+// single Items instantly, bags via the Open menu (lootbag.ts parity:
+// handleMovementStop opens bags instead of taking them).
 func m5PickupAt(c *playerConn) {
 	m5PickupAtTile(c, c.Sess.PlayerX, c.Sess.PlayerY)
 }
@@ -403,6 +413,10 @@ func m5PickupAt(c *playerConn) {
 // m5PickupAtTile takes loot lying on (x,y) (Step destination path).
 func m5PickupAtTile(c *playerConn, x, y int) {
 	if inst, ok := entity.FindLootAt(x, y); ok {
+		if entity.IsBag(inst) {
+			openLootBagFor(c, inst)
+			return
+		}
 		m5Pickup(c, inst)
 	}
 }
@@ -660,7 +674,16 @@ func writePlayer(key string, st *m5State) {
 	if persistStore == nil {
 		return
 	}
-	_ = persistStore.WritePlayer(key, m5ToPersist(st))
+	// Statistics counters ride the same row write as a JSON blob in the
+	// additive `statistics` table (key-aware call site: the converters stay
+	// key-agnostic so handoff.go keeps compiling untouched).
+	ps := m5ToPersist(st)
+	snap := statsCopyOf(key)
+	ps.Stats = persist.StatsBlob{
+		MobKills: snap.MobKills, MobExamines: snap.MobExamines,
+		Resources: snap.Resources, Drops: snap.Drops,
+	}
+	_ = persistStore.WritePlayer(key, ps)
 }
 
 func flushDirty() {
@@ -708,6 +731,9 @@ func m5Load(key string) (*m5State, bool) {
 		return nil, false
 	}
 	st := persistToM5(ps)
+	// Statistics counters restore into the stats registry (statistics.load
+	// parity for the gameplay fields).
+	statsInstall(key, ps.Stats)
 	pstateMu.Lock()
 	pstates[key] = st
 	pstateMu.Unlock()

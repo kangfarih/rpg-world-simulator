@@ -590,15 +590,46 @@ func AchProgress(c Conn, d Deps, st *PlayerState, key string) {
 	}
 	if stage >= def.StageCount {
 		log.Printf("m11: %s finished achievement %s", st.Username, key)
-		// Achievement ability reward (achievement.ts finishCallback ->
-		// abilities.add(rewardAbility, rewardAbilityLevel || 1)).
-		if def.Raw.RewardAbility != "" {
-			d.Abilities.GrantAbility(c, st.Username, def.Raw.RewardAbility, def.Raw.RewardAbilityLevel)
-		}
-		if c != nil && def.Raw.RewardExperience > 0 {
-			if id, found := skillByName(def.Raw.RewardSkill); found {
-				d.Store.AddXP(c, st.Username, id, def.Raw.RewardExperience)
-			}
+		grantAchRewards(c, d, st, def)
+	}
+}
+
+// Finish ports achievement.finish(): jump straight to the finish stage
+// (setStage(stageCount)) with a single progress callback + the finish popup
+// + rewards. Discovered-stage popups are skipped when discovery and finish
+// coincide (the setStage else-if), so milestone achievements (all
+// single-stage) must finish through here rather than repeated AchProgress
+// calls, which would emit a spurious "Discovered" popup. No-op when unknown
+// or already finished (isFinished guard parity).
+func Finish(c Conn, d Deps, st *PlayerState, key string) {
+	def := Achs[key]
+	if def == nil || st.Achs[key] >= def.StageCount {
+		return
+	}
+	st.Achs[key] = def.StageCount
+	d.Store.MarkDirty(st.Username)
+	if c != nil {
+		SendAchievementProgress(c, d, key, def.StageCount)
+		SendPopup(c, d, "Achievement Completed!",
+			"@green@You have completed the achievement @crimson@"+def.Raw.Name+"@green@!", "#33cc33")
+	}
+	log.Printf("m11: %s finished achievement %s", st.Username, key)
+	grantAchRewards(c, d, st, def)
+}
+
+// grantAchRewards runs the finish-stage rewards shared by AchProgress and
+// Finish (achievement.ts finishCallback: ability + skill XP; rewardItem
+// grants are not modeled — no milestone/examiner achievement carries one,
+// verified against achievements.json).
+func grantAchRewards(c Conn, d Deps, st *PlayerState, def *AchDef) {
+	// Achievement ability reward (achievement.ts finishCallback ->
+	// abilities.add(rewardAbility, rewardAbilityLevel || 1)).
+	if def.Raw.RewardAbility != "" {
+		d.Abilities.GrantAbility(c, st.Username, def.Raw.RewardAbility, def.Raw.RewardAbilityLevel)
+	}
+	if c != nil && def.Raw.RewardExperience > 0 {
+		if id, found := skillByName(def.Raw.RewardSkill); found {
+			d.Store.AddXP(c, st.Username, id, def.Raw.RewardExperience)
 		}
 	}
 }

@@ -349,6 +349,19 @@ func m11AchProgress(c *playerConn, st *m11PlayerState, key string) {
 	quest.AchProgress(m11qc(c), m11deps(), st.PlayerState, key)
 }
 
+// m11FinishAchievement finishes an achievement outright (achievement.finish
+// parity: jump to the finish stage with a single progress callback, no
+// discovery popup). Used by the statistics milestone paths (examiner +
+// gather skills), which finish single-stage achievements directly like TS.
+// Unknown keys and missing connections are ignored (TS
+// `achievements.get(key)?.finish()` parity).
+func m11FinishAchievement(c *playerConn, key string) {
+	if c == nil || c.Username == "" || m11A[key] == nil {
+		return
+	}
+	quest.Finish(m11qc(c), m11deps(), quest.StateFor(c.Username), key)
+}
+
 // m11EnsureTables creates the quest/achievement tables (M5 DDL order).
 func m11EnsureTables() {
 	quest.EnsureTables(m11deps())

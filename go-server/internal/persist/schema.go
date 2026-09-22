@@ -28,7 +28,13 @@ const SchemaVersionKey = "schema_version"
 
 // CurrentSchemaVersion is the schema this binary understands. Bump it in
 // the same commit that adds the expand-only DDL to EnsureSchema.
-const CurrentSchemaVersion = 1
+//
+// v2 adds the `statistics` table (player statistics JSON blob, see
+// persist.go StatsBlob). Expand-only: a new table no older query touches,
+// so v1 binaries keep booting against a v2 DB for every table they know
+// (they only refuse via the version gate below, which is the intended
+// roll-forward-only direction).
+const CurrentSchemaVersion = 2
 
 // checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
 // row) are stamped with the current version; older versions are re-stamped

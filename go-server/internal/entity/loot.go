@@ -452,8 +452,14 @@ func DestroyLoot(inst, why string) {
 	if !ok {
 		return
 	}
+	clearBagOpeners(inst)
 	if lootDeps.World != nil {
 		lootDeps.World.RemoveEntity(inst)
+		if l.Bag {
+			// LootBag.destroy() parity: close() broadcasts Close so every
+			// client with the menu open hides it (then the entity despawns).
+			lootDeps.World.Broadcast(protocol.PktOp(protocol.PacketLootBag, protocol.LootBagClose, map[string]any{}))
+		}
 		lootDeps.World.Broadcast(protocol.Pkt(protocol.PacketDespawn, protocol.DespawnData{Instance: inst}))
 	}
 	log.Printf("m5: loot %s destroyed (%s)", inst, why)
@@ -471,12 +477,129 @@ func RegisterLoot(inst, key string, count, x, y int, owner string) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// LootBag Open/Take lifecycle (objects/lootbag.ts parity).
+//
+// TS flow: stopping on a bag opens it (activeLootBag + LootBag Open
+// {items}); the client menu sends LootBag {Take, index} per item; take()
+// validates opener + ownership + distance, transfers one stack, and either
+// destroys the emptied bag (close + despawn) or broadcasts Take {index} so
+// open menus drop the row. Slots are stable: take() deletes the container
+// entry (a hole), surviving slots keep their indices — mirrored here with
+// Drop{Key:""} tombstones, which the take-all path skips.
+// ---------------------------------------------------------------------------
+
+// BagSlot is one live lootbag slot for the Open payload (SlotData parity).
+type BagSlot struct {
+	Index int
+	Key   string
+	Count int
+}
+
+var (
+	bagMu      sync.Mutex
+	bagOpeners = map[string]string{} // player instance -> open bag instance
+)
+
+// OpenBag records player as the opener of a live bag
+// (player.activeLootBag parity). Reports false when inst is not a bag.
+func OpenBag(player, inst string) bool {
+	lootMu.Lock()
+	l, ok := loots[inst]
+	isBag := ok && l.Bag
+	lootMu.Unlock()
+	if !isBag {
+		return false
+	}
+	bagMu.Lock()
+	bagOpeners[player] = inst
+	bagMu.Unlock()
+	return true
+}
+
+// ActiveBag reports the bag a player currently has open.
+func ActiveBag(player string) (string, bool) {
+	bagMu.Lock()
+	defer bagMu.Unlock()
+	inst, ok := bagOpeners[player]
+	return inst, ok
+}
+
+// ClearBagOpener forgets a player's open bag (open another / disconnect).
+func ClearBagOpener(player string) {
+	bagMu.Lock()
+	delete(bagOpeners, player)
+	bagMu.Unlock()
+}
+
+// clearBagOpeners forgets every opener of a destroyed bag.
+func clearBagOpeners(inst string) {
+	bagMu.Lock()
+	for player, open := range bagOpeners {
+		if open == inst {
+			delete(bagOpeners, player)
+		}
+	}
+	bagMu.Unlock()
+}
+
+// BagSlots lists the live slots of a bag with stable indices (getItems
+// parity: taken slots are holes, survivors keep their indices).
+func BagSlots(inst string) ([]BagSlot, bool) {
+	lootMu.Lock()
+	defer lootMu.Unlock()
+	l, ok := loots[inst]
+	if !ok || !l.Bag {
+		return nil, false
+	}
+	var out []BagSlot
+	for i, d := range l.Items {
+		if d.Key == "" {
+			continue // taken slot (hole)
+		}
+		out = append(out, BagSlot{Index: i, Key: d.Key, Count: d.Count})
+	}
+	return out, true
+}
+
+// TakeBagItem removes slot index from a bag (lootbag.take parity): the
+// slot becomes a hole (tombstone, stable surviving indices). Returns the
+// taken drop and the remaining live count. ok=false when the bag or slot
+// is gone (already-taken slots included).
+func TakeBagItem(inst string, index int) (taken Drop, remaining int, ok bool) {
+	lootMu.Lock()
+	defer lootMu.Unlock()
+	l, found := loots[inst]
+	if !found || !l.Bag || index < 0 || index >= len(l.Items) {
+		return Drop{}, 0, false
+	}
+	d := l.Items[index]
+	if d.Key == "" {
+		return Drop{}, 0, false
+	}
+	l.Items[index] = Drop{}
+	for _, r := range l.Items {
+		if r.Key != "" {
+			remaining++
+		}
+	}
+	return d, remaining, true
+}
+
 // IsLoot reports whether id is a live loot entity.
 func IsLoot(id string) bool {
 	lootMu.Lock()
 	defer lootMu.Unlock()
 	_, ok := loots[id]
 	return ok
+}
+
+// IsBag reports whether id is a live lootbag (vs a single Item).
+func IsBag(id string) bool {
+	lootMu.Lock()
+	defer lootMu.Unlock()
+	l, ok := loots[id]
+	return ok && l.Bag
 }
 
 // FindLoot returns a detached copy of the loot record (pickup path).

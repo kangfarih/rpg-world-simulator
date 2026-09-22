@@ -2,6 +2,7 @@ package persist
 
 import (
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -14,9 +15,10 @@ func TestSchemaVersionStamped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	want := strconv.Itoa(CurrentSchemaVersion)
 	v, ok := s.GetMeta(SchemaVersionKey)
-	if !ok || v != "1" {
-		t.Fatalf("schema_version = %q, %v; want \"1\", true", v, ok)
+	if !ok || v != want {
+		t.Fatalf("schema_version = %q, %v; want %q, true", v, ok, want)
 	}
 	if err := s.Close(nil); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -26,8 +28,8 @@ func TestSchemaVersionStamped(t *testing.T) {
 		t.Fatalf("re-Open stamped DB: %v", err)
 	}
 	defer s2.Close(nil)
-	if v, ok := s2.GetMeta(SchemaVersionKey); !ok || v != "1" {
-		t.Fatalf("schema_version after reopen = %q, %v; want \"1\", true", v, ok)
+	if v, ok := s2.GetMeta(SchemaVersionKey); !ok || v != want {
+		t.Fatalf("schema_version after reopen = %q, %v; want %q, true", v, ok, want)
 	}
 }
 

@@ -598,6 +598,16 @@ const (
 	SkillUpdate = 1
 )
 
+// LootBag opcodes (Opcodes.LootBag in opcodes.ts:227): Open0 Take1 Close2.
+// S->C frames carry the opcode as its own element ([56,opcode,data],
+// packet.ts serialize); C->S frames send it inside data
+// ([56,{opcode,index}], socket.send parity).
+const (
+	LootBagOpen  = 0
+	LootBagTake  = 1
+	LootBagClose = 2
+)
+
 // slotData mirrors SlotData (common/types/slot.d.ts) as sent in Container
 // Add/Batch frames; containerBatch mirrors SerializedContainer.
 type slotData struct {

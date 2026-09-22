@@ -241,6 +241,12 @@ const (
 	SkillUpdate = protocol.SkillUpdate
 )
 
+const (
+	LootBagOpen  = protocol.LootBagOpen
+	LootBagTake  = protocol.LootBagTake
+	LootBagClose = protocol.LootBagClose
+)
+
 type (
 	Enchantment        = protocol.Enchantment
 	Enchantments       = protocol.Enchantments
