@@ -16,7 +16,9 @@
 package main
 
 import (
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/player/quest"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // Type aliases so existing names keep resolving to the moved types.
@@ -101,7 +103,8 @@ func m11conn(c quest.Conn) *playerConn {
 	if c == nil {
 		return nil
 	}
-	return connByInstance(c.InstanceID())
+	pc, _ := worldcore.Find[*playerConn](c.InstanceID())
+	return pc
 }
 
 // ---------------------------------------------------------------------------
@@ -148,15 +151,15 @@ func (m11store) MarkDirty(username string) { markDirty(username) }
 type m11bus struct{}
 
 func (m11bus) SendTo(instance string, frames ...[]any) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	_ = send(c.conn, frames...)
+	_ = gnet.Send(c.Conn, frames...)
 }
 
 func (m11bus) Notify(instance string, message string) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}

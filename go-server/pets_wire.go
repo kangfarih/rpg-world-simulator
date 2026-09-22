@@ -77,7 +77,9 @@ import (
 	"time"
 
 	"rpg-world-server/internal/entity"
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/pets"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // petEntityType is Modules.EntityType.Pet (7). internal/protocol defines no
@@ -142,36 +144,34 @@ func petFollowFrame(instance, owner string) []any {
 type petWorld struct{}
 
 func (petWorld) OwnerPos(owner string) (int, int, bool) {
-	return entityPos(owner)
+	return worldcore.EntityPos(owner)
 }
 
 func (petWorld) SpawnPet(rec entity.Record) {
-	setEntityPos(rec.Instance, rec.X, rec.Y)
-	broadcast(pkt(PacketSpawn, petPayload(&rec)))
-	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+	worldcore.SetEntityPos(rec.Instance, rec.X, rec.Y)
+	worldcore.Broadcast(pkt(PacketSpawn, petPayload(&rec)))
+	worldcore.Broadcast(petFollowFrame(rec.Instance, rec.Owner))
 }
 
 func (petWorld) MovePet(rec entity.Record) {
-	setEntityPos(rec.Instance, rec.X, rec.Y)
-	broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
+	worldcore.SetEntityPos(rec.Instance, rec.X, rec.Y)
+	worldcore.Broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
 		Instance: rec.Instance, X: intp(rec.X), Y: intp(rec.Y),
 	}))
-	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+	worldcore.Broadcast(petFollowFrame(rec.Instance, rec.Owner))
 }
 
 func (petWorld) TeleportPet(rec entity.Record) {
-	setEntityPos(rec.Instance, rec.X, rec.Y)
-	broadcast(pkt(PacketDespawn, despawnData{Instance: rec.Instance}))
-	broadcast(pkt(PacketSpawn, petPayload(&rec)))
-	broadcast(petFollowFrame(rec.Instance, rec.Owner))
+	worldcore.SetEntityPos(rec.Instance, rec.X, rec.Y)
+	worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: rec.Instance}))
+	worldcore.Broadcast(pkt(PacketSpawn, petPayload(&rec)))
+	worldcore.Broadcast(petFollowFrame(rec.Instance, rec.Owner))
 	log.Printf("pets: %s teleported to owner %s (%d,%d)", rec.Instance, rec.Owner, rec.X, rec.Y)
 }
 
 func (petWorld) DespawnPet(instance string) {
-	entitiesMu.Lock()
-	delete(entities, instance)
-	entitiesMu.Unlock()
-	broadcast(pkt(PacketDespawn, despawnData{Instance: instance}))
+	worldcore.RemoveEntity(instance)
+	worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: instance}))
 }
 
 func (petWorld) IsMob(target string) bool {
@@ -183,8 +183,8 @@ func (petWorld) HitMob(petInstance, ownerInstance, target string, dmg int) {
 	if m == nil {
 		return
 	}
-	broadcast(pkt(PacketAnimation, animationData{Instance: petInstance, Action: ActionAttack}))
-	broadcast(pktOp(PacketCombat, CombatHit, combatData{
+	worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: petInstance, Action: ActionAttack}))
+	worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
 		Instance: petInstance, Target: target,
 		Hit: HitData{Type: HitsNormal, Damage: dmg},
 	}))
@@ -211,14 +211,8 @@ func (petWorld) DummyTarget() string {
 // (retaliate/loot/quest flow). Nil when the owner is gone; m9PlayerHit is
 // nil-safe (skips credit, still applies broadcast-side damage already sent).
 func petConnByInstance(instance string) *playerConn {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	for _, c := range players {
-		if c.instance == instance {
-			return c
-		}
-	}
-	return nil
+	c, _ := worldcore.Find[*playerConn](instance)
+	return c
 }
 
 // petGrant spawns a companion for the owner's connection (player.ts setPet:
@@ -229,7 +223,7 @@ func petGrant(c *playerConn, mobKey, itemKey string) *petRecord {
 		return nil
 	}
 	now := time.Now().UnixMilli()
-	rec, already := petRegistry.Grant(c.instance, c.sess.playerX, c.sess.playerY, mobKey, itemKey, now)
+	rec, already := petRegistry.Grant(c.Instance, c.Sess.PlayerX, c.Sess.PlayerY, mobKey, itemKey, now)
 	if already {
 		m6Notify(c, "misc:ALREADY_HAVE_PET")
 		return nil
@@ -238,7 +232,7 @@ func petGrant(c *playerConn, mobKey, itemKey string) *petRecord {
 		return nil
 	}
 	petWorld{}.SpawnPet(*rec)
-	log.Printf("pets: %s granted %s (%s) at %d,%d", c.instance, rec.Instance, mobKey, rec.X, rec.Y)
+	log.Printf("pets: %s granted %s (%s) at %d,%d", c.Instance, rec.Instance, mobKey, rec.X, rec.Y)
 	return rec
 }
 
@@ -271,7 +265,7 @@ func petMirrorSwing(c *playerConn, target string) {
 	if c == nil || target == "" {
 		return
 	}
-	petRegistry.Mirror(petWorld{}, c.instance, target)
+	petRegistry.Mirror(petWorld{}, c.Instance, target)
 }
 
 // petForgetPlayer despawns + drops pet state on disconnect (abForgetPlayer /
@@ -280,12 +274,12 @@ func petForgetPlayer(c *playerConn) {
 	if c == nil {
 		return
 	}
-	r, ok := petRegistry.RemoveByOwner(c.instance)
+	r, ok := petRegistry.RemoveByOwner(c.Instance)
 	if !ok {
 		return
 	}
 	petWorld{}.DespawnPet(r.Instance)
-	log.Printf("pets: %s forgotten on disconnect of %s", r.Instance, c.instance)
+	log.Printf("pets: %s forgotten on disconnect of %s", r.Instance, c.Instance)
 }
 
 // petHandlePacket routes C->S Pet frames [58,{opcode}] (incoming.ts handlePet):
@@ -301,29 +295,29 @@ func petHandlePacket(c *playerConn, frame clientFrame) {
 	if err := json.Unmarshal(frame[1], &d); err != nil || d.Opcode == nil || *d.Opcode != petPickup {
 		return
 	}
-	r, ok := petRegistry.ByOwner(c.instance)
+	r, ok := petRegistry.ByOwner(c.Instance)
 	if !ok {
 		return
 	}
-	if len(m5StateFor(c.username).Inv) >= ModulesInventorySize {
+	if len(m5StateFor(c.Username).Inv) >= ModulesInventorySize {
 		m6Notify(c, "misc:NO_SPACE_PET")
 		return
 	}
-	idx := m5AddItem(c.username, r.ItemKey, 1)
-	_ = send(c.conn, pktOp(PacketContainer, ContainerAdd, containerData{
+	idx := m5AddItem(c.Username, r.ItemKey, 1)
+	_ = gnet.Send(c.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 		Type: ContainerTypeInventory,
 		Slot: &slotData{Index: idx, Key: r.ItemKey, Count: 1, Enchantments: map[string]any{}},
 	}))
-	markDirty(c.username)
-	_, _ = petRegistry.RemoveByOwner(c.instance)
+	markDirty(c.Username)
+	_, _ = petRegistry.RemoveByOwner(c.Instance)
 	petWorld{}.DespawnPet(r.Instance)
-	log.Printf("pets: %s picked up by %s (+%s)", r.Instance, c.instance, r.ItemKey)
+	log.Printf("pets: %s picked up by %s (+%s)", r.Instance, c.Instance, r.ItemKey)
 }
 
 // petDropKey peeks the inventory slot for a pet item (handler.ts
 // item.isPetItem() parity via the items.json table in internal/entity).
 func petDropKey(c *playerConn, index int) (mob, item string, ok bool) {
-	st := m5StateFor(c.username)
+	st := m5StateFor(c.Username)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	if index < 0 || index >= len(st.Inv) {
@@ -364,13 +358,13 @@ func petTestHandler(c *playerConn, data []byte) {
 			m6Notify(c, fmt.Sprintf("pet:grant %s mob=%s at=%d,%d", r.Instance, mob, r.X, r.Y))
 		}
 	case "state":
-		r, ok := petRegistry.ByOwner(c.instance)
+		r, ok := petRegistry.ByOwner(c.Instance)
 		if !ok {
 			m6Notify(c, "pet:state none")
 			return
 		}
 		now := time.Now().UnixMilli()
-		ox, oy, ok := entityPos(r.Owner)
+		ox, oy, ok := worldcore.EntityPos(r.Owner)
 		dist := -1
 		if ok {
 			dist = pets.Distance(ox, oy, r.X, r.Y)
@@ -382,7 +376,7 @@ func petTestHandler(c *playerConn, data []byte) {
 			// never-elapsing lifespan.
 			pets.IsHungry(now, r.FedMs), pets.IsExpired(now, r.BornMs, 1<<62)))
 	case "remove":
-		r, ok := petRegistry.RemoveByOwner(c.instance)
+		r, ok := petRegistry.RemoveByOwner(c.Instance)
 		if !ok {
 			m6Notify(c, "pet:state none")
 			return

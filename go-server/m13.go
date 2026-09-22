@@ -22,9 +22,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"rpg-world-server/internal/controller"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // TS parity constants (aliases to the moved commands.ts values).
@@ -66,10 +66,10 @@ type m13Flags = controller.CommandFlags
 func (c *playerConn) Rank() int { return chatStateFor(c).rank }
 
 // MovementSpeed is the session ms-per-tile override.
-func (c *playerConn) MovementSpeed() int { return c.sess.movementSpeed }
+func (c *playerConn) MovementSpeed() int { return c.Sess.MovementSpeed }
 
 // SetMovementSpeed applies the /ms override live (checkSpeed reads it).
-func (c *playerConn) SetMovementSpeed(v int) { c.sess.movementSpeed = v }
+func (c *playerConn) SetMovementSpeed(v int) { c.Sess.MovementSpeed = v }
 
 // m13conn unwraps a controller.CommandConn back to the root conn (subsystem
 // calls need it); falls back to an instance lookup for foreign impls.
@@ -80,7 +80,8 @@ func m13conn(c controller.CommandConn) *playerConn {
 	if c == nil {
 		return nil
 	}
-	return connByInstance(c.InstanceID())
+	pc, _ := worldcore.Find[*playerConn](c.InstanceID())
+	return pc
 }
 
 // ---------------------------------------------------------------------------
@@ -215,22 +216,20 @@ func (m13world) SetPVP(c controller.CommandConn) {
 	}
 }
 func (m13world) Countdown(c controller.CommandConn, t int) {
-	broadcast(pkt(PacketCountdown, map[string]any{"instance": c.InstanceID(), "time": t}))
+	worldcore.Broadcast(pkt(PacketCountdown, map[string]any{"instance": c.InstanceID(), "time": t}))
 }
 func (m13world) SameRegion(ax, ay, bx, by int) bool {
-	return regionOf(ax, ay) == regionOf(bx, by)
+	return worldcore.TileRegion(ax, ay) == worldcore.TileRegion(bx, by)
 }
-func (m13world) RegionOf(x, y int) int                  { return regionOf(x, y) }
+func (m13world) RegionOf(x, y int) int                  { return worldcore.TileRegion(x, y) }
 func (m13world) TileBlocked(x, y int) bool              { return tileBlocked(x, y) }
 func (m13world) WorldWidth() int                        { loadWorld(); return world.Width }
-func (m13world) SetEntityPos(instance string, x, y int) { setEntityPos(instance, x, y) }
+func (m13world) SetEntityPos(instance string, x, y int) { worldcore.SetEntityPos(instance, x, y) }
 func (m13world) SpawnFrame(instance string) []any {
 	return pkt(PacketSpawn, welcomePlayer(instance))
 }
 func (m13world) LiveNPCPos(npcKey string) (int, int, bool) {
-	entitiesMu.Lock()
-	defer entitiesMu.Unlock()
-	for _, e := range entities {
+	for _, e := range worldcore.EntitySnapshot() {
 		if key := m6ResolveNPCKey(nil, e.Instance); key == npcKey {
 			return e.X, e.Y, true
 		}
@@ -536,14 +535,14 @@ func m5SpawnLootBag(owner string, cx, cy int, items []m5Drop) {
 	l := &m5Loot{Instance: inst, Bag: len(items) > 1, Items: items, X: lx, Y: ly, Owner: owner}
 	loots[inst] = l
 	lootMu.Unlock()
-	setEntityPos(inst, lx, ly)
+	worldcore.SetEntityPos(inst, lx, ly)
 	var payload EntityData
 	if l.Bag {
 		payload = EntityData{Instance: inst, Type: EntityLootBag, Key: "lootbag", Name: "Loot Bag", X: lx, Y: ly}
 	} else {
 		payload = EntityData{Instance: inst, Type: EntityItem, Key: items[0].Key, Name: items[0].Key, X: lx, Y: ly, Count: intp(items[0].Count)}
 	}
-	broadcast(pkt(PacketSpawn, payload))
+	worldcore.Broadcast(pkt(PacketSpawn, payload))
 	log.Printf("m13: loot %s spawned (%s x%d) at %d,%d owner=%s bag=%v", inst, items[0].Key, items[0].Count, lx, ly, owner, l.Bag)
 }
 
@@ -554,37 +553,34 @@ func m5SpawnLootBag(owner string, cx, cy int, items []m5Drop) {
 type m13bus struct{}
 
 func (m13bus) SendTo(instance string, frames ...[]any) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	_ = send(c.conn, frames...)
+	_ = gnet.Send(c.Conn, frames...)
 }
 func (m13bus) Notify(instance string, message string) {
-	if c := connByInstance(instance); c != nil {
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
 		m6Notify(c, message)
 	}
 }
-func (m13bus) Broadcast(frames ...[]any) { broadcast(frames...) }
+func (m13bus) Broadcast(frames ...[]any) { worldcore.Broadcast(frames...) }
 func (m13bus) SendBan(instance string) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	writeMu.Lock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_ = c.conn.WriteMessage(websocket.TextMessage, []byte("ban"))
-	writeMu.Unlock()
+	_ = gnet.WriteText(c.Conn.WS, []byte("ban"), 2*time.Second)
 }
 func (m13bus) Close(instance string) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	removeClient(c.conn)
+	worldcore.RemoveClient(c.Conn.WS)
 }
 func (m13bus) NotifySource(instance, message, colour, source string) {
-	if c := connByInstance(instance); c != nil {
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
 		m6NotifyWithSource(c, message, colour, source)
 	}
 }
@@ -592,7 +588,7 @@ func (m13bus) NotifySource(instance, message, colour, source string) {
 type m13peers struct{}
 
 func (m13peers) ByInstance(instance string) (controller.CommandConn, bool) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return nil, false
 	}

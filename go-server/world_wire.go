@@ -99,6 +99,8 @@ import (
 	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/events"
 	"rpg-world-server/internal/globals"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 	"rpg-world-server/internal/worldmap"
 )
 
@@ -214,7 +216,7 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 		return false
 	}
 	nowMs := time.Now().UnixMilli()
-	if deny := worldWarpCtl.Authorize(c.username, w, nowMs, worldWarpStore{c: c}); deny != "" {
+	if deny := worldWarpCtl.Authorize(c.Username, w, nowMs, worldWarpStore{c: c}); deny != "" {
 		m6Notify(c, deny)
 		return false
 	}
@@ -222,16 +224,16 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 	if !ok {
 		return false
 	}
-	c.sess.playerX, c.sess.playerY = lx, ly
-	setEntityPos(c.instance, lx, ly)
-	updateClientRegion(c)
-	broadcast(pkt(PacketTeleport, teleportData{Instance: c.instance, X: lx, Y: ly}))
+	c.Sess.PlayerX, c.Sess.PlayerY = lx, ly
+	worldcore.SetEntityPos(c.Instance, lx, ly)
+	worldcore.UpdateRegion(c, lx, ly)
+	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: lx, Y: ly}))
 	m10OnPositionUpdate(c)
 	m5TrackPos(c)
 	worldPushLights(c)
-	worldWarpCtl.Record(c.username, nowMs)
+	worldWarpCtl.Record(c.Username, nowMs)
 	m6Notify(c, "warps:WARPED_TO;name="+m7FormatName(w.Name))
-	log.Printf("world: %s warped to %s (%d,%d)", c.username, w.Name, lx, ly)
+	log.Printf("world: %s warped to %s (%d,%d)", c.Username, w.Name, lx, ly)
 	return true
 }
 
@@ -323,16 +325,16 @@ type worldBubbleData struct {
 // the conn holding the instance. Packet shapes are unchanged.
 type worldGlowWorld struct{}
 
-func (worldGlowWorld) RegionOf(x, y int) int { return regionOf(x, y) }
+func (worldGlowWorld) RegionOf(x, y int) int { return worldcore.TileRegion(x, y) }
 
 func (worldGlowWorld) SurroundingRegions(rid int) []int { return surroundingRegions(rid) }
 
 func (worldGlowWorld) SendLamp(instance string, l globals.Light) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	_ = send(c.conn, pktOp(PacketOverlay, OverlayLamp, map[string]any{
+	_ = gnet.Send(c.Conn, pktOp(PacketOverlay, OverlayLamp, map[string]any{
 		"light": worldLightData{
 			Instance: fmt.Sprintf("light-%d-%d", l.X, l.Y),
 			X:        l.X, Y: l.Y, Colour: l.Colour,
@@ -345,11 +347,11 @@ func (worldGlowWorld) SendLamp(instance string, l globals.Light) {
 }
 
 func (worldGlowWorld) SendBubble(instance, bubbleInstance, text string, x, y int) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	_ = send(c.conn, pktOp(PacketBubble, BubblePosition, worldBubbleData{
+	_ = gnet.Send(c.Conn, pktOp(PacketBubble, BubblePosition, worldBubbleData{
 		Instance: bubbleInstance, Text: text, X: intp(x), Y: intp(y),
 	}))
 }
@@ -362,7 +364,7 @@ func worldBootGlobals() {
 		log.Printf("world: globals: %v (lights/signs disabled)", err)
 		return
 	}
-	if worldGlow.EnsureTestLamp(testMode, cleanMode, combatMode, regionOf) {
+	if worldGlow.EnsureTestLamp(testMode, cleanMode, combatMode, worldcore.TileRegion) {
 		log.Printf("world: TESTMAP synthetic lamp at 102,96")
 	}
 	g := worldGlow.Globals()
@@ -373,22 +375,22 @@ func worldBootGlobals() {
 // in the surrounding regions (handler.ts handleLights parity). Silent when
 // nothing is new.
 func worldPushLights(c *playerConn) {
-	if c == nil || c.username == "" {
+	if c == nil || c.Username == "" {
 		return
 	}
 	if worldGlow.Globals() == nil {
 		return
 	}
-	n := worldGlow.Push(worldGlowWorld{}, c.instance, c.sess.playerX, c.sess.playerY)
+	n := worldGlow.Push(worldGlowWorld{}, c.Instance, c.Sess.PlayerX, c.Sess.PlayerY)
 	if n > 0 {
-		log.Printf("world: %s lamps=%d (region %d)", c.username, n, regionOf(c.sess.playerX, c.sess.playerY))
+		log.Printf("world: %s lamps=%d (region %d)", c.Username, n, worldcore.TileRegion(c.Sess.PlayerX, c.Sess.PlayerY))
 	}
 }
 
 // worldPushLightsForce clears the per-conn loaded set then pushes (debug
 // re-send for the worldtest lights leg).
 func worldPushLightsForce(c *playerConn) int {
-	return worldGlow.PushForce(worldGlowWorld{}, c.instance, c.sess.playerX, c.sess.playerY)
+	return worldGlow.PushForce(worldGlowWorld{}, c.Instance, c.Sess.PlayerX, c.Sess.PlayerY)
 }
 
 // worldForgetPlayer drops per-conn lamp state on disconnect.
@@ -396,18 +398,18 @@ func worldForgetPlayer(c *playerConn) {
 	if c == nil {
 		return
 	}
-	worldGlow.Forget(c.instance)
+	worldGlow.Forget(c.Instance)
 }
 
 // worldSignTalk handles Target Talk on a sign position ("x-y" instance,
 // player.ts handleObjectInteraction parity): Bubble Position with talkIndex
 // paging over the comma-split text. Reports whether a sign matched.
 func worldSignTalk(c *playerConn, instance string) bool {
-	msg, ok := worldGlow.TalkWith(worldGlowWorld{}, c.instance, instance, &c.talkNPC, &c.talkIndex)
+	msg, ok := worldGlow.TalkWith(worldGlowWorld{}, c.Instance, instance, &c.talkNPC, &c.talkIndex)
 	if !ok {
 		return false
 	}
-	log.Printf("world: %s read sign %s (%q)", c.username, instance, msg)
+	log.Printf("world: %s read sign %s (%q)", c.Username, instance, msg)
 	return true
 }
 
@@ -461,7 +463,7 @@ func worldTestHandler(c *playerConn, data []byte) {
 			return
 		}
 		if worldDoWarp(c, w) {
-			m6Notify(c, fmt.Sprintf("world:warp %s x=%d y=%d", w.Name, c.sess.playerX, c.sess.playerY))
+			m6Notify(c, fmt.Sprintf("world:warp %s x=%d y=%d", w.Name, c.Sess.PlayerX, c.Sess.PlayerY))
 		}
 	case "at":
 		if d.X == nil || d.Y == nil || !worldWarpCtl.Loaded() {

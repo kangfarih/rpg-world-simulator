@@ -34,7 +34,9 @@ import (
 	"time"
 
 	"rpg-world-server/internal/meta"
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/persist"
+	worldcore "rpg-world-server/internal/world"
 
 	_ "modernc.org/sqlite"
 )
@@ -326,14 +328,14 @@ func m5SpawnLoot(mobKey string, cx, cy int, owner string) {
 	l := &m5Loot{Instance: inst, Bag: bag, Items: drops, X: lx, Y: ly, Owner: owner}
 	loots[inst] = l
 	lootMu.Unlock()
-	setEntityPos(inst, lx, ly)
+	worldcore.SetEntityPos(inst, lx, ly)
 	var payload EntityData
 	if bag {
 		payload = EntityData{Instance: inst, Type: EntityLootBag, Key: "lootbag", Name: "Loot Bag", X: lx, Y: ly}
 	} else {
 		payload = EntityData{Instance: inst, Type: EntityItem, Key: drops[0].Key, Name: drops[0].Key, X: lx, Y: ly, Count: intp(drops[0].Count)}
 	}
-	broadcast(pkt(PacketSpawn, payload))
+	worldcore.Broadcast(pkt(PacketSpawn, payload))
 	// M11: multi-drop bags log their contents (Node logs the roll set; the
 	// bag itself only carries the keys server-side, so the log is the only
 	// observable record — e2e asserts on this line).
@@ -355,7 +357,7 @@ func m5BlinkLoot(inst string) {
 		return
 	}
 	l.Owner = ""
-	broadcast(pkt(PacketBlink, inst))
+	worldcore.Broadcast(pkt(PacketBlink, inst))
 	log.Printf("m5: loot %s blinking (free for all, destroy in %v)", inst, lootDespawnDelay-lootBlinkDelay)
 }
 
@@ -375,10 +377,8 @@ func m5DestroyLoot(inst, why string) {
 	if !ok {
 		return
 	}
-	entitiesMu.Lock()
-	delete(entities, inst)
-	entitiesMu.Unlock()
-	broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
+	worldcore.RemoveEntity(inst)
+	worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
 	log.Printf("m5: loot %s destroyed (%s)", inst, why)
 }
 
@@ -522,16 +522,8 @@ func m5CombatLevelLocked(st *m5State) int {
 	return level
 }
 
-func connByInstance(inst string) *playerConn {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	for _, c := range players {
-		if c.instance == inst {
-			return c
-		}
-	}
-	return nil
-}
+// connByInstance moved to internal/world (D2a): use
+// worldcore.Find[*playerConn](inst) at the former call sites.
 
 // m5AddXP awards skill XP, emitting Experience Skill + Skill Update, and on
 // level-up a Sync broadcast + Healing FX heal anim. Returns new level.
@@ -560,10 +552,10 @@ func m5AddXP(c *playerConn, key string, skill, amount int) int {
 	pstateMu.Unlock()
 
 	if c != nil {
-		_ = send(c.conn, pktOp(PacketExperience, ExperienceSkill, experienceData{
-			Instance: c.instance, Amount: intp(amount), Skill: intp(skill),
+		_ = gnet.Send(c.Conn, pktOp(PacketExperience, ExperienceSkill, experienceData{
+			Instance: c.Instance, Amount: intp(amount), Skill: intp(skill),
 		}))
-		_ = send(c.conn, pktOp(PacketSkill, SkillUpdate, skillData{
+		_ = gnet.Send(c.Conn, pktOp(PacketSkill, SkillUpdate, skillData{
 			Type: skill, Experience: xp, Level: intp(level),
 			Percentage: floatp(m5Percentage(xp)), NextExperience: intp(nextExp(xp)),
 			Combat: boolp(m5CombatSkill(skill)),
@@ -572,11 +564,11 @@ func m5AddXP(c *playerConn, key string, skill, amount int) int {
 	if level != prev {
 		log.Printf("m5: %s %s leveled %d -> %d (xp=%d)", key, m5SkillName(skill), prev, level, xp)
 		if c != nil {
-			ph := welcomePlayer(c.instance)
+			ph := welcomePlayer(c.Instance)
 			ph.X, ph.Y = st.X, st.Y
 			ph.Level = intp(combatLevel)
-			broadcast(pkt(PacketSync, ph))
-			broadcast(pktOp(PacketEffect, EffectAdd, effectData{Instance: c.instance, Effect: EffectHealing}))
+			worldcore.Broadcast(pkt(PacketSync, ph))
+			worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{Instance: c.Instance, Effect: EffectHealing}))
 			log.Printf("m5: %s level-up heal anim (Healing FX only, no Heal packet)", key)
 		}
 		markDirty(key)
@@ -630,7 +622,7 @@ func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 
 // m5AwardGatherXP is the M4-hook successor: table experience on exhaust.
 func m5GatherXP(attackerInstance, skill string, xp int) {
-	c := connByInstance(attackerInstance)
+	c, _ := worldcore.Find[*playerConn](attackerInstance)
 	if c == nil {
 		return
 	}
@@ -638,7 +630,7 @@ func m5GatherXP(attackerInstance, skill string, xp int) {
 		"lumberjacking": SkillLumberjacking, "mining": SkillMining,
 		"fishing": SkillFishing, "foraging": SkillForaging,
 	}[skill]
-	m5AddXP(c, c.username, id, xp)
+	m5AddXP(c, c.Username, id, xp)
 }
 
 // m5AddItem stacks (items.json stackable) or appends; returns slot index.
@@ -677,32 +669,32 @@ func m5Pickup(c *playerConn, inst string) bool {
 	if !ok {
 		return false
 	}
-	dx := c.sess.playerX - l.X
+	dx := c.Sess.PlayerX - l.X
 	if dx < 0 {
 		dx = -dx
 	}
-	dy := c.sess.playerY - l.Y
+	dy := c.Sess.PlayerY - l.Y
 	if dy < 0 {
 		dy = -dy
 	}
 	if dx+dy > 1 {
-		log.Printf("m5: %s takes %s from %d tiles (lenient pickup)", c.instance, inst, dx+dy)
+		log.Printf("m5: %s takes %s from %d tiles (lenient pickup)", c.Instance, inst, dx+dy)
 	}
 	for _, it := range l.Items {
-		idx := m5AddItem(c.username, it.Key, it.Count)
-		_ = send(c.conn, pktOp(PacketContainer, ContainerAdd, containerData{
+		idx := m5AddItem(c.Username, it.Key, it.Count)
+		_ = gnet.Send(c.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
 			Slot: &slotData{Index: idx, Key: it.Key, Count: it.Count, Enchantments: map[string]any{}},
 		}))
 	}
-	markDirty(c.username)
-	m5DestroyLoot(inst, "picked up by "+c.instance)
+	markDirty(c.Username)
+	m5DestroyLoot(inst, "picked up by "+c.Instance)
 	return true
 }
 
 // m5PickupAt steps onto loot: any loot on the player's tile is taken.
 func m5PickupAt(c *playerConn) {
-	m5PickupAtTile(c, c.sess.playerX, c.sess.playerY)
+	m5PickupAtTile(c, c.Sess.PlayerX, c.Sess.PlayerY)
 }
 
 // m5PickupAtTile takes loot lying on (x,y) (Step destination path).
@@ -723,14 +715,14 @@ func m5PickupAtTile(c *playerConn, x, y int) {
 
 // m5TrackPos records the authoritative tile and marks the row dirty.
 func m5TrackPos(c *playerConn) {
-	if c.username == "" {
+	if c.Username == "" {
 		return
 	}
-	st := m5StateFor(c.username)
+	st := m5StateFor(c.Username)
 	pstateMu.Lock()
-	st.X, st.Y = c.sess.playerX, c.sess.playerY
+	st.X, st.Y = c.Sess.PlayerX, c.Sess.PlayerY
 	pstateMu.Unlock()
-	markDirty(c.username)
+	markDirty(c.Username)
 }
 
 // m5RegisterLoot adds a pre-built loot entry to the registry without any
@@ -740,7 +732,7 @@ func m5RegisterLoot(inst, key string, count, x, y int, owner string) {
 	lootMu.Lock()
 	loots[inst] = &m5Loot{Instance: inst, Bag: false, Items: []m5Drop{{Key: key, Count: count}}, X: x, Y: y, Owner: owner}
 	lootMu.Unlock()
-	setEntityPos(inst, x, y)
+	worldcore.SetEntityPos(inst, x, y)
 }
 
 // m5IsLoot reports whether id is a live loot entity.
@@ -759,7 +751,7 @@ func m5LootPayload(inst string) (any, bool) {
 	if !ok {
 		return nil, false
 	}
-	x, y, found := entityPos(inst)
+	x, y, found := worldcore.EntityPos(inst)
 	if !found {
 		x, y = l.X, l.Y
 	}
@@ -807,21 +799,21 @@ func handlePlayerAttack(c *playerConn, target string) {
 	dmg = int(float64(dmg) * m11HeroDamageMult())
 	if m := m9MobFor(target); m != nil {
 		if m.dead {
-			log.Printf("m5: %s swings at dead %s (ignored)", c.instance, target)
+			log.Printf("m5: %s swings at dead %s (ignored)", c.Instance, target)
 			return
 		}
-		abSetTarget(c.instance, target)
-		broadcast(pkt(PacketAnimation, animationData{Instance: c.instance, Action: ActionAttack}))
-		broadcast(pktOp(PacketCombat, CombatHit, combatData{
-			Instance: c.instance, Target: target,
+		abSetTarget(c.Instance, target)
+		worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: c.Instance, Action: ActionAttack}))
+		worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
+			Instance: c.Instance, Target: target,
 			Hit: HitData{Type: HitsNormal, Damage: dmg},
 		}))
 		m9PlayerHit(m, c, dmg)
 		// TS combat.ts poison-on-hit: a poisonous weapon poisons the victim.
-		if abHeroWeaponPoisonous(c.username) {
+		if abHeroWeaponPoisonous(c.Username) {
 			abApplyPoison(target)
 		}
-		m5AwardCombatXP(c, c.username, dmg, false, false)
+		m5AwardCombatXP(c, c.Username, dmg, false, false)
 		return
 	}
 	switch target {
@@ -829,21 +821,21 @@ func handlePlayerAttack(c *playerConn, target string) {
 		combatMu.Lock()
 		if combatDead {
 			combatMu.Unlock()
-			log.Printf("m5: %s swings at dead boss (ignored)", c.instance)
+			log.Printf("m5: %s swings at dead boss (ignored)", c.Instance)
 			return
 		}
-		abSetTarget(c.instance, target)
-		applyBossHitLocked(c.instance, dmg, HitsNormal, nil, false, -1, true)
+		abSetTarget(c.Instance, target)
+		applyBossHitLocked(c.Instance, dmg, HitsNormal, nil, false, -1, true)
 		died := combatDead
 		combatMu.Unlock()
-		m5AwardCombatXP(c, c.username, dmg, false, false)
+		m5AwardCombatXP(c, c.Username, dmg, false, false)
 		if died {
-			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.instance)
+			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.Instance)
 		}
 	default:
 		// M9: engine-registered mobs were handled above; anything else is
 		// not killable (legacy note kept from slice 1).
-		log.Printf("m5: %s attacks %s (not killable)", c.instance, target)
+		log.Printf("m5: %s attacks %s (not killable)", c.Instance, target)
 	}
 }
 
@@ -1047,9 +1039,9 @@ func m5Load(key string) (*m5State, bool) {
 func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 	key := username
 	if key == "" {
-		key = c.instance
+		key = c.Instance
 	}
-	c.username = key
+	c.Username = key
 	var st *m5State
 	if loaded, ok := m5Load(key); ok {
 		st = loaded
@@ -1057,10 +1049,10 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		st = m5StateFor(key)
 		markDirty(key)
 	}
-	c.sess.playerX, c.sess.playerY = st.X, st.Y
-	setEntityPos(c.instance, st.X, st.Y)
-	updateClientRegion(c)
-	ph := welcomePlayer(c.instance)
+	c.Sess.PlayerX, c.Sess.PlayerY = st.X, st.Y
+	worldcore.SetEntityPos(c.Instance, st.X, st.Y)
+	worldcore.UpdateRegion(c, st.X, st.Y)
+	ph := welcomePlayer(c.Instance)
 	ph.X, ph.Y = st.X, st.Y
 	if st.Level > 0 {
 		ph.Level = intp(st.Level)

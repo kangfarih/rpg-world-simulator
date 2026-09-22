@@ -84,24 +84,24 @@ func m10ChestItemsAt(x, y int) bool {
 // despawn the chest, roll one entry, spawn it at the chest tile as a
 // persistent M5 loot entity, and log the (future) achievement reward.
 func m10OpenChest(c *playerConn, chest *m10Chest) {
-	entity.OpenChest(chest, c.username, gameWorld)
+	entity.OpenChest(chest, c.Username, gameWorld)
 }
 
 // m10OnPositionUpdate is the M10 hook on the movement path (Node
 // handleMovement -> detectAreas). Change-detection is per player per group.
 func m10OnPositionUpdate(c *playerConn) {
-	entity.OnPositionUpdate(c.instance, c.username, c.sess.playerX, c.sess.playerY, gameWorld)
+	entity.OnPositionUpdate(c.Instance, c.Username, c.Sess.PlayerX, c.Sess.PlayerY, gameWorld)
 }
 
 // m10UpdatePVP ports player.updatePVP: notify + PVP packet on state flip.
 func m10UpdatePVP(c *playerConn, inPVP bool) {
-	entity.UpdatePVP(c.instance, c.username, inPVP, gameWorld)
+	entity.UpdatePVP(c.Instance, c.Username, inPVP, gameWorld)
 }
 
 // m10SetFreezing applies/removes the Freezing status effect
 // (Area.addPlayer/removePlayer -> player.status Effects.Freezing).
 func m10SetFreezing(c *playerConn, on bool) {
-	entity.SetFreezing(c.instance, on, gameWorld)
+	entity.SetFreezing(c.Instance, on, gameWorld)
 }
 
 // m10PVPState reports the player's current pvp flag (Spawn PlayerData.pvp).

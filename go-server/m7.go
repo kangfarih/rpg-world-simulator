@@ -24,7 +24,9 @@ import (
 	"sync"
 	"time"
 
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/player/chat"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // ---------------------------------------------------------------------------
@@ -144,7 +146,7 @@ type chatRouter struct{}
 var _ chat.Router = chatRouter{}
 
 func (chatRouter) SendBubble(instance, message string, withBubble bool, colour string) {
-	broadcast(pkt(PacketChat, chatPacketData{
+	worldcore.Broadcast(pkt(PacketChat, chatPacketData{
 		Instance:   instance,
 		Message:    message,
 		WithBubble: withBubble,
@@ -205,13 +207,13 @@ func m7HandleChat(c *playerConn, frame clientFrame) {
 
 	// Ops limiter: shared per-conn chat bucket (same silent drop as the
 	// bucket-exhaust above — no notify).
-	if !opsAllowChat(c) {
+	if !gnet.AllowChat(c.Conn) {
 		return
 	}
 
 	// Mute gate (incoming.ts:479): the m13 slice persists user.mute in the
 	// players.data blob and rejects chat while the deadline is in the future.
-	if (m13Moderation{}).IsMuted(c.username) {
+	if (m13Moderation{}).IsMuted(c.Username) {
 		m6Notify(c, chat.MutedText())
 		return
 	}
@@ -242,7 +244,7 @@ func m7Chat(c *playerConn, message string, global bool, withBubble bool, colour 
 		cs.lastGlobalChat = nowMillis()
 	}
 
-	name := chat.DisplayName(c.username, cs.rank)
+	name := chat.DisplayName(c.Username, cs.rank)
 	colour = chat.ResolveColour(cs.rank, colour)
 
 	if global {
@@ -254,9 +256,9 @@ func m7Chat(c *playerConn, message string, global bool, withBubble bool, colour 
 	}
 
 	// Region-scoped bubble (player.chat → sendToRegions): the broadcast
-	// helper resolves c.instance's tile and fans out to the 9-region
+	// helper resolves c.Instance's tile and fans out to the 9-region
 	// interest sets, matching world.push(Regions).
-	defaultRouter.SendBubble(c.instance, message, withBubble, colour)
+	defaultRouter.SendBubble(c.Instance, message, withBubble, colour)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,11 +296,11 @@ func m7PlayerCommands(c *playerConn, command string, blocks []string) {
 		}
 
 	case chat.CmdCoords:
-		m6Notify(c, chat.CoordsText(c.sess.playerX, c.sess.playerY))
+		m6Notify(c, chat.CoordsText(c.Sess.PlayerX, c.Sess.PlayerY))
 
 	case chat.CmdPing:
 		// player.ping(): Network Ping frame, bypassing the outbox queue.
-		_ = send(c.conn, pktOp(PacketNetwork, NetworkPing, nil))
+		_ = gnet.Send(c.Conn, pktOp(PacketNetwork, NetworkPing, nil))
 
 	case chat.CmdGlobal:
 		m7Chat(c, strings.Join(blocks, " "), true, false, chat.GlobalColour)
@@ -336,20 +338,20 @@ func m7SendPrivateMessage(c *playerConn, playerName string, message string) {
 		m6Notify(c, chat.PMOffline(playerName))
 		return
 	}
-	formatted := m7FormatName(c.username)
-	fromSource, toSource := chat.PMSources(formatted, m7FormatName(target.username))
-	defaultRouter.SendSourced(target.username, message, chat.PMColour, fromSource)
-	defaultRouter.SendSourced(c.username, message, chat.PMColour, toSource)
+	formatted := m7FormatName(c.Username)
+	fromSource, toSource := chat.PMSources(formatted, m7FormatName(target.Username))
+	defaultRouter.SendSourced(target.Username, message, chat.PMColour, fromSource)
+	defaultRouter.SendSourced(c.Username, message, chat.PMColour, toSource)
 }
 
 // m7Teleport ports character.teleport: set position, Teleport frame to the
 // surrounding regions (which the Go broadcast scopes by the entity tile).
 func m7Teleport(c *playerConn, x, y int) {
-	c.sess.playerX = x
-	c.sess.playerY = y
-	setEntityPos(c.instance, x, y)
-	updateClientRegion(c)
-	broadcast(pkt(PacketTeleport, teleportData{Instance: c.instance, X: x, Y: y}))
+	c.Sess.PlayerX = x
+	c.Sess.PlayerY = y
+	worldcore.SetEntityPos(c.Instance, x, y)
+	worldcore.UpdateRegion(c, x, y)
+	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,12 +360,10 @@ func m7Teleport(c *playerConn, x, y int) {
 
 // m7PlayerUsernames snapshots online usernames.
 func m7PlayerUsernames() []string {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	names := make([]string, 0, len(players))
-	for _, c := range players {
-		if c.username != "" {
-			names = append(names, c.username)
+	var names []string
+	for _, c := range worldcore.AllOf[*playerConn]() {
+		if c.Username != "" {
+			names = append(names, c.Username)
 		}
 	}
 	return names
@@ -373,10 +373,8 @@ func m7PlayerUsernames() []string {
 // world.getPlayerByName's lowercase compare).
 func m7PlayerByName(name string) *playerConn {
 	lower := strings.ToLower(name)
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	for _, c := range players {
-		if strings.ToLower(c.username) == lower {
+	for _, c := range worldcore.AllOf[*playerConn]() {
+		if strings.ToLower(c.Username) == lower {
 			return c
 		}
 	}
@@ -391,7 +389,7 @@ func m6NotifyWithSource(c *playerConn, message string, colour string, source str
 	n := chat.Notice(message, colour, source)
 	col := n.Colour
 	src := n.Source
-	_ = send(c.conn, pktOp(PacketNotification, NotificationText, notificationPacketData{
+	_ = gnet.Send(c.Conn, pktOp(PacketNotification, NotificationText, notificationPacketData{
 		Message: n.Message,
 		Colour:  &col,
 		Source:  &src,

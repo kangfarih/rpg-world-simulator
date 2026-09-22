@@ -29,6 +29,7 @@ import (
 
 	"rpg-world-server/internal/app"
 	"rpg-world-server/internal/meta"
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/sim"
 	worldcore "rpg-world-server/internal/world"
 	"rpg-world-server/internal/worldmap"
@@ -41,12 +42,18 @@ import (
 //   - movement/anticheat verify math delegates to internal/world (pure).
 //   - the 20Hz tick loop runs subsystems through an internal/world Engine.
 //   - showcase/combat-scene layout math delegates to internal/sim (pure).
-//   - transport (upgrader/subs/broadcast/send), the entity registry maps,
-//     the dispatch switch, the combat brain and the boot sequence stay in
-//     package main: frozen files lock entitiesMu/playersMu and call
-//     broadcast/send/setEntityPos directly, so moving them would change
-//     shared state ownership. internal/world.Store is the staged registry
-//     for the follow-up once those call sites leave package main.
+//   - D2a: transport (upgrader/subs/broadcast/send/accept-gate) is owned by
+//     internal/net (Hub + Conn/Session types); the entity registry
+//     (entities/players maps, positions, region interest, disconnect fanout)
+//     is owned by internal/world (Registry). Root keeps NO transport
+//     globals: playerConn embeds *net.Conn, and every former
+//     broadcast/send/setEntityPos/entityPos/removeClient/connByInstance call
+//     site goes through the package APIs with identical frames/logs.
+//     handleConn dispatch + tick + boot stay in package main (D2b moves
+//     those). internal/world.Store backs the entity positions; the combat
+//     brain and boot sequence stay here.
+// Lock order: net outbox/Conn.mu -> world Registry.mu -> persist store
+// (dbMu) -> subsystem state (see internal/net + internal/world docs).
 
 // addr resolves the listen address: PORT env (e.g. PORT=9002 for a side-by-side
 // run while the TS dev server occupies 9001) or the client-server default 9001.
@@ -54,9 +61,8 @@ func addr() string {
 	return app.ListenAddr(os.Getenv("PORT"))
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(_ *http.Request) bool { return true },
-}
+// The WS upgrader lives in the net Hub (D2a); the root keeps no transport
+// globals.
 
 func intp(v int) *int { return &v }
 
@@ -592,7 +598,7 @@ func showAnimTick() {
 		}))
 	}
 	showTick++
-	broadcast(frames...)
+	worldcore.Broadcast(frames...)
 	log.Printf("showcase anim tick %d: 10 atk (m-show-%d..) + 5 idle", showTick, start+1)
 }
 
@@ -1141,19 +1147,19 @@ func applyBossHitLocked(attacker string, dmg, typ int, skills []string, ranged b
 		hit.Ranged = boolp(true)
 	}
 	if withAnim {
-		broadcast(pkt(PacketAnimation, animationData{
+		worldcore.Broadcast(pkt(PacketAnimation, animationData{
 			Instance: attacker, Action: ActionAttack,
 		}))
 	}
-	broadcast(pktOp(PacketCombat, CombatHit, combatData{
+	worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
 		Instance: attacker, Target: combatDummyInstance, Hit: hit,
 	}))
 	if effect >= 0 {
-		broadcast(pktOp(PacketEffect, EffectAdd, effectData{
+		worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{
 			Instance: combatDummyInstance, Effect: effect,
 		}))
 	}
-	broadcast(pkt(PacketPoints, pointsData{
+	worldcore.Broadcast(pkt(PacketPoints, pointsData{
 		Instance:  combatDummyInstance,
 		HitPoints: intp(combatHP), MaxHitPoints: intp(dummyMaxHP),
 	}))
@@ -1163,7 +1169,7 @@ func applyBossHitLocked(attacker string, dmg, typ int, skills []string, ranged b
 		combatGen++
 		bossTarget = ""
 		bossAttackers = map[string]bool{}
-		broadcast(pkt(PacketDespawn, despawnData{Instance: combatDummyInstance}))
+		worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: combatDummyInstance}))
 		log.Printf("combat: boss died -> despawned, respawn in %v", dummyRespawnDelay)
 		// M5: boss death rolls the golem drop tables (attacker owns the loot).
 		m5SpawnLoot("golem", combatDummyX, combatDummyY, attacker)
@@ -1218,20 +1224,18 @@ func spawnRangedStrikeLocked(owner string, dmg, typ int, skills []string, effect
 	projMu.Lock()
 	projPayloads[inst] = p
 	projMu.Unlock()
-	setEntityPos(inst, ox, oy)
-	broadcast(pkt(PacketAnimation, animationData{Instance: owner, Action: ActionAttack}))
-	broadcast(pkt(PacketSpawn, p))
+	worldcore.SetEntityPos(inst, ox, oy)
+	worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: owner, Action: ActionAttack}))
+	worldcore.Broadcast(pkt(PacketSpawn, p))
 	log.Printf("combat: %s launched %s (%s) travel=%v dmg=%d", owner, inst, key, travel, dmg)
 	time.AfterFunc(travel, func() {
 		combatMu.Lock()
 		defer combatMu.Unlock()
-		entitiesMu.Lock()
-		delete(entities, inst)
-		entitiesMu.Unlock()
+		worldcore.RemoveEntity(inst)
 		projMu.Lock()
 		delete(projPayloads, inst)
 		projMu.Unlock()
-		broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
+		worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
 		if combatDead || gen != combatGen {
 			log.Printf("combat: %s impact dropped (target died mid-flight, fallback)", inst)
 			return
@@ -1364,16 +1368,16 @@ func combatHeal() {
 	}
 	hp := combatBotHP[target] + amount
 	combatBotHP[target] = hp
-	broadcast(pkt(PacketAnimation, animationData{
+	worldcore.Broadcast(pkt(PacketAnimation, animationData{
 		Instance: combatSupInstance, Action: ActionIdle,
 	}))
-	broadcast(pkt(PacketHeal, healData{
+	worldcore.Broadcast(pkt(PacketHeal, healData{
 		Instance: target, Type: "hitpoints", Amount: amount,
 	}))
-	broadcast(pktOp(PacketEffect, EffectAdd, effectData{
+	worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{
 		Instance: target, Effect: EffectHealing,
 	}))
-	broadcast(pkt(PacketPoints, pointsData{
+	worldcore.Broadcast(pkt(PacketPoints, pointsData{
 		Instance: target, HitPoints: intp(hp), MaxHitPoints: intp(combatBotMaxHP[target]),
 	}))
 	log.Printf("combat: support healed %s +%d hp=%d/%d", target, amount, hp, combatBotMaxHP[target])
@@ -1408,7 +1412,7 @@ func combatBuffNoLock() {
 	}
 	combatBuffCycle++
 	for _, b := range combatBotOrder {
-		broadcast(pktOp(PacketEffect, EffectAdd, effectData{
+		worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{
 			Instance: b, Effect: effect,
 		}))
 	}
@@ -1467,7 +1471,7 @@ func combatRespawn() {
 	combatDead = false
 	combatMu.Unlock()
 	if d, ok := dummyData(); ok {
-		broadcast(pkt(PacketSpawn, d))
+		worldcore.Broadcast(pkt(PacketSpawn, d))
 	}
 	log.Printf("combat: boss respawned full HP=%d", dummyMaxHP)
 }
@@ -1710,27 +1714,23 @@ func blocked(x, y int) bool {
 // updated by Started/Step/Stop reports) for teleport-back on reject, plus
 // the last resource target (Request/Started/Follow/Entity carry
 // targetInstance; Step does not) so Step can apply the same gather-approach
-// exception as Request. lastStep + cheatScore implement the M2 speed
+// exception as Request. LastStep + CheatScore implement the M2 speed
 // anticheat (movementSpeed ms/tile, 2-tile grace, teleport-back, >15
 // disconnect — cf. player.ts handleMovementRequest/Step + handler.ts:809).
-type session struct {
-	playerX, playerY int
-	target           string
-	lastStep         time.Time
-	movementSpeed    int // ms per tile (Welcome default 220)
-	cheatScore       int
-}
+// The session type lives in internal/net (gnet.Session, D2a); the root
+// addresses it through the embedded Conn record.
 
 // stopPlayer mirrors server stopMovement/teleport-back: halt the client
 // entity (connection.ts:461-463 entity.stop()) and snap it to the last
 // valid tile (Teleport [12,{instance,x,y}], connection.ts:478-501),
 // plus the authoritative List.Positions reply (regions.ts
 // sendEntityPositions) so the client resyncs on mismatch.
-func stopPlayer(conn *websocket.Conn, s *session, instance string) {
-	_ = send(conn, pktOp(PacketMovement, MovementStop, serverMovement{Instance: instance}))
-	_ = send(conn, pkt(PacketTeleport, teleportData{Instance: instance, X: s.playerX, Y: s.playerY}))
-	_ = send(conn, pktOp(PacketList, ListPositions, map[string]any{
-		"positions": map[string]any{instance: map[string]any{"x": s.playerX, "y": s.playerY}},
+func stopPlayer(c *playerConn) {
+	s := &c.Sess
+	_ = gnet.Send(c.Conn, pktOp(PacketMovement, MovementStop, serverMovement{Instance: c.Instance}))
+	_ = gnet.Send(c.Conn, pkt(PacketTeleport, teleportData{Instance: c.Instance, X: s.PlayerX, Y: s.PlayerY}))
+	_ = gnet.Send(c.Conn, pktOp(PacketList, ListPositions, map[string]any{
+		"positions": map[string]any{c.Instance: map[string]any{"x": s.PlayerX, "y": s.PlayerY}},
 	}))
 }
 
@@ -1750,14 +1750,14 @@ func targetsResource(x, y int, targets ...string) bool {
 // rejectLocked records one cheat/collision strike: teleport-back + Positions
 // reply; over 15 disconnects the conn (handler.ts cheatScore gate).
 // Returns true when the caller should drop the connection.
-func rejectLocked(conn *websocket.Conn, c *playerConn, reason string) bool {
-	c.sess.cheatScore++
-	n := c.sess.cheatScore
-	stopPlayer(conn, &c.sess, c.instance)
-	updateClientRegion(c)
-	log.Printf("anticheat: %s instance=%s score=%d", reason, c.instance, n)
+func rejectLocked(c *playerConn, reason string) bool {
+	c.Sess.CheatScore++
+	n := c.Sess.CheatScore
+	stopPlayer(c)
+	worldcore.UpdateRegion(c, c.Sess.PlayerX, c.Sess.PlayerY)
+	log.Printf("anticheat: %s instance=%s score=%d", reason, c.Instance, n)
 	if n > 15 {
-		log.Printf("anticheat: disconnecting %s (score %d > 15)", c.instance, n)
+		log.Printf("anticheat: disconnecting %s (score %d > 15)", c.Instance, n)
 		return true
 	}
 	return false
@@ -1769,10 +1769,10 @@ func rejectLocked(conn *websocket.Conn, c *playerConn, reason string) bool {
 // Divergence note: truth uses a 1.5s region grace with latency subtracted
 // from the interval; here we keep the coarser 2-tile + 2s idle leniency.
 // The math lives in internal/world; this adapts the root session to it.
-func checkSpeed(s *session, tiles int) bool {
-	st := worldcore.SpeedState{MovementSpeed: s.movementSpeed, LastStep: s.lastStep}
+func checkSpeed(s *gnet.Session, tiles int) bool {
+	st := worldcore.SpeedState{MovementSpeed: s.MovementSpeed, LastStep: s.LastStep}
 	violation := worldcore.CheckSpeed(&st, tiles, time.Now())
-	s.movementSpeed, s.lastStep = st.MovementSpeed, st.LastStep
+	s.MovementSpeed, s.LastStep = st.MovementSpeed, st.LastStep
 	return violation
 }
 
@@ -1787,8 +1787,8 @@ func checkSpeed(s *session, tiles int) bool {
 // onto the currently-targeted resource tile, which Request also allows.
 // Request far jumps (>2 tiles, noclip) and too-fast Steps (speed check)
 // bump cheatScore with teleport-back; >15 disconnects. Anything else silent.
-func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool {
-	s := &c.sess
+func handleMovement(c *playerConn, mv clientMovement) bool {
+	s := &c.Sess
 	if mv.Opcode == nil {
 		return false
 	}
@@ -1796,54 +1796,54 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 	// (stores.ts storeOpen=none + player.ts canAccessContainer=false on move).
 	clearContainerAccess(c)
 	if mv.TargetInstance != "" {
-		s.target = mv.TargetInstance
+		s.Target = mv.TargetInstance
 	}
 	switch *mv.Opcode {
 	case MovementRequest:
 		if mv.RequestX == nil || mv.RequestY == nil {
 			return false
 		}
-		dx := abs(*mv.RequestX - s.playerX)
-		dy := abs(*mv.RequestY - s.playerY)
-		if worldcore.JumpTooFar(dx, dy) && !m13NoclipAllowed(c.username) {
+		dx := abs(*mv.RequestX - s.PlayerX)
+		dy := abs(*mv.RequestY - s.PlayerY)
+		if worldcore.JumpTooFar(dx, dy) && !m13NoclipAllowed(c.Username) {
 			// Noclip jump (player.ts handleMovementRequest diff>2). m13:
 			// player.noclip bypasses the jump check (movement.ts noclip).
-			return rejectLocked(conn, c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.playerX, s.playerY, *mv.RequestX, *mv.RequestY))
+			return rejectLocked(c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.PlayerX, s.PlayerY, *mv.RequestX, *mv.RequestY))
 		}
-		if checkSpeed(s, dx+dy) && !m13NoclipAllowed(c.username) {
-			return rejectLocked(conn, c, "speed request")
+		if checkSpeed(s, dx+dy) && !m13NoclipAllowed(c.Username) {
+			return rejectLocked(c, "speed request")
 		}
-		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.username) {
-			stopPlayer(conn, s, c.instance)
-			updateClientRegion(c)
+		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.Username) {
+			stopPlayer(c)
+			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 		}
 	case MovementStarted:
 		if mv.PlayerX != nil && mv.PlayerY != nil {
-			dx := abs(*mv.PlayerX - s.playerX)
-			dy := abs(*mv.PlayerY - s.playerY)
+			dx := abs(*mv.PlayerX - s.PlayerX)
+			dy := abs(*mv.PlayerY - s.PlayerY)
 			if worldcore.JumpTooFar(dx, dy) {
 				// Started mismatch: silent resync only (no cheatScore).
-				stopPlayer(conn, s, c.instance)
-				updateClientRegion(c)
+				stopPlayer(c)
+				worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 				return false
 			}
-			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
-			setEntityPos(c.instance, s.playerX, s.playerY)
-			updateClientRegion(c)
+			s.PlayerX, s.PlayerY = *mv.PlayerX, *mv.PlayerY
+			worldcore.SetEntityPos(c.Instance, s.PlayerX, s.PlayerY)
+			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 			m5TrackPos(c)
 		}
 	case MovementStep:
 		if mv.NextGridX != nil && mv.NextGridY != nil {
-			dx := abs(*mv.NextGridX - s.playerX)
-			dy := abs(*mv.NextGridY - s.playerY)
+			dx := abs(*mv.NextGridX - s.PlayerX)
+			dy := abs(*mv.NextGridY - s.PlayerY)
 			if dx+dy > 0 && checkSpeed(s, dx+dy) {
-				return rejectLocked(conn, c, "speed step")
+				return rejectLocked(c, "speed step")
 			}
 		}
 		if mv.PlayerX != nil && mv.PlayerY != nil {
-			s.playerX, s.playerY = *mv.PlayerX, *mv.PlayerY
-			setEntityPos(c.instance, s.playerX, s.playerY)
-			updateClientRegion(c)
+			s.PlayerX, s.PlayerY = *mv.PlayerX, *mv.PlayerY
+			worldcore.SetEntityPos(c.Instance, s.PlayerX, s.PlayerY)
+			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 			m5TrackPos(c)
 			m8OnPositionUpdate(c)  // M8: lobby area enter/exit callbacks
 			m9OnPlayerMoved(c)     // M9: aggro scan on position update (Node detectAggro)
@@ -1851,9 +1851,9 @@ func handleMovement(conn *websocket.Conn, c *playerConn, mv clientMovement) bool
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
 			blocked(*mv.NextGridX, *mv.NextGridY) &&
-			!targetsResource(*mv.NextGridX, *mv.NextGridY, mv.TargetInstance, s.target) {
-			stopPlayer(conn, s, c.instance)
-			updateClientRegion(c)
+			!targetsResource(*mv.NextGridX, *mv.NextGridY, mv.TargetInstance, s.Target) {
+			stopPlayer(c)
+			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 		} else if mv.NextGridX != nil && mv.NextGridY != nil {
 			// M5: stepping onto a loot tile picks it up.
 			m5PickupAtTile(c, *mv.NextGridX, *mv.NextGridY)
@@ -1877,7 +1877,7 @@ func abs(v int) int { return worldcore.Abs(v) }
 // resource counts as a gather swing (explicit click-on-arrival): walking to
 // the resource (Request/Started/Step/Follow/Entity) is approach only and
 // never gathers. The 600ms per-instance debounce stays as a safety net.
-func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
+func handleTarget(c *playerConn, frame clientFrame) {
 	if len(frame) < 2 {
 		return
 	}
@@ -1917,7 +1917,7 @@ func handleTarget(conn *websocket.Conn, c *playerConn, frame clientFrame) {
 		}
 	}
 	if opcode == TargetObject && isResourceInstance(instance) {
-		hitResource(c.instance, instance)
+		hitResource(c.Instance, instance)
 	}
 }
 
@@ -2090,33 +2090,15 @@ func canExhaustResource(skill string, weaponLevel, skillLevel int, info *resourc
 	return rand.Intn(probability+1) == 2
 }
 
-// subs tracks live connections so the respawn timer can restore the tree even
-// if the chopping connection is gone. All WS writes flow through the central
-// 20Hz tick loop (one bulk write per conn per tick); gorilla/websocket still
-// forbids concurrent writers, guarded by writeMu.
-var (
-	writeMu sync.Mutex
-	subsMu  sync.Mutex
-	subs    = map[*websocket.Conn]struct{}{}
-)
+// Connection + registry state moved to packages (D2a): the net Hub owns
+// subs/sockets/writeMu/accept-gate, the world Registry owns the
+// entities/players maps. The root keeps no transport globals.
 
-// Entity is the central registry record (M2): every spawned instance with
-// its current tile. Covers statics (oaks, showcase, bots, adventurer,
-// guest, rat, dummy) plus one entry per connected player.
-type Entity struct {
-	Instance string
-	X, Y     int
-}
-
-// Player is the per-connection record (M2): session + queue state.
+// playerConn is the per-connection record (M2): the transport core embeds
+// *gnet.Conn (socket, identity, session, outbox, interest set — owned by
+// internal/net) plus the game session fields owned by the root slices.
 type playerConn struct {
-	conn     *websocket.Conn
-	instance string
-	username string // login name, DB key for the M5 persist slice
-	sess     session
-	outbox   chan []any // queued S->C frames, flushed by the tick loop
-	regions  []int      // current 9-region interest set
-	dropped  int        // overflow drops (outbox full)
+	*gnet.Conn
 
 	// M6 store/bank/NPC-talk session state (stores.ts/handler.ts parity).
 	storeOpen          string // key of the currently open store ("" = none)
@@ -2135,215 +2117,23 @@ type playerConn struct {
 	m8Target string // coursingTarget (pointer entity)
 }
 
-var (
-	entitiesMu sync.Mutex
-	entities   = map[string]*Entity{}
-
-	playersMu sync.Mutex
-	players   = map[*websocket.Conn]*playerConn{}
-)
-
-const outboxSize = 64
-
-// regionOf maps a tile to its region id.
-func regionOf(x, y int) int {
-	if sideLen <= 0 {
-		return 0
-	}
-	return (y/mapDivisionSize)*sideLen + (x / mapDivisionSize)
-}
+// Entity is the central registry record (M2) alias: canonical owner is the
+// world Store (worldcore.Entry).
+type Entity = worldcore.Entry
 
 // setEntityPos upserts the registry position for an instance.
-func setEntityPos(instance string, x, y int) {
-	entitiesMu.Lock()
-	defer entitiesMu.Unlock()
-	if e, ok := entities[instance]; ok {
-		e.X, e.Y = x, y
-		return
-	}
-	entities[instance] = &Entity{Instance: instance, X: x, Y: y}
-}
+// Registry + region-interest primitives moved to packages (D2a):
+// worldcore.SetEntityPos/EntityPos/UpdateRegion/ClientInterested/TileRegion
+// (internal/world Registry) and gnet.RegionScoped/FrameInstance
+// (internal/net). The old root funcs (setEntityPos/entityPos/
+// updateClientRegion/clientInterested/regionScoped/frameInstance) are gone;
+// call sites use the package APIs directly.
 
-// entityPos returns the registry tile for an instance.
-func entityPos(instance string) (int, int, bool) {
-	entitiesMu.Lock()
-	defer entitiesMu.Unlock()
-	e, ok := entities[instance]
-	if !ok {
-		return 0, 0, false
-	}
-	return e.X, e.Y, true
-}
-
-// updateClientRegion recomputes a conn's 9-region interest set from its
-// authoritative player tile (surroundingRegions + tile→region math).
-func updateClientRegion(c *playerConn) {
-	loadWorld()
-	rid := regionOf(c.sess.playerX, c.sess.playerY)
-	playersMu.Lock()
-	c.regions = surroundingRegions(rid)
-	playersMu.Unlock()
-	worldPushLights(c) // world: region-enter Lamp fan-out (deduped, no-op when none new)
-}
-
-// clientInterested reports whether conn's regions include the entity tile.
-func clientInterested(c *playerConn, x, y int) bool {
-	rid := regionOf(x, y)
-	playersMu.Lock()
-	regions := c.regions
-	playersMu.Unlock()
-	for _, r := range regions {
-		if r == rid {
-			return true
-		}
-	}
-	return false
-}
-
-// regionScoped reports whether a packet id is region-scoped (interest-routed)
-// vs global fan-out. Matches the M2 scope: Spawn/Movement/Animation/Combat/
-// Resource/Effect route by entity tile; everything else (banner, shutdown,
-// Welcome/Map/Teleport/Points/Heal/Despawn/List/Sync/Equipment...) fans out
-// or unicasts as before.
-func regionScoped(id int) bool {
-	switch id {
-	case PacketSpawn, PacketMovement, PacketAnimation, PacketCombat, PacketResource, PacketEffect,
-		PacketChat, PacketDeath, PacketRespawn: // M9: Death/Respawn ride region scoping
-		return true
-	}
-	return false
-}
-
-// frameInstance extracts the entity instance from an S->C frame's data payload.
-func frameInstance(frame []any) string {
-	if len(frame) < 2 {
-		return ""
-	}
-	data := frame[len(frame)-1]
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return ""
-	}
-	var probe struct {
-		Instance string `json:"instance"`
-	}
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return ""
-	}
-	return probe.Instance
-}
-
-// enqueueTo queues frames for one conn (drop+count on overflow, size 64).
-func enqueueTo(conn *websocket.Conn, frames ...[]any) {
-	playersMu.Lock()
-	c, ok := players[conn]
-	playersMu.Unlock()
-	if !ok {
-		return
-	}
-	for _, f := range frames {
-		select {
-		case c.outbox <- f:
-		default:
-			playersMu.Lock()
-			c.dropped++
-			n := c.dropped
-			playersMu.Unlock()
-			log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
-		}
-	}
-}
-
-// enqueueGlobal queues frames for every live connection.
-func enqueueGlobal(frames ...[]any) {
-	playersMu.Lock()
-	conns := make([]*playerConn, 0, len(players))
-	for _, c := range players {
-		conns = append(conns, c)
-	}
-	playersMu.Unlock()
-	for _, c := range conns {
-		for _, f := range frames {
-			select {
-			case c.outbox <- f:
-			default:
-				playersMu.Lock()
-				c.dropped++
-				n := c.dropped
-				playersMu.Unlock()
-				log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
-			}
-		}
-	}
-}
-
-// sendDirect writes one bulk message immediately (5s deadline), bypassing
-// the tick outbox. Used only for the initial spawn burst (240 Spawn frames
-// exceed the 64-slot outbox); all steady-state traffic goes via send().
-func sendDirect(conn *websocket.Conn, frames ...[]any) error {
-	msg := bulk(frames...)
-	fmt.Printf("TX %s\n", msg)
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return conn.WriteMessage(websocket.TextMessage, msg)
-}
-
-// send queues unicast frames for one conn (flushed by the tick loop) and
-// logs the bulk. Keeps the original signature so call sites are unchanged.
-func send(conn *websocket.Conn, frames ...[]any) error {
-	msg := bulk(frames...)
-	fmt.Printf("TX %s\n", msg)
-	enqueueTo(conn, frames...)
-	return nil
-}
-
-// broadcast routes each frame: region-scoped packets only enqueue to conns
-// whose interest set includes the entity tile; global events fan out.
-// Queued into tick outboxes (never direct-written); shapes unchanged.
-func broadcast(frames ...[]any) {
-	msg := bulk(frames...)
-	fmt.Printf("TX %s\n", msg)
-	for _, f := range frames {
-		if len(f) == 0 {
-			continue
-		}
-		id, ok := f[0].(int)
-		if !ok {
-			enqueueGlobal(f)
-			continue
-		}
-		if !regionScoped(id) {
-			enqueueGlobal(f)
-			continue
-		}
-		inst := frameInstance(f)
-		x, y, found := entityPos(inst)
-		if !found {
-			enqueueGlobal(f)
-			continue
-		}
-		playersMu.Lock()
-		conns := make([]*playerConn, 0, len(players))
-		for _, c := range players {
-			conns = append(conns, c)
-		}
-		playersMu.Unlock()
-		for _, c := range conns {
-			if clientInterested(c, x, y) {
-				select {
-				case c.outbox <- f:
-				default:
-					playersMu.Lock()
-					c.dropped++
-					n := c.dropped
-					playersMu.Unlock()
-					log.Printf("outbox overflow instance=%s dropped=%d", c.instance, n)
-				}
-			}
-		}
-	}
-}
+// Unicast + fan-out mechanics moved to packages (D2a): gnet.Send/SendDirect
+// (internal/net Hub, TX logging + enqueue + immediate writes) and
+// worldcore.Broadcast (internal/world Registry, region routing). The old
+// root funcs (enqueueTo/enqueueGlobal/sendDirect/send/broadcast) are gone;
+// call sites use the package APIs directly.
 
 // startTickLoop launches the central 20Hz flush loop (one ticker per
 // process): every FlushInterval each conn's queued frames flush as a single
@@ -2368,82 +2158,98 @@ func startTickLoop() {
 			defer t.Stop()
 			for range t.C {
 				tickEngine.Tick()
-				playersMu.Lock()
-				conns := make([]*playerConn, 0, len(players))
-				for _, c := range players {
-					conns = append(conns, c)
-				}
-				playersMu.Unlock()
-				for _, c := range conns {
-					var frames [][]any
-					for {
-						select {
-						case f := <-c.outbox:
-							frames = append(frames, f)
-						default:
-							goto drained
-						}
-					}
-				drained:
-					if len(frames) == 0 {
-						continue
-					}
-					msg := bulk(frames...)
-					fmt.Printf("TX %s\n", msg)
-					writeMu.Lock()
-					_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					err := c.conn.WriteMessage(websocket.TextMessage, msg)
-					writeMu.Unlock()
-					if err != nil {
-						log.Printf("tick write failed instance=%s: %v", c.instance, err)
-						removeClient(c.conn)
-					}
+				for _, c := range gnet.Flush(worldcore.Conns()) {
+					worldcore.RemoveClient(c.WS)
 				}
 			}
 		}()
 	})
 }
 
-// removeClient drops a dead conn: subs cleanup + registry removal +
-// Despawn broadcast for its player (reconnect path).
-func removeClient(conn *websocket.Conn) {
-	playersMu.Lock()
-	c, ok := players[conn]
-	if ok {
-		delete(players, conn)
-	}
-	playersMu.Unlock()
-	subsMu.Lock()
-	delete(subs, conn)
-	subsMu.Unlock()
-	if !ok {
-		return
-	}
-	entitiesMu.Lock()
-	delete(entities, c.instance)
-	entitiesMu.Unlock()
-	// M8: leave the minigame (disconnect() kicks to lobby position).
-	m8OnDisconnect(c)
-	// M9: drop HP state + release any mob targeting this player.
-	m9PlayerLeave(c)
-	// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
-	m10ForgetPlayer(c.instance)
-	// Abilities: drop mana/target/fx state + freeze-tracker keys.
-	abForgetPlayer(c)
-	// Pets: despawn the companion (disconnect removePet parity).
-	petForgetPlayer(c)
-	// World: drop per-conn lamp state.
-	worldForgetPlayer(c)
-	// Social: hub unregister + friends flush + offline fanout (all three).
-	socOnDisconnect(c)
-	m12ClearSession(c, nil)
-	// M5: synchronous persist on disconnect (plus the 10s dirty flush).
-	m5SaveSync(c.username)
-	// M11: quest/achievement rows persist on disconnect (same path).
-	m11PersistQuests(c.username)
-	_ = conn.Close()
-	broadcast(pkt(PacketDespawn, despawnData{Instance: c.instance}))
-	log.Printf("client removed: instance=%s (despawn broadcast)", c.instance)
+// Disconnect fanout moved to the world Registry (D2a): worldcore.RemoveClient
+// runs the registry cleanup + Despawn broadcast + the hooks registered here
+// (same order as the old root removeClient) + close + log line. Register at
+// boot only (main() calls registerDisconnectHooks before serving).
+func registerDisconnectHooks() {
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// M8: leave the minigame (disconnect() kicks to lobby position).
+		m8OnDisconnect(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// M9: drop HP state + release any mob targeting this player.
+		m9PlayerLeave(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
+		m10ForgetPlayer(c.Instance)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// Abilities: drop mana/target/fx state + freeze-tracker keys.
+		abForgetPlayer(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// Pets: despawn the companion (disconnect removePet parity).
+		petForgetPlayer(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// World: drop per-conn lamp state.
+		worldForgetPlayer(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// Social: hub unregister + friends flush + offline fanout (all three).
+		socOnDisconnect(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		m12ClearSession(c, nil)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// M5: synchronous persist on disconnect (plus the 10s dirty flush).
+		m5SaveSync(c.Username)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// M11: quest/achievement rows persist on disconnect (same path).
+		m11PersistQuests(c.Username)
+	})
 }
 
 // hitResource registers one gather swing on the given resource instance:
@@ -2515,7 +2321,7 @@ func hitResource(attacker, instance string) {
 	swings := st.swings
 	resMu.Unlock()
 
-	broadcast(pkt(PacketAnimation, animationData{
+	worldcore.Broadcast(pkt(PacketAnimation, animationData{
 		Instance:         attacker,
 		Action:           ActionAttack,
 		ResourceInstance: instance,
@@ -2530,28 +2336,29 @@ func hitResource(attacker, instance string) {
 		instance, info.Experience, skill, desc.Key, info.Item)
 	// M6 (resourceskill.ts:114-118 order): the table item lands in the
 	// inventory BEFORE the skill XP — a full inventory would swallow the XP.
-	if ci := connByInstance(attacker); ci != nil && info.Item != "" {
+	if ci, _ := worldcore.Find[*playerConn](attacker); ci != nil && info.Item != "" {
 		yield := 1
 		if worldHarvestDouble(skill) {
 			yield = 2 // world: lumberjacking/mining double-yield events
 		}
-		idx := m5AddItem(ci.username, info.Item, yield)
-		_ = send(ci.conn, pktOp(PacketContainer, ContainerAdd, containerData{
+		idx := m5AddItem(ci.Username, info.Item, yield)
+		_ = gnet.Send(ci.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
 			Slot: &slotData{Index: idx, Key: info.Item, Count: yield, Enchantments: map[string]any{}},
 		}))
-		markDirty(ci.username)
+		markDirty(ci.Username)
 	}
 	// M5: table experience lands on the real gathering skill.
 	m5GatherXP(attacker, skill, info.Experience)
 	// M11: quest resource stages fire on exhaust (quest.ts resourceCallback
 	// from resourceskill.ts:131 — after the item + XP land).
-	m11Resource(connByInstance(attacker), skill, desc.Key)
+	attackerConn, _ := worldcore.Find[*playerConn](attacker)
+	m11Resource(attackerConn, skill, desc.Key)
 	resMu.Lock()
 	st.depleted = true
 	delay := resourceRespawnDelay(info)
 	resMu.Unlock()
-	broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDepleted}))
+	worldcore.Broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDepleted}))
 	log.Printf("resource %s depleted -> exhausted frame, respawn in %v", instance, delay)
 	resMu.Lock()
 	st.timer = time.AfterFunc(delay, func() {
@@ -2560,7 +2367,7 @@ func hitResource(attacker, instance string) {
 		st.depleted = false
 		st.timer = nil
 		resMu.Unlock()
-		broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDefault}))
+		worldcore.Broadcast(pkt(PacketResource, resourceData{Instance: instance, State: ResourceStateDefault}))
 		log.Printf("resource %s respawned (state 0)", instance)
 	})
 	resMu.Unlock()
@@ -2575,35 +2382,31 @@ type clientFrame []json.RawMessage
 // authoritative grid pos of each Character-like entity there (regions.ts
 // sendEntities/sendEntityPositions). The client diffs Spawns vs its spawned
 // set and asks for the missing ones via Who.
-func handleList(conn *websocket.Conn, c *playerConn) {
-	playersMu.Lock()
-	regions := append([]int(nil), c.regions...)
-	playersMu.Unlock()
+func handleList(c *playerConn) {
+	regions := c.Conn.Regions()
 	regionSet := make(map[int]bool, len(regions))
 	for _, r := range regions {
 		regionSet[r] = true
 	}
-	entitiesMu.Lock()
 	var ids []string
 	positions := make(map[string]any)
-	for _, e := range entities {
-		if regionSet[regionOf(e.X, e.Y)] {
+	for _, e := range worldcore.EntitySnapshot() {
+		if regionSet[worldcore.TileRegion(e.X, e.Y)] {
 			ids = append(ids, e.Instance)
 			positions[e.Instance] = map[string]any{"x": e.X, "y": e.Y}
 		}
 	}
-	entitiesMu.Unlock()
 	if ids == nil {
 		ids = []string{}
 	}
-	_ = send(conn, pktOp(PacketList, ListSpawns, map[string]any{"entities": ids}))
-	_ = send(conn, pktOp(PacketList, ListPositions, map[string]any{"positions": positions}))
-	log.Printf("list reply instance=%s entities=%d", c.instance, len(ids))
+	_ = gnet.Send(c.Conn, pktOp(PacketList, ListSpawns, map[string]any{"entities": ids}))
+	_ = gnet.Send(c.Conn, pktOp(PacketList, ListPositions, map[string]any{"positions": positions}))
+	log.Printf("list reply instance=%s entities=%d", c.Instance, len(ids))
 }
 
 // handleWho answers C->S Who (packet 7, [ids]): one S Spawn per known live
 // entity (incoming.ts handleWho). Unknown ids are ignored (logged).
-func handleWho(conn *websocket.Conn, frame clientFrame) {
+func handleWho(c *playerConn, frame clientFrame) {
 	if len(frame) < 2 {
 		return
 	}
@@ -2618,7 +2421,7 @@ func handleWho(conn *websocket.Conn, frame clientFrame) {
 			log.Printf("who unknown instance=%s", id)
 			continue
 		}
-		_ = send(conn, pkt(PacketSpawn, payload))
+		_ = gnet.Send(c.Conn, pkt(PacketSpawn, payload))
 	}
 	log.Printf("who reply instances=%d", len(ids))
 }
@@ -2636,31 +2439,22 @@ func handleSyncReq(c *playerConn, frame clientFrame) {
 	}
 	inst, _ := data["instance"].(string)
 	if inst == "" {
-		inst = c.instance
+		inst = c.Instance
 		data["instance"] = inst
 	}
-	x, y, found := entityPos(inst)
+	x, y, found := worldcore.EntityPos(inst)
 	if !found {
-		x, y = c.sess.playerX, c.sess.playerY
+		x, y = c.Sess.PlayerX, c.Sess.PlayerY
 	}
 	raw, _ := json.Marshal(data)
 	var msg json.RawMessage = raw
-	playersMu.Lock()
-	conns := make([]*playerConn, 0, len(players))
-	for _, o := range players {
-		if o != c {
-			conns = append(conns, o)
+	for _, o := range worldcore.AllOf[*playerConn]() {
+		if o == c {
+			continue
 		}
-	}
-	playersMu.Unlock()
-	for _, o := range conns {
-		if clientInterested(o, x, y) {
-			select {
-			case o.outbox <- []any{PacketSync, msg}:
-			default:
-				playersMu.Lock()
-				o.dropped++
-				playersMu.Unlock()
+		if worldcore.ClientInterested(o, x, y) {
+			if !gnet.TryEnqueue(o.Conn, []any{PacketSync, msg}) {
+				o.Conn.BumpDropped()
 			}
 		}
 	}
@@ -2671,7 +2465,7 @@ func handleSyncReq(c *playerConn, frame clientFrame) {
 // honour depleted state; players echo their Welcome shape at the registry
 // pos; statics echo their scenario definition.
 func spawnPayload(instance string) (any, bool) {
-	x, y, found := entityPos(instance)
+	x, y, found := worldcore.EntityPos(instance)
 	if !found {
 		return nil, false
 	}
@@ -2707,10 +2501,8 @@ func spawnPayload(instance string) (any, bool) {
 			}
 		}
 	}
-	playersMu.Lock()
-	for _, c := range players {
-		if c.instance == instance {
-			playersMu.Unlock()
+	for _, c := range worldcore.AllOf[*playerConn]() {
+		if c.Instance == instance {
 			ph := welcomePlayer(instance)
 			ph.X, ph.Y = x, y
 			// M10: Spawn PlayerData.pvp mirrors the live PVP state
@@ -2719,7 +2511,6 @@ func spawnPayload(instance string) (any, bool) {
 			return ph, true
 		}
 	}
-	playersMu.Unlock()
 	if d, ok := petPayloadByInstance(instance); ok {
 		return d, true
 	}
@@ -2767,67 +2558,56 @@ func initEntities() {
 	if testMode {
 		gx, gy = 101, 96
 	}
-	setEntityPos("p2", gx, gy)
+	worldcore.SetEntityPos("p2", gx, gy)
 	if !testMode && !cleanMode && !combatMode {
-		setEntityPos("m1", 104, 104)
+		worldcore.SetEntityPos("m1", 104, 104)
 	}
 	for _, o := range resourceSpawns {
-		setEntityPos(o.Instance, o.X, o.Y)
+		worldcore.SetEntityPos(o.Instance, o.X, o.Y)
 	}
 	if testMode && !cleanMode && !combatMode {
 		for i, key := range showMobs {
 			_ = key
 			x, y := showPos(i)
-			setEntityPos(fmt.Sprintf("m-show-%d", i+1), x, y)
+			worldcore.SetEntityPos(fmt.Sprintf("m-show-%d", i+1), x, y)
 		}
 		for i, key := range showNPCs {
 			_ = key
 			x, y := showPos(len(showMobs) + i)
-			setEntityPos(fmt.Sprintf("n-show-%d", i+1), x, y)
+			worldcore.SetEntityPos(fmt.Sprintf("n-show-%d", i+1), x, y)
 		}
 		for _, p := range demoPlayers() {
-			setEntityPos(p.Instance, p.X, p.Y)
+			worldcore.SetEntityPos(p.Instance, p.X, p.Y)
 		}
 	}
 	if cleanMode {
-		setEntityPos("p-adv-1", 102, 96)
+		worldcore.SetEntityPos("p-adv-1", 102, 96)
 	}
 	if combatMode {
-		setEntityPos(combatBotInstance, combatBotX, combatBotY)
-		setEntityPos(combatArcherInstance, combatArcherX, combatArcherY)
-		setEntityPos(combatMageInstance, combatMageX, combatMageY)
-		setEntityPos(combatSupInstance, combatSupX, combatSupY)
-		setEntityPos(combatDummyInstance, combatDummyX, combatDummyY)
-		setEntityPos(combatRatInstance, combatRatX, combatRatY)
+		worldcore.SetEntityPos(combatBotInstance, combatBotX, combatBotY)
+		worldcore.SetEntityPos(combatArcherInstance, combatArcherX, combatArcherY)
+		worldcore.SetEntityPos(combatMageInstance, combatMageX, combatMageY)
+		worldcore.SetEntityPos(combatSupInstance, combatSupX, combatSupY)
+		worldcore.SetEntityPos(combatDummyInstance, combatDummyX, combatDummyY)
+		worldcore.SetEntityPos(combatRatInstance, combatRatX, combatRatY)
 	}
-	entitiesMu.Lock()
-	n := len(entities)
-	entitiesMu.Unlock()
+	n := worldcore.EntityCount()
 	log.Printf("entity registry seeded: %d statics", n)
 }
 
 func handleConn(conn *websocket.Conn) {
-	subsMu.Lock()
-	subs[conn] = struct{}{}
-	subsMu.Unlock()
+	gnet.AddSub(conn)
 
 	// Per-connection player record: random Welcome instance + queued outbox.
 	inst := newPlayerInstance()
-	c := &playerConn{
-		conn:     conn,
-		instance: inst,
-		sess:     session{playerX: 100, playerY: 96, movementSpeed: 220},
-		outbox:   make(chan []any, outboxSize),
-	}
-	playersMu.Lock()
-	players[conn] = c
-	playersMu.Unlock()
-	setEntityPos(inst, 100, 96)
-	updateClientRegion(c)
-	defer removeClient(conn)
+	c := &playerConn{Conn: gnet.NewConn(conn, inst)}
+	worldcore.AddPlayer(conn, c)
+	worldcore.SetEntityPos(inst, 100, 96)
+	worldcore.UpdateRegion(c, 100, 96)
+	defer worldcore.RemoveClient(conn)
 
 	// S Connected [0,null]: client answers with Handshake{gVer}.
-	if err := send(conn, pkt(PacketConnected, nil)); err != nil {
+	if err := gnet.Send(c.Conn, pkt(PacketConnected, nil)); err != nil {
 		log.Printf("write connected: %v", err)
 		return
 	}
@@ -2851,7 +2631,7 @@ func handleConn(conn *websocket.Conn) {
 			chunk := all[i:end]
 			raw, _ := json.Marshal(chunk)
 			total += len(raw)
-			if err := sendDirect(conn, chunk...); err != nil {
+			if err := gnet.SendDirect(conn, chunk...); err != nil {
 				log.Printf("write spawns chunk %d: %v", i/80, err)
 				return
 			}
@@ -2885,8 +2665,8 @@ func handleConn(conn *websocket.Conn) {
 				continue
 			}
 			// Ops limiter: drop inbound frames over the per-conn msg budget.
-			if !opsAllowMsg(opsConnID(conn)) {
-				log.Printf("ops: drop frame over msg budget instance=%s", c.instance)
+			if !gnet.AllowMsg(gnet.AddrID(conn)) {
+				log.Printf("ops: drop frame over msg budget instance=%s", c.Instance)
 				continue
 			}
 			var id int
@@ -2898,11 +2678,11 @@ func handleConn(conn *websocket.Conn) {
 			case PacketHandshake: // C Handshake{gVer} -> S Handshake{type:client}
 				reply := HandshakeData{
 					Type:       "client",
-					Instance:   c.instance,
+					Instance:   c.Instance,
 					ServerID:   1,
 					ServerTime: time.Now().UnixMilli(),
 				}
-				if err := send(conn, pkt(PacketHandshake, reply)); err != nil {
+				if err := gnet.Send(c.Conn, pkt(PacketHandshake, reply)); err != nil {
 					log.Printf("write handshake: %v", err)
 					return
 				}
@@ -2924,17 +2704,17 @@ func handleConn(conn *websocket.Conn) {
 				// gold before the Container batch is built, giving the harness a
 				// deterministic wallet (Node e2e accounts start pre-loaded).
 				if login.SeedGold > 0 && testMode && !cleanMode && !combatMode {
-					m6SeedGold(c.username, login.SeedGold)
+					m6SeedGold(c.Username, login.SeedGold)
 					extra = append(extra, pktOp(PacketContainer, ContainerBatch, containerData{
 						Type: ContainerTypeInventory,
-						Data: &containerBatch{Slots: m6InvSlots(c.username)},
+						Data: &containerBatch{Slots: m6InvSlots(c.Username)},
 					}))
 				}
 				// M6 equipment e2e hook (TESTMAP only): seedArrow appends a
 				// fresh arrow stack so the harness gets a deterministic slot
 				// index (arrows are Equipment.Arrows-equippable).
 				if login.SeedArrow > 0 && testMode && !cleanMode && !combatMode {
-					arrowIdx := m6SeedItem(c.username, "arrow", login.SeedArrow)
+					arrowIdx := m6SeedItem(c.Username, "arrow", login.SeedArrow)
 					extra = append(extra, pktOp(PacketContainer, ContainerAdd, containerData{
 						Type: ContainerTypeInventory,
 						Slot: &slotData{Index: arrowIdx, Key: "arrow", Count: login.SeedArrow, Enchantments: map[string]any{}},
@@ -2952,12 +2732,12 @@ func handleConn(conn *websocket.Conn) {
 				// area) so the harness skips the long walk from spawn.
 				if len(login.SeedPos) == 2 && testMode && !cleanMode && !combatMode {
 					x, y := login.SeedPos[0], login.SeedPos[1]
-					c.sess.playerX, c.sess.playerY = x, y
-					setEntityPos(c.instance, x, y)
-					updateClientRegion(c)
-					markDirty(c.username)
+					c.Sess.PlayerX, c.Sess.PlayerY = x, y
+					worldcore.SetEntityPos(c.Instance, x, y)
+					worldcore.UpdateRegion(c, x, y)
+					markDirty(c.Username)
 					ph.X, ph.Y = x, y
-					extra = append(extra, pkt(PacketTeleport, teleportData{Instance: c.instance, X: x, Y: y}))
+					extra = append(extra, pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
 					// M8: the position change may cross a lobby area boundary
 					// (onEnter parity for the seeded tile).
 					m8OnPositionUpdate(c)
@@ -2969,34 +2749,31 @@ func handleConn(conn *websocket.Conn) {
 				// close (Node login.go database loader -> connection.reject);
 				// the persisted mspeed override applies to the session before
 				// the first movement check.
-				if m13CheckBan(c.username) {
-					writeMu.Lock()
-					_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					_ = conn.WriteMessage(websocket.TextMessage, []byte("ban"))
-					writeMu.Unlock()
-					removeClient(conn)
+				if m13CheckBan(c.Username) {
+					_ = gnet.WriteText(conn, []byte("ban"), 2*time.Second)
+					worldcore.RemoveClient(conn)
 					return
 				}
-				if ms := m13MovementSpeed(c.username); ms > 0 {
-					c.sess.movementSpeed = ms
+				if ms := m13MovementSpeed(c.Username); ms > 0 {
+					c.Sess.MovementSpeed = ms
 				}
 				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
 				// M11: restore + batch quest/achievement state after the login
 				// extras (handler.ts:69-70 onLoaded → handleQuests/
 				// handleAchievements Batch frames; m5Load precedent).
 				m11EnsureTables()
-				m11LoadQuests(c.username)
-				frames = append(frames, m11LoginBatches(c.username)...)
+				m11LoadQuests(c.Username)
+				frames = append(frames, m11LoginBatches(c.Username)...)
 				// Abilities: restore unlocks + queue the Ability Batch
 				// (handler.ts onLoaded ability serialize).
-				abLoadAbilities(c.username)
-				frames = append(frames, abLoginBatch(c.username))
+				abLoadAbilities(c.Username)
+				frames = append(frames, abLoginBatch(c.Username))
 				// Social: friends table DDL (boot already ran it; cheap
 				// re-ensure like m11), restore + batch the Friends List and
 				// the guild Login/Update when guilded, fan presence out.
 				socEnsureTables()
 				frames = append(frames, socOnLogin(c)...)
-				if err := send(conn, frames...); err != nil {
+				if err := gnet.Send(c.Conn, frames...); err != nil {
 					log.Printf("write welcome/map: %v", err)
 					return
 				}
@@ -3004,9 +2781,9 @@ func handleConn(conn *websocket.Conn) {
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
 				sendSpawns()
 			case PacketList: // C List request -> Spawns + Positions
-				handleList(conn, c)
+				handleList(c)
 			case PacketWho: // C Who [newIds] -> Spawn each known
-				handleWho(conn, frame)
+				handleWho(c, frame)
 			case PacketSync: // C Sync PlayerData -> forward to region neighbours
 				handleSyncReq(c, frame)
 			case PacketChat: // C Chat [text] -> sanitize, commands, region bubble (M7)
@@ -3087,11 +2864,11 @@ func handleConn(conn *websocket.Conn) {
 				if err := json.Unmarshal(frame[1], &mv); err != nil {
 					continue
 				}
-				if disconnect := handleMovement(conn, c, mv); disconnect {
+				if disconnect := handleMovement(c, mv); disconnect {
 					return
 				}
 			case PacketTarget: // C Target [opcode, instance] -> gather / loot / NPC talk
-				handleTarget(conn, c, frame)
+				handleTarget(c, frame)
 			case PacketStore: // C Store {opcode,key,index,count} -> Buy/Sell/Select (M6)
 				m6HandleStore(c, frame)
 			case PacketContainer: // C Container {opcode,...} -> bank moves/swap/drop (M6)
@@ -3122,17 +2899,26 @@ func main() {
 	m9Engine()           // M9: mob AI engine (mobs.json/spawns.json, 500ms tick)
 	startTickLoop()
 	initEntities()
+	// D2a: region geometry + region-enter hook for the world Registry (the
+	// world is loaded by initEntities above, so sideLen is final), then the
+	// disconnect fanout hooks owned by the Registry.
+	worldcore.Configure(sideLen, mapDivisionSize, surroundingRegions, func(v any) {
+		if pc, ok := v.(*playerConn); ok {
+			worldPushLights(pc) // world: region-enter Lamp fan-out (deduped, no-op when none new)
+		}
+	})
+	registerDisconnectHooks()
 	startShowcase()
 	if combatMode {
 		startCombat()
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn, ok := opsAccept(w, r)
+		conn, ok := gnet.Accept(w, r)
 		if !ok {
 			return
 		}
 		handleConn(conn)
-		opsRelease(conn)
+		gnet.Release(conn)
 	})
 
 	opsStartAPI()     // API_PORT set => serve REST; unset => off; busy port => log + continue

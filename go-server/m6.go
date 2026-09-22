@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 
 	"rpg-world-server/internal/controller"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // Type aliases so existing names keep resolving to the moved types.
@@ -146,15 +147,13 @@ func (m6store) TotalLevel(username string) int {
 
 type m6bus struct{ m12bus }
 
-func (m6bus) Broadcast(frames ...[]any) { broadcast(frames...) }
+func (m6bus) Broadcast(frames ...[]any) { worldcore.Broadcast(frames...) }
 
 type m6peers struct{ m12peers }
 
 func (m6peers) WithStoreOpen(key string) []controller.EconomyConn {
-	playersMu.Lock()
-	defer playersMu.Unlock()
 	var out []controller.EconomyConn
-	for _, c := range players {
+	for _, c := range worldcore.AllOf[*playerConn]() {
 		if c.storeOpen == key {
 			out = append(out, c)
 		}
@@ -184,7 +183,9 @@ func (m6pets) Grant(c controller.EconomyConn, mob, item string) {
 
 type m6world struct{}
 
-func (m6world) EntityPos(instance string) (int, int, bool) { return entityPos(instance) }
+func (m6world) EntityPos(instance string) (int, int, bool) {
+	return worldcore.EntityPos(instance)
+}
 func (m6world) SpawnNPCKey(instance string) (string, bool) {
 	payload, ok := spawnPayload(instance)
 	if !ok {

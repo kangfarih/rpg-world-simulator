@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"rpg-world-server/internal/minigame"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // ---------------------------------------------------------------------------
@@ -103,14 +105,8 @@ var (
 type m8Effects struct{}
 
 func m8ConnFor(instance string) *playerConn {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	for _, c := range players {
-		if c.instance == instance {
-			return c
-		}
-	}
-	return nil
+	c, _ := worldcore.Find[*playerConn](instance)
+	return c
 }
 
 func (m8Effects) Notify(instance, msg string) {
@@ -126,12 +122,12 @@ func (m8Effects) Teleport(instance string, x, y int) {
 }
 
 func (m8Effects) Broadcast(frames ...[]any) {
-	broadcast(frames...)
+	worldcore.Broadcast(frames...)
 }
 
 func (m8Effects) SendMinigame(instance string, opcode int, data map[string]any) {
 	if c := m8ConnFor(instance); c != nil {
-		_ = send(c.conn, pktOp(PacketMinigame, opcode, data))
+		_ = gnet.Send(c.Conn, pktOp(PacketMinigame, opcode, data))
 	}
 }
 
@@ -139,15 +135,15 @@ func (m8Effects) SendPointer(instance string, target string) {
 	if c := m8ConnFor(instance); c != nil {
 		// player.pointer: Remove-then-Entity (pointer.ts default remove).
 		// Remove carries no data → 2-element frame like Node's serialize.
-		_ = send(c.conn, []any{PacketPointer, PointerRemove})
-		_ = send(c.conn, pktOp(PacketPointer, PointerEntity, map[string]any{
+		_ = gnet.Send(c.Conn, []any{PacketPointer, PointerRemove})
+		_ = gnet.Send(c.Conn, pktOp(PacketPointer, PointerEntity, map[string]any{
 			"instance": target, "type": PointerEntity,
 		}))
 	}
 }
 
 func (m8Effects) EntityPos(instance string) (int, int, bool) {
-	return entityPos(instance)
+	return worldcore.EntityPos(instance)
 }
 
 // m8SyncStarted mirrors started assignments onto playerConn fields.
@@ -211,11 +207,11 @@ func m8SyncTick(gameKey string, res minigame.TickResult) {
 // Teleport broadcast; the region recompute happens inside the broadcast's
 // interest resolution and updateClientRegion here).
 func m8Teleport(c *playerConn, x, y int) {
-	c.sess.playerX = x
-	c.sess.playerY = y
-	setEntityPos(c.instance, x, y)
-	updateClientRegion(c)
-	broadcast(pkt(PacketTeleport, teleportData{Instance: c.instance, X: x, Y: y}))
+	c.Sess.PlayerX = x
+	c.Sess.PlayerY = y
+	worldcore.SetEntityPos(c.Instance, x, y)
+	worldcore.UpdateRegion(c, x, y)
+	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +277,7 @@ func m8GameFor(key string) *minigame.Game {
 // exit hook only to detect leaving via the lobby (Node tracks exits through
 // the area callbacks; the stub keeps membership until stop()).
 func m8OnPositionUpdate(c *playerConn) {
-	m8Mgr.OnPositionUpdate(c.instance, c.sess.playerX, c.sess.playerY, c.m8Game, m8Fx)
+	m8Mgr.OnPositionUpdate(c.Instance, c.Sess.PlayerX, c.Sess.PlayerY, c.m8Game, m8Fx)
 }
 
 // m8OnDisconnect ports Minigame.disconnect: teleport to a random lobby
@@ -291,7 +287,7 @@ func m8OnDisconnect(c *playerConn) {
 		return
 	}
 	key := c.m8Game
-	x, y, remaining := m8Mgr.Disconnect(key, c.instance)
+	x, y, remaining := m8Mgr.Disconnect(key, c.Instance)
 
 	c.m8Game = ""
 	c.m8Team = 0
@@ -302,7 +298,7 @@ func m8OnDisconnect(c *playerConn) {
 	// persist path saves the lobby tile and the relogin lands back in the
 	// lobby area (disconnect() setPosition parity). Persist goes through
 	// m5TrackPos (never hold pstateMu outside it).
-	c.sess.playerX, c.sess.playerY = x, y
+	c.Sess.PlayerX, c.Sess.PlayerY = x, y
 	m5TrackPos(c)
 
 	// minigame.ts disconnect: stop when fewer than 2 players remain.
@@ -356,7 +352,7 @@ func m8HandleTest(c *playerConn, frame clientFrame) {
 		// Full session introspection for the harness (positions, team,
 		// score, target, game key).
 		m6Notify(c, fmt.Sprintf("m8:state game=%s team=%d score=%d target=%s x=%d y=%d inst=%s",
-			c.m8Game, c.m8Team, c.m8Score, c.m8Target, c.sess.playerX, c.sess.playerY, c.instance))
+			c.m8Game, c.m8Team, c.m8Score, c.m8Target, c.Sess.PlayerX, c.Sess.PlayerY, c.Instance))
 	case "score":
 		if c.m8Game != "coursing" {
 			return

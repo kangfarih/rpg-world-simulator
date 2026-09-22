@@ -1,5 +1,5 @@
-// Ops wiring (API + console + rate limits) — behavior-additive root glue over
-// internal/api, internal/console and internal/net.
+// Ops wiring (API + console) — behavior-additive root glue over
+// internal/api, internal/console, internal/net and internal/world.
 //
 //   - API: an api.Server is started on API_PORT only when API_PORT is set
 //     (default off). Providers read live state (players count, guild list,
@@ -7,11 +7,11 @@
 //   - Console: a stdin bufio loop in a goroutine feeds console.Exec with a
 //     Handler over the live world. Disabled when stdin is not a TTY or when
 //     CONSOLE=0 (tests/harness must not hang on stdin).
-//   - Limits: a shared net.Limiter enforces the per-IP connection cap at
-//     accept (reject + log over 16), the per-message budget in the accept
-//     read path (drop over budget) and the chat bucket in the m7 path (same
-//     silent drop as the chatState bucket-exhaust today). Per-conn state is
-//     forgotten on disconnect.
+//   - Limits/accept gate: owned by internal/net (Hub: per-IP cap at accept,
+//     per-message budget in the read path, chat bucket in the m7 path, IP
+//     bans, update-mode gate). This file only drives the Hub from console
+//     commands (/update, /ipban); per-conn state is forgotten on disconnect
+//     by the Hub release path (D2a: no transport globals stay in root).
 //
 // With no env set the API never starts, the console never starts, and the
 // limiter runs at the same budgets the server already enforced (16/IP,
@@ -28,15 +28,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/gorilla/websocket"
 
 	"rpg-world-server/internal/api"
 	"rpg-world-server/internal/console"
-	opsnet "rpg-world-server/internal/net"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // opsGameVersion / opsMaxPlayers feed the API status snapshot (the stub has
@@ -47,124 +45,16 @@ const (
 	opsMaxPlayers  = 200
 )
 
-// opsLimiter is the shared rate limiter (defaults mirror the TS/Go
-// conventions: 16 conns/IP, 300 msg/s/conn, chat 3 burst @ 0.5/s).
-var opsLimiter = opsnet.NewLimiterFromConfig(opsnet.Config{})
+// Transport + accept-gate state moved to internal/net (D2a): the Hub owns
+// the limiter, the update-mode gate, the admitted-conn table and the IP ban
+// set. The accept/release/budget entry points live there as package funcs
+// (gnet.Accept/Release/AllowMsg/AllowChat); console commands below drive
+// the Hub via gnet.SetAccepting/gnet.BanIP/gnet.BannedIPs.
 
-// opsAccepting gates new connections (console /update flips it; default true).
-var opsAccepting atomic.Bool
-
-// opsConns tracks admitted conns for observability (conn -> client IP).
-var (
-	opsConnsMu sync.Mutex
-	opsConns   = map[*websocket.Conn]string{}
-)
-
-// opsIPBans is the console-managed IP ban set (empty by default, so the
-// accept path behaves exactly as before until /ipban is used).
-var (
-	opsIPMu   sync.Mutex
-	opsIPBans = map[string]bool{}
-)
-
-func init() { opsAccepting.Store(true) }
-
-// opsClientIP strips the port from an HTTP remote address ("1.2.3.4:5678" ->
-// "1.2.3.4"); unparseable input is returned as-is.
-func opsClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// opsConnID is the limiter's per-connection key. RemoteAddr (ip:port) is
-// unique per conn and stays available after close, so release-time Forget
-// needs no extra bookkeeping.
-func opsConnID(conn *websocket.Conn) string {
-	if conn == nil {
-		return ""
-	}
-	if a := conn.RemoteAddr(); a != nil {
-		return a.String()
-	}
-	return ""
-}
-
-// opsAccept gates one HTTP request before the WS upgrade: update-mode and
-// IP bans reject first, then the per-IP cap (reject + log over 16), then the
-// upgrade. A failed upgrade releases the acquired slot.
-func opsAccept(w http.ResponseWriter, r *http.Request) (*websocket.Conn, bool) {
-	if !opsAccepting.Load() {
-		http.Error(w, "server updating", http.StatusServiceUnavailable)
-		return nil, false
-	}
-	ip := opsClientIP(r)
-	opsIPMu.Lock()
-	banned := opsIPBans[ip]
-	opsIPMu.Unlock()
-	if banned {
-		log.Printf("ops: reject banned ip=%s", ip)
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return nil, false
-	}
-	if !opsLimiter.Acquire(ip) {
-		log.Printf("ops: reject ip=%s over per-IP cap (%d)", ip, opsnet.DefaultMaxConnectionsPerIP)
-		http.Error(w, "too many connections", http.StatusTooManyRequests)
-		return nil, false
-	}
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("upgrade: %v", err)
-		opsLimiter.Release(ip)
-		return nil, false
-	}
-	opsConnsMu.Lock()
-	opsConns[conn] = ip
-	opsConnsMu.Unlock()
-	log.Printf("client connected: %s", r.RemoteAddr)
-	return conn, true
-}
-
-// opsRelease frees the limiter slot and per-conn msg/chat state for a conn
-// whose handleConn loop has returned (every disconnect path funnels there:
-// read errors, kicks, bans and the deferred removeClient).
-func opsRelease(conn *websocket.Conn) {
-	if conn == nil {
-		return
-	}
-	opsConnsMu.Lock()
-	ip, ok := opsConns[conn]
-	if ok {
-		delete(opsConns, conn)
-	}
-	opsConnsMu.Unlock()
-	if !ok {
-		return
-	}
-	opsLimiter.Forget(opsConnID(conn))
-	opsLimiter.Release(ip)
-}
-
-// opsAllowMsg reports whether one inbound frame from id may be processed
-// (drops over the per-message budget; caller logs the drop).
-func opsAllowMsg(id string) bool {
-	if id == "" {
-		return true
-	}
-	return opsLimiter.AllowMsg(id, time.Now().UnixMilli())
-}
-
-// opsAllowChat reports whether conn may send one chat message under the
-// limiter bucket. Rejection drops silently, matching the chatState
-// bucket-exhaust path in m7HandleChat today (no notify).
-func opsAllowChat(c *playerConn) bool {
-	if c == nil || c.conn == nil {
-		return true
-	}
-	return opsLimiter.AllowChat(opsConnID(c.conn), time.Now().UnixMilli())
-}
+// Transport + accept-gate entry points moved to internal/net (D2a): use
+// gnet.Accept/gnet.Release/gnet.AllowMsg/gnet.AllowChat at the former
+// opsAccept/opsRelease/opsAllowMsg/opsAllowChat call sites (main.go
+// handler, handleConn read path, m7 chat path).
 
 // ---------------------------------------------------------------------------
 // API.
@@ -194,18 +84,11 @@ func opsStartAPI() {
 // opsPlayers serves live player snapshots to the API.
 type opsPlayers struct{}
 
-// opsPlayerUsernames snapshots online usernames (lock released before the
-// caller touches player state, preserving the playersMu/pstateMu order).
+// opsPlayerUsernames snapshots online usernames via the world Registry
+// (the Registry mutex is released before the caller touches player state,
+// preserving the old playersMu/pstateMu order).
 func opsPlayerUsernames() []string {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	names := make([]string, 0, len(players))
-	for _, c := range players {
-		if c.username != "" {
-			names = append(names, c.username)
-		}
-	}
-	return names
+	return m7PlayerUsernames()
 }
 
 func opsPlayerLevel(username string) int {
@@ -271,15 +154,12 @@ func (opsStatus) Status() api.Status {
 			port = n
 		}
 	}
-	playersMu.Lock()
-	n := len(players)
-	playersMu.Unlock()
 	return api.Status{
 		Name:        "kaetram-stub",
 		Port:        port,
 		GameVersion: opsGameVersion,
 		MaxPlayers:  opsMaxPlayers,
-		PlayerCount: n,
+		PlayerCount: worldcore.PlayerCount(),
 	}
 }
 
@@ -340,15 +220,10 @@ func (opsConsole) Total() string {
 }
 
 func (opsConsole) Update() string {
-	opsAccepting.Store(false)
-	playersMu.Lock()
-	conns := make([]*websocket.Conn, 0, len(players))
-	for k := range players {
-		conns = append(conns, k)
-	}
-	playersMu.Unlock()
+	gnet.SetAccepting(false)
+	conns := worldcore.AllWS()
 	for _, k := range conns {
-		removeClient(k)
+		worldcore.RemoveClient(k)
 	}
 	return fmt.Sprintf("Server updating: rejected %d connection(s), new connections disabled.", len(conns))
 }
@@ -359,7 +234,7 @@ func (opsConsole) Kill(username string) string {
 		return fmt.Sprintf("Player %s not found.", username)
 	}
 	m9DamagePlayer(target, m9PlayerHP(target), nil)
-	return fmt.Sprintf("%s has been killed.", target.username)
+	return fmt.Sprintf("%s has been killed.", target.Username)
 }
 
 func opsConsoleDrop(username, verb string) string {
@@ -367,8 +242,8 @@ func opsConsoleDrop(username, verb string) string {
 	if target == nil {
 		return fmt.Sprintf("Player %s not found.", username)
 	}
-	name := target.username
-	removeClient(target.conn)
+	name := target.Username
+	worldcore.RemoveClient(target.Conn.WS)
 	return fmt.Sprintf("%s has been %s.", name, verb)
 }
 
@@ -380,11 +255,9 @@ func opsConsoleSetRank(username string, rank int, title string) string {
 	if target == nil {
 		return fmt.Sprintf("Player %s not found.", username)
 	}
-	playersMu.Lock()
 	target.rank = rank
 	chatStateFor(target).rank = rank
-	name := target.username
-	playersMu.Unlock()
+	name := target.Username
 	return fmt.Sprintf("%s is now %s.", name, title)
 }
 
@@ -397,35 +270,26 @@ func (o opsConsole) SetMod(username string) string {
 
 func (opsConsole) IPBan(ip string) string {
 	if ip == "list" {
-		opsIPMu.Lock()
-		out := make([]string, 0, len(opsIPBans))
-		for k := range opsIPBans {
-			out = append(out, k)
-		}
-		opsIPMu.Unlock()
+		out := gnet.BannedIPs()
 		sort.Strings(out)
 		if len(out) == 0 {
 			return "No banned IPs."
 		}
 		return "Banned IPs: " + strings.Join(out, ", ")
 	}
-	opsIPMu.Lock()
-	opsIPBans[ip] = true
-	opsIPMu.Unlock()
-	playersMu.Lock()
+	gnet.BanIP(ip)
 	var conns []*websocket.Conn
-	for k := range players {
-		host, _, err := net.SplitHostPort(opsConnID(k))
+	for _, k := range worldcore.AllWS() {
+		host, _, err := net.SplitHostPort(gnet.AddrID(k))
 		if err != nil {
-			host = opsConnID(k)
+			host = gnet.AddrID(k)
 		}
 		if host == ip {
 			conns = append(conns, k)
 		}
 	}
-	playersMu.Unlock()
 	for _, k := range conns {
-		removeClient(k)
+		worldcore.RemoveClient(k)
 	}
 	return fmt.Sprintf("Banned %s (%d connection(s) dropped).", ip, len(conns))
 }

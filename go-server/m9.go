@@ -34,6 +34,8 @@ import (
 	"time"
 
 	"rpg-world-server/internal/entity"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // m9MobProfile/m9SpawnOverride/m9Overrides are entity-owned now (same
@@ -134,20 +136,18 @@ type gameWorldAdapter struct{}
 var gameWorld = gameWorldAdapter{}
 
 func (gameWorldAdapter) Players() []entity.PlayerView {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	out := make([]entity.PlayerView, 0, len(players))
-	for _, c := range players {
+	out := []entity.PlayerView{}
+	for _, c := range worldcore.AllOf[*playerConn]() {
 		lvl, def := 0, 0
-		if st := m5StateFor(c.username); st != nil {
+		if st := m5StateFor(c.Username); st != nil {
 			lvl = st.Level
 			if sk := st.Skills[SkillDefense]; sk != nil {
 				def = sk.Level
 			}
 		}
 		out = append(out, entity.PlayerView{
-			Instance: c.instance, Username: c.username,
-			X: c.sess.playerX, Y: c.sess.playerY,
+			Instance: c.Instance, Username: c.Username,
+			X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 			Level: lvl, Defense: def,
 		})
 	}
@@ -155,8 +155,8 @@ func (gameWorldAdapter) Players() []entity.PlayerView {
 }
 
 func (gameWorldAdapter) PlayerPos(instance string) (int, int, bool) {
-	if c := connByInstance(instance); c != nil {
-		return c.sess.playerX, c.sess.playerY, true
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		return c.Sess.PlayerX, c.Sess.PlayerY, true
 	}
 	return 0, 0, false
 }
@@ -164,23 +164,23 @@ func (gameWorldAdapter) PlayerPos(instance string) (int, int, bool) {
 func (gameWorldAdapter) Blocked(x, y int) bool { return blocked(x, y) }
 
 func (gameWorldAdapter) SetEntityPos(instance string, x, y int) {
-	setEntityPos(instance, x, y)
+	worldcore.SetEntityPos(instance, x, y)
 }
 
 func (gameWorldAdapter) Despawn(instance string) {
-	broadcast(pkt(PacketDespawn, despawnData{Instance: instance}))
+	worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: instance}))
 }
 
 func (gameWorldAdapter) MoveMob(instance string, x, y int) {
-	setEntityPos(instance, x, y)
-	broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
+	worldcore.SetEntityPos(instance, x, y)
+	worldcore.Broadcast(pktOp(PacketMovement, MovementMove, serverMovement{
 		Instance: instance, X: intp(x), Y: intp(y),
 	}))
 }
 
 func (gameWorldAdapter) SpawnMobFrame(s entity.MobSpawn) {
-	setEntityPos(s.Instance, s.X, s.Y)
-	broadcast(pkt(PacketSpawn, EntityData{
+	worldcore.SetEntityPos(s.Instance, s.X, s.Y)
+	worldcore.Broadcast(pkt(PacketSpawn, EntityData{
 		Instance: s.Instance, Type: EntityMob, Key: s.Key,
 		Name: s.Name, X: s.X, Y: s.Y,
 		Orientation: intp(OrientationDown),
@@ -192,13 +192,13 @@ func (gameWorldAdapter) SpawnMobFrame(s entity.MobSpawn) {
 }
 
 func (gameWorldAdapter) MobPoints(instance string, hp, maxHP int) {
-	broadcast(pkt(PacketPoints, pointsData{
+	worldcore.Broadcast(pkt(PacketPoints, pointsData{
 		Instance: instance, HitPoints: intp(hp), MaxHitPoints: intp(maxHP),
 	}))
 }
 
 func (gameWorldAdapter) StrikeMob(attacker, target string, dmg int) {
-	broadcast(pktOp(PacketCombat, CombatHit, combatData{
+	worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
 		Instance: attacker, Target: target,
 		Hit: HitData{Type: HitsNormal, Damage: dmg},
 	}))
@@ -220,26 +220,26 @@ func (gameWorldAdapter) ForgetHeroHP(instance string) {
 }
 
 func (gameWorldAdapter) HeroPoints(instance string, hp, maxHP int) {
-	broadcast(pkt(PacketPoints, pointsData{
+	worldcore.Broadcast(pkt(PacketPoints, pointsData{
 		Instance: instance, HitPoints: intp(hp), MaxHitPoints: intp(maxHP),
 	}))
 }
 
 func (gameWorldAdapter) HeroDied(playerInstance, _, _ string) {
-	broadcast(pkt(PacketDeath, playerInstance))
+	worldcore.Broadcast(pkt(PacketDeath, playerInstance))
 }
 
 func (gameWorldAdapter) TeleportHero(instance string, x, y int) {
-	broadcast(pkt(PacketTeleport, teleportData{Instance: instance, X: x, Y: y}))
+	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: instance, X: x, Y: y}))
 }
 
 func (gameWorldAdapter) SpawnHero(instance string) {
-	broadcast(pkt(PacketSpawn, welcomePlayer(instance)))
+	worldcore.Broadcast(pkt(PacketSpawn, welcomePlayer(instance)))
 }
 
 func (gameWorldAdapter) HeroRespawned(instance string, x, y int) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, pkt(PacketRespawn, respawnData{X: x, Y: y}))
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, pkt(PacketRespawn, respawnData{X: x, Y: y}))
 	}
 }
 
@@ -264,31 +264,32 @@ func (gameWorldAdapter) RegisterLoot(inst, key string, count, x, y int, owner st
 }
 
 func (gameWorldAdapter) SpawnLootItem(i entity.LootItem) {
-	broadcast(pkt(PacketSpawn, EntityData{
+	worldcore.Broadcast(pkt(PacketSpawn, EntityData{
 		Instance: i.Instance, Type: EntityItem, Key: i.Key, Name: i.Key,
 		X: i.X, Y: i.Y, Count: intp(i.Count),
 	}))
 }
 
 func (gameWorldAdapter) QuestKill(killerInstance, mobKey string) {
-	m11Kill(connByInstance(killerInstance), mobKey) // nil-safe (m11Kill guards nil)
+	killer, _ := worldcore.Find[*playerConn](killerInstance)
+	m11Kill(killer, mobKey) // nil-safe (m11Kill guards nil)
 }
 
 func (gameWorldAdapter) Notify(instance, msg string) {
-	if c := connByInstance(instance); c != nil {
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
 		m6Notify(c, msg)
 	}
 }
 
 func (gameWorldAdapter) SendPVP(instance string, state bool) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, []any{PacketPVP, nil, map[string]any{"state": state}})
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, []any{PacketPVP, nil, map[string]any{"state": state}})
 	}
 }
 
 func (gameWorldAdapter) SendOverlaySet(instance, image, colour string) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, pktOp(PacketOverlay, entity.OverlaySet, map[string]any{
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, pktOp(PacketOverlay, entity.OverlaySet, map[string]any{
 			"image":  image,
 			"colour": colour,
 		}))
@@ -296,20 +297,20 @@ func (gameWorldAdapter) SendOverlaySet(instance, image, colour string) {
 }
 
 func (gameWorldAdapter) SendOverlayRemove(instance string) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, pktOp(PacketOverlay, entity.OverlayRemove, nil))
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, pktOp(PacketOverlay, entity.OverlayRemove, nil))
 	}
 }
 
 func (gameWorldAdapter) SendCamera(instance string, opcode int) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, pktOp(PacketCamera, opcode, nil))
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, pktOp(PacketCamera, opcode, nil))
 	}
 }
 
 func (gameWorldAdapter) SendMusic(instance, song string) {
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, []any{PacketMusic, nil, song})
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, []any{PacketMusic, nil, song})
 	}
 }
 
@@ -318,8 +319,8 @@ func (gameWorldAdapter) SendEffect(instance string, add bool, effect int) {
 	if add {
 		op = EffectAdd
 	}
-	if c := connByInstance(instance); c != nil {
-		_ = send(c.conn, pktOp(PacketEffect, op, effectData{Instance: instance, Effect: effect}))
+	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
+		_ = gnet.Send(c.Conn, pktOp(PacketEffect, op, effectData{Instance: instance, Effect: effect}))
 	}
 }
 
@@ -332,8 +333,8 @@ func (gameWorldAdapter) FreezeClear(instance string) {
 }
 
 func (gameWorldAdapter) SpawnChestFrame(c entity.ChestSpawn) {
-	setEntityPos(c.Instance, c.X, c.Y)
-	broadcast(pkt(PacketSpawn, EntityData{
+	worldcore.SetEntityPos(c.Instance, c.X, c.Y)
+	worldcore.Broadcast(pkt(PacketSpawn, EntityData{
 		Instance: c.Instance, Type: EntityChest, Key: "chest", Name: "Chest", X: c.X, Y: c.Y,
 	}))
 }
@@ -341,15 +342,15 @@ func (gameWorldAdapter) SpawnChestFrame(c entity.ChestSpawn) {
 // playerViewFor builds one PlayerView for a live conn (m9OnPlayerMoved).
 func playerViewFor(c *playerConn) entity.PlayerView {
 	lvl, def := 0, 0
-	if st := m5StateFor(c.username); st != nil {
+	if st := m5StateFor(c.Username); st != nil {
 		lvl = st.Level
 		if sk := st.Skills[SkillDefense]; sk != nil {
 			def = sk.Level
 		}
 	}
 	return entity.PlayerView{
-		Instance: c.instance, Username: c.username,
-		X: c.sess.playerX, Y: c.sess.playerY,
+		Instance: c.Instance, Username: c.Username,
+		X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 		Level: lvl, Defense: def,
 	}
 }
@@ -364,7 +365,7 @@ func killerView(killer *playerConn) *entity.PlayerView {
 	if killer == nil {
 		return nil
 	}
-	v := entity.PlayerView{Instance: killer.instance, Username: killer.username}
+	v := entity.PlayerView{Instance: killer.Instance, Username: killer.Username}
 	return &v
 }
 
@@ -423,8 +424,8 @@ func m9SpawnMob(instance, key string, x, y int, over m9Overrides) bool {
 	payload := m.data()
 	m9Mu.Unlock()
 
-	setEntityPos(instance, x, y)
-	broadcast(pkt(PacketSpawn, payload))
+	worldcore.SetEntityPos(instance, x, y)
+	worldcore.Broadcast(pkt(PacketSpawn, payload))
 	// M10: Mob.addToChestArea parity — a mob spawning inside a chest area
 	// registers with it (addEntity; removes any unlooted reward chest).
 	if area := m10ChestAreaAt(x, y); area != nil {
@@ -515,7 +516,7 @@ var m9PlayerHPs sync.Map // instance -> remaining HP
 func m9PlayerMaxHP() int { return entity.HeroMaxHP } // stub hero max (divergence note)
 
 func m9PlayerHP(c *playerConn) int {
-	return gameWorld.GetHeroHP(c.instance)
+	return gameWorld.GetHeroHP(c.Instance)
 }
 
 // m9DamagePlayer applies mob damage: Points frame, Death on empty.
@@ -524,37 +525,37 @@ func m9DamagePlayer(c *playerConn, dmg int, from *m9Mob) {
 	if from != nil {
 		f = from
 	}
-	entity.DamageHero(gameWorld, c.instance, c.username, dmg, f)
+	entity.DamageHero(gameWorld, c.Instance, c.Username, dmg, f)
 }
 
 // m9HandleRespawn ports incoming.handleRespawn -> player.respawn: only when
 // dead; teleport to spawn + Spawn broadcast + Respawn{x,y} + Points sync.
 func m9HandleRespawn(c *playerConn) {
 	if m9PlayerHP(c) > 0 {
-		log.Printf("m9: invalid respawn request from %s", c.username)
+		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
 	x, y := entity.HeroSpawnX, entity.HeroSpawnY
-	c.sess.playerX, c.sess.playerY = x, y
-	if !entity.RespawnHero(gameWorld, c.instance) {
-		log.Printf("m9: invalid respawn request from %s", c.username)
+	c.Sess.PlayerX, c.Sess.PlayerY = x, y
+	if !entity.RespawnHero(gameWorld, c.Instance) {
+		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
 	m8OnPositionUpdate(c)  // respawn position can cross an area boundary
 	m10OnPositionUpdate(c) // M10: area callbacks on the respawn tile too
-	log.Printf("m9: %s respawned at %d,%d", c.username, x, y)
+	log.Printf("m9: %s respawned at %d,%d", c.Username, x, y)
 }
 
 // m9PlayerLeave drops per-player state on disconnect.
 func m9PlayerLeave(c *playerConn) {
-	m9PlayerHPs.Delete(c.instance)
+	m9PlayerHPs.Delete(c.Instance)
 	m9Mu.Lock()
 	for _, m := range m9Mobs {
 		m.mu.Lock()
-		if m.target == c.instance {
+		if m.target == c.Instance {
 			m.target = ""
 		}
-		delete(m.attackers, c.instance)
+		delete(m.attackers, c.Instance)
 		m.mu.Unlock()
 	}
 	m9Mu.Unlock()
@@ -617,7 +618,7 @@ func m9OnPlayerMoved(c *playerConn) {
 		}
 		m.mu.Lock()
 		if m.target == "" && entity.CanAggro(m.prof, m.over, m.x, m.y, m.target, v) {
-			m.target = c.instance
+			m.target = c.Instance
 			m.lastTgt = time.Now()
 		}
 		m.mu.Unlock()
@@ -647,14 +648,14 @@ func m9TestHandler(c *playerConn, data []byte) {
 		m9SpawnMob(d.Instance, d.Key, d.X, d.Y, m9Overrides{Aggro: d.Aggro, Leash: d.Leash})
 	case "remove":
 		if m := m9MobFor(d.Instance); m != nil {
-			broadcast(pkt(PacketDespawn, despawnData{Instance: d.Instance}))
+			worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: d.Instance}))
 			m9Remove(d.Instance)
 		}
 	case "tp": // reposition the hero server-side (seedPos precedent)
 		if c != nil {
-			c.sess.playerX, c.sess.playerY = d.X, d.Y
-			setEntityPos(c.instance, d.X, d.Y)
-			broadcast(pkt(PacketTeleport, teleportData{Instance: c.instance, X: d.X, Y: d.Y}))
+			c.Sess.PlayerX, c.Sess.PlayerY = d.X, d.Y
+			worldcore.SetEntityPos(c.Instance, d.X, d.Y)
+			worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: d.X, Y: d.Y}))
 			m8OnPositionUpdate(c)
 			m9OnPlayerMoved(c)     // position updates run the aggro scan
 			m10OnPositionUpdate(c) // M10: camera/music/pvp/overlay area callbacks

@@ -13,6 +13,8 @@ package main
 
 import (
 	"rpg-world-server/internal/controller"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // Type aliases so existing names keep resolving to the moved types.
@@ -29,10 +31,10 @@ type (
 // controller.Conn seam (*playerConn satisfies it, so identity is preserved).
 // ---------------------------------------------------------------------------
 
-func (c *playerConn) InstanceID() string { return c.instance }
-func (c *playerConn) PlayerName() string { return c.username }
-func (c *playerConn) TileX() int         { return c.sess.playerX }
-func (c *playerConn) TileY() int         { return c.sess.playerY }
+func (c *playerConn) InstanceID() string { return c.Instance }
+func (c *playerConn) PlayerName() string { return c.Username }
+func (c *playerConn) TileX() int         { return c.Sess.PlayerX }
+func (c *playerConn) TileY() int         { return c.Sess.PlayerY }
 
 // GrantContainerAccess sets canAccessContainer (enchanter NPC branch).
 func (c *playerConn) GrantContainerAccess() { c.canAccessContainer = true }
@@ -46,7 +48,8 @@ func m12conn(c controller.Conn) *playerConn {
 	if c == nil {
 		return nil
 	}
-	return connByInstance(c.InstanceID())
+	pc, _ := worldcore.Find[*playerConn](c.InstanceID())
+	return pc
 }
 
 // ---------------------------------------------------------------------------
@@ -171,15 +174,15 @@ func (m12store) MaxStack(key string) int { return m6MaxStack(key) }
 type m12bus struct{}
 
 func (m12bus) SendTo(instance string, frames ...[]any) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
-	_ = send(c.conn, frames...)
+	_ = gnet.Send(c.Conn, frames...)
 }
 
 func (m12bus) Notify(instance string, message string) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return
 	}
@@ -189,7 +192,7 @@ func (m12bus) Notify(instance string, message string) {
 type m12peers struct{}
 
 func (m12peers) ByInstance(instance string) (controller.Conn, bool) {
-	c := connByInstance(instance)
+	c, _ := worldcore.Find[*playerConn](instance)
 	if c == nil {
 		return nil, false
 	}
@@ -199,10 +202,8 @@ func (m12peers) ByInstance(instance string) (controller.Conn, bool) {
 // connByUsername finds the live connection for a username (trade peers are
 // players, so usernames are unique among connections here).
 func (m12peers) ByUsername(username string) (controller.Conn, bool) {
-	playersMu.Lock()
-	defer playersMu.Unlock()
-	for _, c := range players {
-		if c.username == username {
+	for _, c := range worldcore.AllOf[*playerConn]() {
+		if c.Username == username {
 			return c, true
 		}
 	}

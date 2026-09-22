@@ -1,34 +1,26 @@
-// Package net is an ADDITIVE-ONLY seam for the root server's connection
-// fan-out and region-interest routing. It defines the Bus interface that a
-// future root adapter will implement; it imports nothing from the root
-// package (that would be an import cycle) and changes no root behavior.
+// Package net is the root server's connection transport + fan-out owner
+// (D2a). It defines the Bus interface, the Conn/Session transport types and
+// the Hub (subs registry, writeMu, accept gate, Send/SendDirect/Flush
+// mechanics, RegionScoped/FrameInstance routing predicates); it imports
+// nothing from the root package (that would be an import cycle).
 //
-// Read-only copies of the root (package main) signatures this seam mirrors
-// (main.go; DO NOT import, DO NOT duplicate logic here):
+// Canonical homes (D2a; the root keeps no transport globals):
 //
-//	func broadcast(frames ...[]any)
-//	func send(conn *websocket.Conn, frames ...[]any) error
-//	func sendDirect(conn *websocket.Conn, frames ...[]any) error
-//	func enqueueTo(conn *websocket.Conn, frames ...[]any)
-//	func enqueueGlobal(frames ...[]any)
-//	func regionOf(x, y int) int
-//	func setEntityPos(instance string, x, y int)
-//	func entityPos(instance string) (int, int, bool)
-//	func updateClientRegion(c *playerConn)
-//	func clientInterested(c *playerConn, x, y int) bool
-//	func regionScoped(id int) bool
-//	func frameInstance(frame []any) string
-//	func removeClient(conn *websocket.Conn)
+//	Hub.AddSub/DelSub          <- root subs/subsMu map
+//	Hub.writeMu                <- root writeMu
+//	Hub.Upgrader               <- root upgrader
+//	Hub.Accept/Release         <- root opsAccept/opsRelease (update-mode +
+//	                              IP bans + per-IP cap, same log lines)
+//	Hub.AllowMsg/AllowChat     <- root opsAllowMsg/opsAllowChat
+//	Hub.Send/SendDirect/Flush  <- root send/sendDirect/tick-loop flush
+//	                              (identical TX logs, deadlines, drop lines)
+//	Conn/Session               <- root playerConn/session (transport half;
+//	                              the root playerConn embeds *Conn)
+//	RegionScoped/FrameInstance <- root regionScoped/frameInstance
+//	Limiter                    <- root opsLimiter (limits.go, unchanged)
 //
-// Globals (signatures only, main.go):
-//
-//	writeMu sync.Mutex
-//	subsMu  sync.Mutex
-//	subs    = map[*websocket.Conn]struct{}{}
-//	entitiesMu sync.Mutex
-//	entities   = map[string]*Entity{}
-//	playersMu sync.Mutex
-//	players   = map[*websocket.Conn]*playerConn{}
+// The entity registry + region routing live in internal/world (Registry),
+// which calls into this package (world -> net; never the reverse).
 package net
 
 // Frame is one S->C packet frame: [id, data] or [id, opcode, data]

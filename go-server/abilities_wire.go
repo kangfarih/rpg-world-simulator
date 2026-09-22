@@ -29,7 +29,9 @@ import (
 	"time"
 
 	"rpg-world-server/internal/abilities"
+	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/status"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // Ability opcodes (Opcodes.Ability in opcodes.ts): Batch0 Add1 Update2
@@ -166,11 +168,11 @@ func abGrantAbility(c *playerConn, username, key string, level int) bool {
 		typ = AbilityTypePassive
 	}
 	if had {
-		_ = send(c.conn, pktOp(PacketAbility, AbilityUpdate, abilityEntry{
+		_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityUpdate, abilityEntry{
 			Key: key, Level: a.Level, QuickSlot: quick,
 		}))
 	} else {
-		_ = send(c.conn, pktOp(PacketAbility, AbilityAdd, abilityEntry{
+		_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityAdd, abilityEntry{
 			Key: key, Level: a.Level, QuickSlot: quick, Type: intp(typ),
 		}))
 	}
@@ -315,11 +317,11 @@ func abHandleAbility(c *playerConn, data []byte) {
 			return
 		}
 		abMu.Lock()
-		if abLevels[c.username][d.Key] > 0 {
-			if abQuick[c.username] == nil {
-				abQuick[c.username] = map[string]int{}
+		if abLevels[c.Username][d.Key] > 0 {
+			if abQuick[c.Username] == nil {
+				abQuick[c.Username] = map[string]int{}
 			}
-			abQuick[c.username][d.Key] = *d.Index
+			abQuick[c.Username][d.Key] = *d.Index
 		}
 		abMu.Unlock()
 	}
@@ -340,7 +342,7 @@ func abUse(c *playerConn, key string) {
 		return
 	}
 	abMu.Lock()
-	level := abLevels[c.username][key]
+	level := abLevels[c.Username][key]
 	abMu.Unlock()
 	if level < 1 {
 		return // TS: abilities[key]?.activate — unknown/unowned is a no-op
@@ -352,14 +354,14 @@ func abUse(c *playerConn, key string) {
 	if !ok {
 		return
 	}
-	if r.RequiresTarget(key) && abLiveTarget(c.instance) == "" {
+	if r.RequiresTarget(key) && abLiveTarget(c.Instance) == "" {
 		m6Notify(c, "misc:NEED_COMBAT")
 		return
 	}
 	nowMs := time.Now().UnixMilli()
-	mana := abManaFor(c.instance)
+	mana := abManaFor(c.Instance)
 	abMu.Lock()
-	last := abLastCast[c.username+"\x00"+key]
+	last := abLastCast[c.Username+"\x00"+key]
 	abMu.Unlock()
 	if mana < a.ManaCost {
 		m6Notify(c, "misc:NOT_ENOUGH_MANA")
@@ -375,45 +377,45 @@ func abUse(c *playerConn, key string) {
 	}
 	mana -= a.ManaCost
 	abMu.Lock()
-	abMana[c.instance] = mana
-	abLastCast[c.username+"\x00"+key] = nowMs
+	abMana[c.Instance] = mana
+	abLastCast[c.Username+"\x00"+key] = nowMs
 	abMu.Unlock()
-	_ = send(c.conn, pkt(PacketPoints, pointsData{
-		Instance: c.instance, Mana: intp(mana), MaxMana: intp(abMaxMana),
+	_ = gnet.Send(c.Conn, pkt(PacketPoints, pointsData{
+		Instance: c.Instance, Mana: intp(mana), MaxMana: intp(abMaxMana),
 	}))
-	_ = send(c.conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+	_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 	fx := a.Effect()
 	if fx.Kind == abilities.EffectNone {
 		// Client-visual window only (intimidate/hotshot/secretcalling):
 		// untoggle when the duration lapses, no server status.
 		if fx.DurationMs > 0 {
 			time.AfterFunc(time.Duration(fx.DurationMs)*time.Millisecond, func() {
-				_ = send(c.conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+				_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 			})
 		}
-		log.Printf("abilities: %s cast %s (window %dms)", c.username, key, fx.DurationMs)
+		log.Printf("abilities: %s cast %s (window %dms)", c.Username, key, fx.DurationMs)
 		return
 	}
 	effectID := int(fx.Kind)
-	abStatus.Apply(status.Instance(c.instance), status.Kind(effectID), 0, int64(fx.DurationMs), nowMs)
+	abStatus.Apply(status.Instance(c.Instance), status.Kind(effectID), 0, int64(fx.DurationMs), nowMs)
 	abFxMu.Lock()
-	m := abFx[c.instance]
+	m := abFx[c.Instance]
 	if m == nil {
 		m = map[int]bool{}
-		abFx[c.instance] = m
+		abFx[c.Instance] = m
 	}
 	m[effectID] = true
 	abFxMu.Unlock()
-	broadcast(pktOp(PacketEffect, EffectAdd, effectData{Instance: c.instance, Effect: effectID}))
-	log.Printf("abilities: %s cast %s effect=%d dur=%dms", c.username, key, effectID, fx.DurationMs)
+	worldcore.Broadcast(pktOp(PacketEffect, EffectAdd, effectData{Instance: c.Instance, Effect: effectID}))
+	log.Printf("abilities: %s cast %s effect=%d dur=%dms", c.Username, key, effectID, fx.DurationMs)
 	if fx.DurationMs > 0 {
 		time.AfterFunc(time.Duration(fx.DurationMs)*time.Millisecond, func() {
-			_ = send(c.conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
+			_ = gnet.Send(c.Conn, pktOp(PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 			abFxMu.Lock()
-			if abFx[c.instance][effectID] {
-				delete(abFx[c.instance], effectID)
+			if abFx[c.Instance][effectID] {
+				delete(abFx[c.Instance], effectID)
 				abFxMu.Unlock()
-				broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: c.instance, Effect: effectID}))
+				worldcore.Broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: c.Instance, Effect: effectID}))
 				return
 			}
 			abFxMu.Unlock()
@@ -484,7 +486,7 @@ func abStatusTick() {
 		if strings.HasSuffix(inst, abFreezeSuffix) {
 			base = strings.TrimSuffix(inst, abFreezeSuffix)
 		}
-		if c := connByInstance(base); c != nil {
+		if c, _ := worldcore.Find[*playerConn](base); c != nil {
 			m9DamagePlayer(c, ex.Damage, nil)
 			log.Printf("abilities: dot %s kind=%d dmg=%d hp=%d", base, int(ex.Kind), ex.Damage, m9PlayerHP(c))
 			continue
@@ -502,7 +504,7 @@ func abStatusTick() {
 		for effectID := range effs {
 			if !abStatus.Has(status.Instance(inst), status.Kind(effectID)) {
 				delete(effs, effectID)
-				broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: inst, Effect: effectID}))
+				worldcore.Broadcast(pktOp(PacketEffect, EffectRemove, effectData{Instance: inst, Effect: effectID}))
 			}
 		}
 		if len(effs) == 0 {
@@ -518,14 +520,14 @@ func abForgetPlayer(c *playerConn) {
 	if c == nil {
 		return
 	}
-	abStatus.Clear(status.Instance(c.instance + abFreezeSuffix))
+	abStatus.Clear(status.Instance(c.Instance + abFreezeSuffix))
 	abMu.Lock()
-	delete(abMana, c.instance)
-	delete(abTarget, c.instance)
+	delete(abMana, c.Instance)
+	delete(abTarget, c.Instance)
 	abMu.Unlock()
 	abFxMu.Lock()
-	delete(abFx, c.instance)
-	delete(abFreezeSet, c.instance)
+	delete(abFx, c.Instance)
+	delete(abFreezeSet, c.Instance)
 	abFxMu.Unlock()
 }
 
@@ -559,8 +561,8 @@ func abTestHandler(c *playerConn, data []byte) {
 		if level < 1 {
 			level = 1
 		}
-		if abGrantAbility(c, c.username, d.Key, level) {
-			m6Notify(c, "ab:grant "+d.Key+"="+itoa(int64(abLevels[c.username][d.Key])))
+		if abGrantAbility(c, c.Username, d.Key, level) {
+			m6Notify(c, "ab:grant "+d.Key+"="+itoa(int64(abLevels[c.Username][d.Key])))
 		}
 	case "apply":
 		var kind status.Kind
@@ -574,21 +576,21 @@ func abTestHandler(c *playerConn, data []byte) {
 		default:
 			return
 		}
-		abStatus.Apply(status.Instance(c.instance), kind, d.Power, d.DurationMs, time.Now().UnixMilli())
+		abStatus.Apply(status.Instance(c.Instance), kind, d.Power, d.DurationMs, time.Now().UnixMilli())
 		m6Notify(c, "ab:applied "+strings.ToLower(d.Kind))
 	case "mana":
 		abMu.Lock()
-		abMana[c.instance] = d.Value
+		abMana[c.Instance] = d.Value
 		abMu.Unlock()
 		m6Notify(c, "ab:mana="+itoa(int64(d.Value)))
 	case "echo":
 		abMu.Lock()
-		keys := make([]string, 0, len(abLevels[c.username]))
-		for k, lv := range abLevels[c.username] {
+		keys := make([]string, 0, len(abLevels[c.Username]))
+		for k, lv := range abLevels[c.Username] {
 			keys = append(keys, k+"="+itoa(int64(lv)))
 		}
 		sort.Strings(keys)
-		mana, ok := abMana[c.instance]
+		mana, ok := abMana[c.Instance]
 		abMu.Unlock()
 		if !ok {
 			mana = abMaxMana

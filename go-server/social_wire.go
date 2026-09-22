@@ -84,6 +84,8 @@ import (
 	"rpg-world-server/internal/friends"
 	"rpg-world-server/internal/guilds"
 	"rpg-world-server/internal/hub"
+	gnet "rpg-world-server/internal/net"
+	worldcore "rpg-world-server/internal/world"
 )
 
 // socServerID mirrors config.serverId on the wire (the stub handshake sends
@@ -443,19 +445,19 @@ func socFriendsListFrame(l *friends.List) []any {
 }
 
 func socSendFriendsAdd(c *playerConn, username string, online bool, serverID int) {
-	_ = send(c.conn, pktOp(PacketFriends, FriendAdd, map[string]any{
+	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendAdd, map[string]any{
 		"username": username, "status": online, "serverId": serverID,
 	}))
 }
 
 func socSendFriendsRemove(c *playerConn, username string) {
-	_ = send(c.conn, pktOp(PacketFriends, FriendRemove, map[string]any{
+	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendRemove, map[string]any{
 		"username": username,
 	}))
 }
 
 func socSendFriendsStatus(c *playerConn, username string, online bool, serverID int) {
-	_ = send(c.conn, pktOp(PacketFriends, FriendStatus, map[string]any{
+	_ = gnet.Send(c.Conn, pktOp(PacketFriends, FriendStatus, map[string]any{
 		"username": username, "status": online, "serverId": serverID,
 	}))
 }
@@ -485,7 +487,7 @@ func socGuildLoginFrame(g *guilds.Guild) []any {
 }
 
 func socSendGuildError(c *playerConn, message string) {
-	_ = send(c.conn, pktOp(PacketGuild, GuildError, map[string]any{"message": message}))
+	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildError, map[string]any{"message": message}))
 }
 
 // socOnlineGuildmates snapshots the online members of g excluding skip.
@@ -511,7 +513,7 @@ func socDeliverGuildChat(from, message string, members []string) {
 	recips, _ := socHub.Route(hub.Message{From: from, Kind: hub.KindGuild, Payload: members})
 	for _, name := range recips {
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildChat, map[string]any{
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildChat, map[string]any{
 				"username": from, "serverId": socServerID, "message": message,
 			}))
 		}
@@ -551,11 +553,11 @@ func socFriendAdd(c *playerConn, username string) {
 		m6Notify(c, "misc:FRIENDS_USERNAME_TOO_LONG")
 		return
 	}
-	if key == strings.ToLower(c.username) {
+	if key == strings.ToLower(c.Username) {
 		m6Notify(c, "misc:FRIENDS_ADD_SELF")
 		return
 	}
-	l := socFriendsFor(c.username)
+	l := socFriendsFor(c.Username)
 	socMu.Lock()
 	dup := l.IsFriend(key)
 	socMu.Unlock()
@@ -582,15 +584,15 @@ func socFriendAdd(c *playerConn, username string) {
 	socMu.Lock()
 	l.SetStatus(key, online, sid)
 	socMu.Unlock()
-	socPersistFriends(c.username)
+	socPersistFriends(c.Username)
 	socSendFriendsAdd(c, key, online, sid)
-	log.Printf("social: %s added friend %s online=%v", c.username, key, online)
+	log.Printf("social: %s added friend %s online=%v", c.Username, key, online)
 }
 
 // socFriendRemove ports friends.ts remove().
 func socFriendRemove(c *playerConn, username string) {
 	key := strings.ToLower(strings.TrimSpace(username))
-	l := socFriendsFor(c.username)
+	l := socFriendsFor(c.Username)
 	socMu.Lock()
 	removed := l.Remove(key)
 	socMu.Unlock()
@@ -598,9 +600,9 @@ func socFriendRemove(c *playerConn, username string) {
 		m6Notify(c, "misc:FRIENDS_NOT_IN_LIST")
 		return
 	}
-	socPersistFriends(c.username)
+	socPersistFriends(c.Username)
 	socSendFriendsRemove(c, key)
-	log.Printf("social: %s removed friend %s", c.username, key)
+	log.Printf("social: %s removed friend %s", c.Username, key)
 }
 
 // socHandleGuild routes C->S Guild frames [35,{opcode,...}]
@@ -655,11 +657,11 @@ func socHandleGuild(c *playerConn, data []byte) {
 // socGuildCreate ports guilds.ts create() minus the economy/progression gates
 // (documented divergence): membership + name-uniqueness checks only.
 func socGuildCreate(c *playerConn, name, colour string, outline *int, outlineColour, crest string) {
-	if _, err := socGuilds.GuildOf(c.username); err == nil {
+	if _, err := socGuilds.GuildOf(c.Username); err == nil {
 		m6Notify(c, "guilds:ALREADY_IN_GUILD")
 		return
 	}
-	g, err := socGuilds.Create(c.username, name)
+	g, err := socGuilds.Create(c.Username, name)
 	if err != nil {
 		if err == guilds.ErrAlreadyInGuild {
 			m6Notify(c, "guilds:ALREADY_IN_GUILD")
@@ -686,20 +688,20 @@ func socGuildCreate(c *playerConn, name, colour string, outline *int, outlineCol
 	socDeco[g.ID] = deco
 	socMu.Unlock()
 	socSaveGuildRows(g)
-	_ = send(c.conn, socGuildLoginFrame(g))
-	log.Printf("social: %s created guild %s (%s)", c.username, g.Name, g.ID)
+	_ = gnet.Send(c.Conn, socGuildLoginFrame(g))
+	log.Printf("social: %s created guild %s (%s)", c.Username, g.Name, g.ID)
 }
 
 // socGuildJoin ports the join flow over a pending invite (invite-only
 // divergence): AcceptInvite, then connect parity (Login + Update of online
 // members to the joiner) plus a Join sync to the other online members.
 func socGuildJoin(c *playerConn, identifier string) {
-	if _, err := socGuilds.GuildOf(c.username); err == nil {
+	if _, err := socGuilds.GuildOf(c.Username); err == nil {
 		m6Notify(c, "guilds:ALREADY_IN_GUILD")
 		return
 	}
 	id := strings.ToLower(identifier)
-	if err := socGuilds.AcceptInvite(c.username, id); err != nil {
+	if err := socGuilds.AcceptInvite(c.Username, id); err != nil {
 		switch err {
 		case guilds.ErrAlreadyInGuild:
 			m6Notify(c, "guilds:ALREADY_IN_GUILD")
@@ -712,27 +714,27 @@ func socGuildJoin(c *playerConn, identifier string) {
 		}
 		return
 	}
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
 	socPersistGuildID(g.ID)
-	_ = send(c.conn, socGuildLoginFrame(g))
+	_ = gnet.Send(c.Conn, socGuildLoginFrame(g))
 	socSendGuildUpdateOnline(c)
-	for _, name := range socOnlineGuildmates(g, c.username) {
+	for _, name := range socOnlineGuildmates(g, c.Username) {
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildJoin, map[string]any{
-				"username": c.username, "serverId": socServerID,
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildJoin, map[string]any{
+				"username": c.Username, "serverId": socServerID,
 			}))
 		}
 	}
-	log.Printf("social: %s joined guild %s", c.username, g.ID)
+	log.Printf("social: %s joined guild %s", c.Username, g.ID)
 }
 
 // socSendGuildUpdateOnline sends the joiner the online roster
 // (guilds.ts updateStatus parity: Update {members:[{username, serverId}]}).
 func socSendGuildUpdateOnline(c *playerConn) {
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
@@ -748,12 +750,12 @@ func socSendGuildUpdateOnline(c *playerConn) {
 	if online == nil {
 		online = []socGuildMember{}
 	}
-	_ = send(c.conn, pktOp(PacketGuild, GuildUpdate, map[string]any{"members": online}))
+	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{"members": online}))
 }
 
 // socGuildLeave ports guilds.ts leave() (owner leaving disbands).
 func socGuildLeave(c *playerConn) {
-	before, err := socGuilds.GuildOf(c.username)
+	before, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
@@ -761,23 +763,23 @@ func socGuildLeave(c *playerConn) {
 	for u := range before.Members {
 		members = append(members, u)
 	}
-	ownerLeaving := before.Owner == c.username
-	if err := socGuilds.Leave(c.username); err != nil {
+	ownerLeaving := before.Owner == c.Username
+	if err := socGuilds.Leave(c.Username); err != nil {
 		return
 	}
 	socPersistGuildID(before.ID)
-	_ = send(c.conn, pktOp(PacketGuild, GuildLeave, nil))
+	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildLeave, nil))
 	for _, name := range members {
-		if name == c.username {
+		if name == c.Username {
 			continue
 		}
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildLeave, map[string]any{
-				"username": c.username,
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, map[string]any{
+				"username": c.Username,
 			}))
 		}
 	}
-	log.Printf("social: %s left guild %s disband=%v", c.username, before.ID, ownerLeaving)
+	log.Printf("social: %s left guild %s disband=%v", c.Username, before.ID, ownerLeaving)
 }
 
 // socGuildList ports guilds.ts get() from the persisted rows (the registry
@@ -850,14 +852,14 @@ func socGuildList(c *playerConn, from, to int) {
 	if list == nil {
 		list = []map[string]any{}
 	}
-	_ = send(c.conn, pktOp(PacketGuild, GuildList, map[string]any{
+	_ = gnet.Send(c.Conn, pktOp(PacketGuild, GuildList, map[string]any{
 		"guilds": list, "total": total,
 	}))
 }
 
 // socGuildChat ports guilds.ts chat() through the Router fanout.
 func socGuildChat(c *playerConn, message string) {
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
@@ -870,13 +872,13 @@ func socGuildChat(c *playerConn, message string) {
 		members = append(members, u)
 	}
 	sort.Strings(members)
-	socDeliverGuildChat(c.username, text, members)
-	log.Printf("social: guild %s chat from %s", g.ID, c.username)
+	socDeliverGuildChat(c.Username, text, members)
+	log.Printf("social: guild %s chat from %s", g.ID, c.Username)
 }
 
 // socGuildSetRankDelta ports promote/demote via SetRank(rank +/- 1).
 func socGuildSetRankDelta(c *playerConn, username string, delta int) {
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		return
 	}
@@ -884,7 +886,7 @@ func socGuildSetRankDelta(c *playerConn, username string, delta int) {
 	if !ok {
 		return
 	}
-	if err := socGuilds.SetRank(c.username, username, cur+guilds.Rank(delta)); err != nil {
+	if err := socGuilds.SetRank(c.Username, username, cur+guilds.Rank(delta)); err != nil {
 		if err == guilds.ErrNoPermission {
 			m6Notify(c, "guilds:NO_PERMISSION_RANK")
 		}
@@ -894,25 +896,25 @@ func socGuildSetRankDelta(c *playerConn, username string, delta int) {
 	rank := int(cur + guilds.Rank(delta))
 	for _, name := range socOnlineGuildmates(g, "") {
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildRank, map[string]any{
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildRank, map[string]any{
 				"username": username, "rank": rank,
 			}))
 		}
 	}
-	log.Printf("social: %s set %s rank to %d in %s", c.username, username, rank, g.ID)
+	log.Printf("social: %s set %s rank to %d in %s", c.Username, username, rank, g.ID)
 }
 
 // socGuildKick ports guilds.ts kick(). Packet path is silent like TS
 // incoming (the /guild command path notifies separately).
 func socGuildKick(c *playerConn, username string, viaCommand bool) {
-	before, err := socGuilds.GuildOf(c.username)
+	before, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		if viaCommand {
 			m6Notify(c, "You are not in a guild.")
 		}
 		return
 	}
-	if err := socGuilds.Kick(c.username, username); err != nil {
+	if err := socGuilds.Kick(c.Username, username); err != nil {
 		if viaCommand {
 			if err == guilds.ErrNoPermission {
 				m6Notify(c, "guilds:NO_PERMISSION")
@@ -924,14 +926,14 @@ func socGuildKick(c *playerConn, username string, viaCommand bool) {
 	}
 	socPersistGuildID(before.ID)
 	if t := m7PlayerByName(username); t != nil {
-		_ = send(t.conn, pktOp(PacketGuild, GuildLeave, nil))
+		_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, nil))
 	}
 	for _, name := range socOnlineGuildmates(before, username) {
-		if name == c.username {
+		if name == c.Username {
 			continue
 		}
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildLeave, map[string]any{
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildLeave, map[string]any{
 				"username": username,
 			}))
 		}
@@ -939,14 +941,14 @@ func socGuildKick(c *playerConn, username string, viaCommand bool) {
 	if viaCommand {
 		m6Notify(c, "You have kicked "+username+" from your guild.")
 	}
-	log.Printf("social: %s kicked %s from %s", c.username, username, before.ID)
+	log.Printf("social: %s kicked %s from %s", c.Username, username, before.ID)
 }
 
 // socBroadcastGuildRank fans a Rank frame to every online member of g.
 func socBroadcastGuildRank(g *guilds.Guild, username string, rank int) {
 	for _, name := range socOnlineGuildmates(g, "") {
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, pktOp(PacketGuild, GuildRank, map[string]any{
+			_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildRank, map[string]any{
 				"username": username, "rank": rank,
 			}))
 		}
@@ -965,7 +967,7 @@ func socGuildRankCommand(c *playerConn, rankStr, username string) {
 		m6Notify(c, "Malformed command, expected /guild rank [rank 0-6] [username]")
 		return
 	}
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		m6Notify(c, "You are not in a guild.")
 		return
@@ -974,7 +976,7 @@ func socGuildRankCommand(c *playerConn, rankStr, username string) {
 		m6Notify(c, "Could not find a member with the name: "+username+".")
 		return
 	}
-	if serr := socGuilds.SetRank(c.username, username, guilds.Rank(n)); serr != nil {
+	if serr := socGuilds.SetRank(c.Username, username, guilds.Rank(n)); serr != nil {
 		if serr == guilds.ErrNoPermission {
 			m6Notify(c, "guilds:NO_PERMISSION_RANK")
 		}
@@ -994,12 +996,12 @@ func socGuildInvite(c *playerConn, target string) {
 		m6Notify(c, "Malformed command, expected /guild invite [username]")
 		return
 	}
-	g, err := socGuilds.GuildOf(c.username)
+	g, err := socGuilds.GuildOf(c.Username)
 	if err != nil {
 		m6Notify(c, "You are not in a guild.")
 		return
 	}
-	if err := socGuilds.Invite(c.username, name); err != nil {
+	if err := socGuilds.Invite(c.Username, name); err != nil {
 		switch err {
 		case guilds.ErrNoPermission:
 			m6Notify(c, "guilds:NO_PERMISSION")
@@ -1014,7 +1016,7 @@ func socGuildInvite(c *playerConn, target string) {
 	if t := m7PlayerByName(name); t != nil {
 		m6Notify(t, "You have been invited to guild "+g.Name+".")
 	}
-	log.Printf("social: %s invited %s to %s", c.username, name, g.ID)
+	log.Printf("social: %s invited %s to %s", c.Username, name, g.ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,21 +1028,21 @@ func socGuildInvite(c *playerConn, target string) {
 // frames (Friends List + guild Login/Update when guilded). Presence fanout to
 // other conns goes out directly; the returned frames join the Welcome bulk.
 func socOnLogin(c *playerConn) [][]any {
-	if c == nil || c.username == "" {
+	if c == nil || c.Username == "" {
 		return nil
 	}
-	socHub.Register(strings.ToLower(c.username))
-	socLoadFriends(c.username)
-	l := socFriendsFor(c.username)
+	socHub.Register(strings.ToLower(c.Username))
+	socLoadFriends(c.Username)
+	l := socFriendsFor(c.Username)
 	var frames [][]any
 	frames = append(frames, socFriendsListFrame(l))
-	if g, err := socGuilds.GuildOf(c.username); err == nil {
+	if g, err := socGuilds.GuildOf(c.Username); err == nil {
 		frames = append(frames, socGuildLoginFrame(g))
 		socSendGuildUpdateOnline(c)
-		for _, name := range socOnlineGuildmates(g, c.username) {
+		for _, name := range socOnlineGuildmates(g, c.Username) {
 			if t := m7PlayerByName(name); t != nil {
-				_ = send(t.conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
-					"members": []socGuildMember{{Username: c.username, ServerID: intp(socServerID)}},
+				_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
+					"members": []socGuildMember{{Username: c.Username, ServerID: intp(socServerID)}},
 				}))
 			}
 		}
@@ -1048,7 +1050,7 @@ func socOnLogin(c *playerConn) [][]any {
 	// Friends online fanout: every online owner listing this user gets a
 	// Status update (world.ts syncFriendsList parity).
 	for _, name := range m7PlayerUsernames() {
-		if name == c.username {
+		if name == c.Username {
 			continue
 		}
 		o := m7PlayerByName(name)
@@ -1057,13 +1059,13 @@ func socOnLogin(c *playerConn) [][]any {
 		}
 		ol := socFriendsFor(name)
 		socMu.Lock()
-		has := ol.IsFriend(c.username)
+		has := ol.IsFriend(c.Username)
 		if has {
-			ol.SetStatus(c.username, true, socServerID)
+			ol.SetStatus(c.Username, true, socServerID)
 		}
 		socMu.Unlock()
 		if has {
-			socSendFriendsStatus(o, c.username, true, socServerID)
+			socSendFriendsStatus(o, c.Username, true, socServerID)
 		}
 	}
 	return frames
@@ -1073,11 +1075,11 @@ func socOnLogin(c *playerConn) [][]any {
 // presence out (Status offline + guild Update serverId -1). Called from
 // removeClient after the conn leaves the players map.
 func socOnDisconnect(c *playerConn) {
-	if c == nil || c.username == "" {
+	if c == nil || c.Username == "" {
 		return
 	}
-	socHub.Unregister(strings.ToLower(c.username))
-	socPersistFriends(c.username)
+	socHub.Unregister(strings.ToLower(c.Username))
+	socPersistFriends(c.Username)
 	for _, name := range m7PlayerUsernames() {
 		o := m7PlayerByName(name)
 		if o == nil {
@@ -1085,25 +1087,25 @@ func socOnDisconnect(c *playerConn) {
 		}
 		ol := socFriendsFor(name)
 		socMu.Lock()
-		has := ol.IsFriend(c.username)
+		has := ol.IsFriend(c.Username)
 		if has {
-			ol.SetStatus(c.username, false, friends.OfflineServerID)
+			ol.SetStatus(c.Username, false, friends.OfflineServerID)
 		}
 		socMu.Unlock()
 		if has {
-			socSendFriendsStatus(o, c.username, false, friends.OfflineServerID)
+			socSendFriendsStatus(o, c.Username, false, friends.OfflineServerID)
 		}
 	}
-	if g, err := socGuilds.GuildOf(c.username); err == nil {
-		for _, name := range socOnlineGuildmates(g, c.username) {
+	if g, err := socGuilds.GuildOf(c.Username); err == nil {
+		for _, name := range socOnlineGuildmates(g, c.Username) {
 			if t := m7PlayerByName(name); t != nil {
-				_ = send(t.conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
-					"members": []socGuildMember{{Username: c.username, ServerID: intp(friends.OfflineServerID)}},
+				_ = gnet.Send(t.Conn, pktOp(PacketGuild, GuildUpdate, map[string]any{
+					"members": []socGuildMember{{Username: c.Username, ServerID: intp(friends.OfflineServerID)}},
 				}))
 			}
 		}
 	}
-	log.Printf("social: %s disconnected (presence flushed)", c.username)
+	log.Printf("social: %s disconnected (presence flushed)", c.Username)
 }
 
 // socRouteChat resolves a PM target through the Router (all-in-one: the
@@ -1124,18 +1126,18 @@ func socRouteChat(target string) *playerConn {
 func socRouteGlobal(frame []any) {
 	recips, _ := socHub.Route(hub.Message{Kind: hub.KindGlobal})
 	if len(recips) == 0 {
-		broadcast(frame)
+		worldcore.Broadcast(frame)
 		return
 	}
 	anySent := false
 	for _, name := range recips {
 		if t := m7PlayerByName(name); t != nil {
-			_ = send(t.conn, frame)
+			_ = gnet.Send(t.Conn, frame)
 			anySent = true
 		}
 	}
 	if !anySent {
-		broadcast(frame)
+		worldcore.Broadcast(frame)
 	}
 }
 
@@ -1157,7 +1159,7 @@ func socTestHandler(c *playerConn, data []byte) {
 	}
 	switch d.SocialTest {
 	case "friends":
-		l := socFriendsFor(c.username)
+		l := socFriendsFor(c.Username)
 		socMu.Lock()
 		members := l.Members()
 		parts := make([]string, 0, len(members))
@@ -1168,11 +1170,11 @@ func socTestHandler(c *playerConn, data []byte) {
 		}
 		socMu.Unlock()
 		sort.Strings(parts)
-		m6Notify(c, "social:friends "+c.username+"=["+strings.Join(parts, ",")+"]")
+		m6Notify(c, "social:friends "+c.Username+"=["+strings.Join(parts, ",")+"]")
 	case "guild":
-		g, err := socGuilds.GuildOf(c.username)
+		g, err := socGuilds.GuildOf(c.Username)
 		if err != nil {
-			m6Notify(c, "social:guild "+c.username+"=none")
+			m6Notify(c, "social:guild "+c.Username+"=none")
 			return
 		}
 		names := make([]string, 0, len(g.Members))
