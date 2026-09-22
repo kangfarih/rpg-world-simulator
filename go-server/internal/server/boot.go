@@ -31,6 +31,7 @@ import (
 	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/sim"
+	"rpg-world-server/internal/version"
 	worldcore "rpg-world-server/internal/world"
 	"rpg-world-server/internal/worldmap"
 )
@@ -2682,7 +2683,16 @@ func handleConn(conn *websocket.Conn) {
 			}
 
 			switch id {
-			case PacketHandshake: // C Handshake{gVer} -> S Handshake{type:client}
+			case PacketHandshake: // C Handshake{gVer} -> S Handshake{type:client} (gVer-gated, R1)
+				if gv, ok := gverGatePass(frame); !ok {
+					// Version contract failed: notice on an existing opcode
+					// (Notification Text + hub redirect payload, no wire
+					// change) then close (ban-path parity). GVER_STRICT=0
+					// disables the gate for dev.
+					sendGVerReject(conn, gv)
+					worldcore.RemoveClient(conn)
+					return
+				}
 				reply := HandshakeData{
 					Type:       "client",
 					Instance:   c.Instance,
@@ -2928,9 +2938,25 @@ func Boot() {
 
 // Handler serves the WS endpoint (accept + handleConn + release) on a
 // fresh mux (the old DefaultServeMux registration carried exactly this
-// one pattern).
+// one pattern). GET /healthz reports the drain-lifecycle snapshot
+// {state, load, buildId, gVer} (new R1 surface; 503 once DRAINING).
 func Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// Live load (PlayerCount), lifecycle state: 200 RUNNING, 503 once
+		// DRAINING/SHUTDOWN so balancers stop new sessions.
+		st := app.Default.State()
+		code := http.StatusOK
+		if st != version.StateRunning {
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": st, "load": worldcore.PlayerCount(),
+			"buildId": version.BuildID, "gVer": version.GVer,
+		})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, ok := gnet.Accept(w, r)
 		if !ok {

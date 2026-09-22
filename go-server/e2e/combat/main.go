@@ -141,7 +141,7 @@ func main() {
 	fmt.Println("connected:", drain(1500*time.Millisecond))
 	lastFrames = nil
 
-	send(conn, `[1,{"gVer":1}]`)
+	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	fmt.Println("handshake:", drain(1500*time.Millisecond))
 	lastFrames = nil
 
@@ -941,7 +941,7 @@ func main() {
 	go reader(conn2)
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
-	send(conn2, `[1,{"gVer":1}]`)
+	send(conn2, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
 	send(conn2, `[2,{"opcode":0,"username":"tester","password":"x"}]`)

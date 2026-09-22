@@ -230,7 +230,7 @@ func main() {
 
 	fmt.Println("connected:", drain(1500*time.Millisecond))
 	lastFrames = nil
-	send(conn, `[1,{"gVer":1}]`)
+	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	fmt.Println("handshake:", drain(1500*time.Millisecond))
 	lastFrames = nil
 	send(conn, `[2,{"opcode":0,"username":"m13admin","password":"x","seedRank":2}]`)
@@ -303,7 +303,7 @@ func main() {
 	defer conn2.Close()
 	go reader(conn2)
 	fmt.Println("connected2:", drain(1500*time.Millisecond))
-	send(conn2, `[1,{"gVer":1}]`)
+	send(conn2, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
 	send(conn2, `[2,{"opcode":0,"username":"m13victim","password":"x","seedGold":100}]`)
@@ -349,7 +349,7 @@ func main() {
 	defer conn3.Close()
 	go reader(conn3)
 	fmt.Println("connected3:", drain(1500*time.Millisecond))
-	send(conn3, `[1,{"gVer":1}]`)
+	send(conn3, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
 	send(conn3, `[2,{"opcode":0,"username":"m13victim","password":"x"}]`)
@@ -439,7 +439,7 @@ func main() {
 	}
 	defer conn4.Close()
 	fmt.Println("connected4 (no reader goroutine; raw 'ban' watch):")
-	send(conn4, `[1,{"gVer":1}]`)
+	send(conn4, `[1,{"gVer":"0.5.5-beta"}]`)
 	send(conn4, `[2,{"opcode":0,"username":"m13victim","password":"x"}]`)
 	banned := false
 	deadline := time.Now().Add(2 * time.Second)

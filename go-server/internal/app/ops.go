@@ -35,6 +35,7 @@ import (
 	"rpg-world-server/internal/api"
 	"rpg-world-server/internal/console"
 	"rpg-world-server/internal/social"
+	"rpg-world-server/internal/version"
 )
 
 // GameVersion / MaxPlayers feed the API status snapshot (the stub has
@@ -101,6 +102,7 @@ func StartAPI() {
 		return
 	}
 	srv := api.NewServer(opsPlayers{}, opsGuilds{}, opsStatus{})
+	srv.Health = opsHealth{lc: Default}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("ops: api listen %s failed (%v), continuing without API", addr, err)
@@ -168,7 +170,27 @@ func (opsStatus) Status() api.Status {
 		GameVersion: GameVersion,
 		MaxPlayers:  MaxPlayers,
 		PlayerCount: opsDeps.PlayerCount(),
+		BuildID:     version.BuildID,
+		GVer:        version.GVer,
 	}
+}
+
+// opsHealth adapts the process lifecycle to the api /healthz provider
+// (state from the lifecycle, live load from the game when wired).
+type opsHealth struct{ lc *Lifecycle }
+
+func (h opsHealth) Health() api.Health {
+	lc := h.lc
+	if lc == nil {
+		lc = Default
+	}
+	load := 0
+	if opsDeps.PlayerCount != nil {
+		load = opsDeps.PlayerCount()
+	}
+	s := lc.Health()
+	s.Load = load
+	return api.Health{State: s.State, Load: s.Load, BuildID: s.BuildID, GVer: s.GVer}
 }
 
 // StartConsole starts the stdin console loop unless CONSOLE=0 or stdin is

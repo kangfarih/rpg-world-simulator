@@ -154,7 +154,7 @@ func main() {
 	fmt.Println("connected:", drain(conn, 2*time.Second))
 	lastFrames = nil
 
-	send(conn, `[1,{"gVer":1}]`)
+	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	fmt.Println("handshake:", drain(conn, 2*time.Second))
 	lastFrames = nil
 

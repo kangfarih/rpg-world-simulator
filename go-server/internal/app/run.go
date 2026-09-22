@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"rpg-world-server/internal/version"
 )
 
 // Steps is the game-core half of the canonical boot: the frozen init
@@ -34,8 +36,15 @@ type Steps struct {
 
 // Run executes the canonical boot and serves until the listener fails.
 // It returns only on ListenAndServe error (logged + fatal by the caller).
+// Router role serves the hub server-list instead of the game (see Router);
+// shard and all-in-one run the frozen game boot below.
 func Run(cfg Config, s Steps) error {
 	LogConfig(cfg)
+	log.Printf("version: buildID=%s gVer=%s role=%s gverStrict=%v drainTimeout=%v",
+		version.BuildID, version.GVer, cfg.Role, version.Strict(), version.DrainTimeout())
+	if cfg.Role == RoleRouter {
+		return RunRouter(cfg)
+	}
 	s.Init()
 	fmt.Printf("kaetram-stub listening on %s\n", s.Addr)
 	log.Printf("%s", s.Modes)

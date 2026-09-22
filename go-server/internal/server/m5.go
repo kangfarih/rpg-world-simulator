@@ -26,9 +26,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"rpg-world-server/internal/entity"
@@ -579,14 +577,12 @@ func m5Init() {
 			flushDirty()
 		}
 	}()
-	go func() {
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-		<-ch
-		log.Printf("m5: shutdown signal -> final flush")
-		flushDirty()
-		os.Exit(0)
-	}()
+	// R1 drain lifecycle (same boot step): SIGTERM/SIGINT -> DRAINING (no
+	// new conns, sim continues) -> empty-or-timeout -> flush barrier ->
+	// exit. With zero players this is the old final-flush-and-exit.
+	startDrainDriver()
+	// R1 shard role: hub Client registration (all-in-one starts none).
+	startShardClient()
 }
 
 func markDirty(key string) {

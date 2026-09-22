@@ -259,7 +259,7 @@ func login(user string, seedPos []int) *websocket.Conn {
 	go reader(conn)
 	drain(1200 * time.Millisecond)
 	lastFrames = nil
-	send(conn, `[1,{"gVer":1}]`)
+	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(1200 * time.Millisecond)
 	lastFrames = nil
 	posJSON, _ := json.Marshal(seedPos)

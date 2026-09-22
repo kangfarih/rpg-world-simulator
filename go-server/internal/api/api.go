@@ -27,6 +27,8 @@
 //   - GET /status       — server status snapshot (TS GET / parity).
 //   - GET /guilds       — guild list snapshot.
 //   - GET /players/{name} — single player lookup; 404 when unknown.
+//   - GET /healthz      — drain-lifecycle snapshot {state, load, buildId,
+//     gVer}; 503 once DRAINING/SHUTDOWN (new surface, no TS counterpart).
 package api
 
 import (
@@ -54,12 +56,16 @@ type Guild struct {
 
 // Status is the server status snapshot. Field names mirror TS GET /
 // (api.ts handleRouter): name, port, gameVersion, maxPlayers, playerCount.
+// R1 adds buildId + gVer (omitempty: older providers render the TS shape
+// byte-identical).
 type Status struct {
 	Name        string `json:"name"`
 	Port        int    `json:"port"`
 	GameVersion string `json:"gameVersion"`
 	MaxPlayers  int    `json:"maxPlayers"`
 	PlayerCount int    `json:"playerCount"`
+	BuildID     string `json:"buildId,omitempty"`
+	GVer        string `json:"gVer,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +89,24 @@ type StatusProvider interface {
 	Status() Status
 }
 
+// HealthProvider supplies the drain-lifecycle snapshot for /healthz. The
+// shape is intentionally minimal ({state, load} + stamps); the game, the
+// router, and the api test stub all satisfy it structurally via Health()
+// adapters or inline funcs. Implementations must be safe for concurrent use
+// (the handler runs on the caller's HTTP server).
+type HealthProvider interface {
+	Health() Health
+}
+
+// Health is the /healthz snapshot: drain state + load (+ build stamps so
+// deploy watchers can tell builds apart).
+type Health struct {
+	State   string `json:"state"`
+	Load    int    `json:"load"`
+	BuildID string `json:"buildId,omitempty"`
+	GVer    string `json:"gVer,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // Server.
 // ---------------------------------------------------------------------------
@@ -90,22 +114,27 @@ type StatusProvider interface {
 // Server routes read-only API requests to the caller-supplied providers.
 // The zero value is unusable; construct with NewServer. It implements
 // http.Handler so the caller can mount it on any http.Server it owns.
+// Health is optional (nil => /healthz reports a static RUNNING stub);
+// set it after construction to report the live drain state.
 type Server struct {
 	Players Players
 	Guilds  Guilds
 	Status  StatusProvider
+	Health  HealthProvider
 
 	mux *http.ServeMux
 }
 
-// NewServer wires GET /status, GET /guilds, and GET /players/{name}.
-// Providers may be nil (see per-handler fallbacks), but callers normally
-// supply all three. NewServer registers routes only; it starts nothing.
+// NewServer wires GET /status, GET /guilds, GET /players/{name} and GET
+// /healthz. Providers may be nil (see per-handler fallbacks), but callers
+// normally supply all three. NewServer registers routes only; it starts
+// nothing.
 func NewServer(players Players, guilds Guilds, status StatusProvider) *Server {
 	s := &Server{Players: players, Guilds: guilds, Status: status, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /status", s.handleStatus)
 	s.mux.HandleFunc("GET /guilds", s.handleGuilds)
 	s.mux.HandleFunc("GET /players/{name}", s.handlePlayer)
+	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	return s
 }
 
@@ -152,6 +181,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Status.Status())
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	h := Health{State: "RUNNING"}
+	code := http.StatusOK
+	if s.Health != nil {
+		h = s.Health.Health()
+		if h.State != "" && h.State != "RUNNING" {
+			code = http.StatusServiceUnavailable
+		}
+		if h.State == "" {
+			h.State = "RUNNING"
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(h)
 }
 
 func (s *Server) handleGuilds(w http.ResponseWriter, _ *http.Request) {

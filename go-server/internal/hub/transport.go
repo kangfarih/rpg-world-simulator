@@ -79,6 +79,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	_ "modernc.org/sqlite"
+
+	"rpg-world-server/internal/version"
 )
 
 // Env keys for the hub transport.
@@ -143,14 +145,28 @@ var ErrNoRecipient = errors.New("hub: mail message has no recipient")
 
 // HubHandshake mirrors TS HubHandshakePacketData (hub variant): sent as the
 // data of a [1, null, {...}] handshake frame on connect (client.ts
-// handleOpen parity; gVer/remoteHost/port/maxPlayers omitted — the Go hub
-// does not serve game clients or a server browser).
+// handleOpen parity; remoteHost/port/maxPlayers omitted — the Go hub
+// does not serve game clients or a server browser). R1 adds the additive
+// routing stamps BuildID/GVer/State/Load/Addr (omitempty: pre-R1 shards
+// register without them and are treated as RUNNING with load 0).
 type HubHandshake struct {
 	Type        string   `json:"type"` // always "hub"
 	Name        string   `json:"name"`
 	ServerID    int      `json:"serverId,omitempty"`
 	AccessToken string   `json:"accessToken,omitempty"`
 	Players     []string `json:"players,omitempty"`
+	// BuildID is the shard binary stamp (version.BuildID via ldflags).
+	BuildID string `json:"buildId,omitempty"`
+	// GVer is the shard wire version (must equal version.GVer to take
+	// matching clients; the router prefers newest RUNNING regardless).
+	GVer string `json:"gVer,omitempty"`
+	// State is the drain state (RUNNING/DRAINING; "" means RUNNING).
+	State string `json:"state,omitempty"`
+	// Load is the shard's live-conn count (router info only).
+	Load int `json:"load,omitempty"`
+	// Addr is the shard's game address for login redirect
+	// (e.g. "127.0.0.1:9001"; "" falls back to the shard name).
+	Addr string `json:"addr,omitempty"`
 }
 
 // encodeFrame serializes a TS-style [packet, opcode, data] array frame.
@@ -220,10 +236,14 @@ func isJSONObject(raw []byte) bool {
 
 // heartbeatMsg is the shard->hub heartbeat (full local player list doubles
 // as presence reconciliation, so no separate online/offline frames exist).
+// State/Load are the R1 routing stamps (State "" = no change, Load always
+// set: the shard reports its live-conn count every beat).
 type heartbeatMsg struct {
 	Type    string   `json:"t"` // "heartbeat"
 	Name    string   `json:"name"`
 	Players []string `json:"players,omitempty"`
+	State   string   `json:"state,omitempty"`
+	Load    int      `json:"load,omitempty"`
 }
 
 // rosterMsg is the hub->shard roster push: every known online player and the
@@ -408,6 +428,35 @@ type shardEntry struct {
 	name     string
 	players  map[string]struct{}
 	lastBeat time.Time
+	// R1 routing stamps (from HubHandshake/heartbeat; see Register).
+	buildID   string
+	gVer      string
+	state     string // "" means RUNNING (pre-R1 shards)
+	load      int
+	addr      string
+	firstSeen time.Time // registration order = build newness
+}
+
+// ShardInfo is the transport-free snapshot of one shardEntry for the
+// router server-list (see Server.ListShards / NewestRunning).
+type ShardInfo struct {
+	Name    string
+	Addr    string
+	BuildID string
+	GVer    string
+	State   string
+	Load    int
+	// Newest is true on the NewestRunning pick (login target for NEW
+	// sessions) when rendered via ListShards.
+	Newest bool
+}
+
+// effectiveState normalizes "" (pre-R1 shard) to RUNNING.
+func effectiveState(state string) string {
+	if state == "" {
+		return version.StateRunning
+	}
+	return state
 }
 
 // Server is the hub-side server-list: it accepts shard registrations,
@@ -473,9 +522,13 @@ func bearerToken(r *http.Request) string {
 }
 
 // Register records (or refreshes) a shard from its handshake: verifies
-// auth, upserts the entry, adopts the handshake player list, and stamps
-// last-heartbeat. Transport-free (unit-testable); the socket is attached
-// separately by ServeHTTP via Attach.
+// auth, upserts the entry, adopts the handshake player list, records the R1
+// routing stamps (buildID/gVer/state/load/addr), and stamps last-heartbeat.
+// firstSeen tracks registration order (build newness for NewestRunning): a
+// brand-new name sets it; a re-register keeps it unless the buildID changed
+// (same-name redeploy of a new build counts as new). Transport-free
+// (unit-testable); the socket is attached separately by ServeHTTP via
+// Attach.
 func (s *Server) Register(hs HubHandshake) error {
 	if hs.Name == "" || hs.Type != "hub" {
 		return errors.New("hub: bad handshake")
@@ -486,10 +539,19 @@ func (s *Server) Register(hs HubHandshake) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.now()
 	e := s.shards[hs.Name]
 	if e == nil {
-		e = &shardEntry{name: hs.Name, players: make(map[string]struct{})}
+		e = &shardEntry{
+			name:      hs.Name,
+			players:   make(map[string]struct{}),
+			firstSeen: now,
+		}
 		s.shards[hs.Name] = e
+	} else if hs.BuildID != "" && hs.BuildID != e.buildID {
+		// Same-name redeploy of a new build: it is newer than everything
+		// registered before it.
+		e.firstSeen = now
 	}
 	e.players = make(map[string]struct{}, len(hs.Players))
 	for _, p := range hs.Players {
@@ -497,15 +559,36 @@ func (s *Server) Register(hs HubHandshake) error {
 			e.players[p] = struct{}{}
 		}
 	}
-	e.lastBeat = s.now()
+	if hs.BuildID != "" {
+		e.buildID = hs.BuildID
+	}
+	if hs.GVer != "" {
+		e.gVer = hs.GVer
+	}
+	if hs.State != "" {
+		e.state = hs.State
+	}
+	e.load = hs.Load
+	if hs.Addr != "" {
+		e.addr = hs.Addr
+	}
+	e.lastBeat = now
 	s.rebuildLocked()
 	return nil
 }
 
 // Heartbeat refreshes a shard's last-heartbeat and reconciles its player
 // list (full-list replace). Unknown shards are rejected so a restarted hub
-// forces a clean re-register.
+// forces a clean re-register. Routing stamps are preserved (use
+// HeartbeatEx to move them).
 func (s *Server) Heartbeat(name string, players []string) error {
+	return s.HeartbeatEx(name, players, "", -1)
+}
+
+// HeartbeatEx is Heartbeat plus the R1 routing stamps: a non-"" state moves
+// the drain state (RUNNING/DRAINING), and a non-negative load replaces it.
+// Heartbeats carrying neither leave the stamps untouched (pre-R1 shape).
+func (s *Server) HeartbeatEx(name string, players []string, state string, load int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.shards[name]
@@ -517,6 +600,12 @@ func (s *Server) Heartbeat(name string, players []string) error {
 		if p != "" {
 			e.players[p] = struct{}{}
 		}
+	}
+	if state != "" {
+		e.state = state
+	}
+	if load >= 0 {
+		e.load = load
 	}
 	e.lastBeat = s.now()
 	s.rebuildLocked()
@@ -556,6 +645,75 @@ func (s *Server) ShardCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.shards)
+}
+
+// NewestRunning reports the newest healthy RUNNING shard for NEW sessions
+// (login routing): among entries whose effective state is RUNNING ("" counts
+// as RUNNING for pre-R1 shards), the latest firstSeen wins, ties broken by
+// name ascending. Evicted (3-miss) shards are gone from the table, so they
+// never win. ok is false when no RUNNING shard is registered — the caller
+// must not start new sessions anywhere (clients keep current sessions).
+// Transport-free.
+func (s *Server) NewestRunning() (ShardInfo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *shardEntry
+	for _, e := range s.shards {
+		if effectiveState(e.state) != version.StateRunning {
+			continue
+		}
+		if best == nil || e.firstSeen.After(best.firstSeen) ||
+			(e.firstSeen.Equal(best.firstSeen) && e.name < best.name) {
+			best = e
+		}
+	}
+	if best == nil {
+		return ShardInfo{}, false
+	}
+	return s.infoLocked(best, true), true
+}
+
+// ListShards snapshots every registered shard newest-first (same order as
+// NewestRunning), flagging the login target. Transport-free; backs the
+// router GET /servers server-list.
+func (s *Server) ListShards() []ShardInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var running *shardEntry
+	for _, e := range s.shards {
+		if effectiveState(e.state) != version.StateRunning {
+			continue
+		}
+		if running == nil || e.firstSeen.After(running.firstSeen) ||
+			(e.firstSeen.Equal(running.firstSeen) && e.name < running.name) {
+			running = e
+		}
+	}
+	out := make([]ShardInfo, 0, len(s.shards))
+	for _, e := range s.shards {
+		out = append(out, s.infoLocked(e, running != nil && e == running))
+	}
+	// Newest-first by (firstSeen desc, name asc). firstSeen is not on the
+	// snapshot, so sort via the entries under the same lock.
+	sort.Slice(out, func(i, j int) bool {
+		ei, ej := s.shards[out[i].Name], s.shards[out[j].Name]
+		if ei == nil || ej == nil {
+			return out[i].Name < out[j].Name
+		}
+		if !ei.firstSeen.Equal(ej.firstSeen) {
+			return ei.firstSeen.After(ej.firstSeen)
+		}
+		return ei.name < ej.name
+	})
+	return out
+}
+
+// infoLocked snapshots e. Caller holds mu.
+func (s *Server) infoLocked(e *shardEntry, newest bool) ShardInfo {
+	return ShardInfo{
+		Name: e.name, Addr: e.addr, BuildID: e.buildID, GVer: e.gVer,
+		State: effectiveState(e.state), Load: e.load, Newest: newest,
+	}
 }
 
 // Roster snapshots username -> shard for every known online player,
@@ -801,7 +959,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if hb.Name == "" {
 				hb.Name = hs.Name
 			}
-			if err := s.Heartbeat(hb.Name, hb.Players); err != nil {
+			if err := s.HeartbeatEx(hb.Name, hb.Players, hb.State, hb.Load); err != nil {
 				log.Printf("hub: heartbeat: %v", err)
 				continue
 			}
@@ -851,6 +1009,16 @@ type Client struct {
 	stop    chan struct{}
 	stopped bool
 	wg      sync.WaitGroup
+
+	// R1 shard stamps, reported in the register frame and every
+	// heartbeat (router server-list + login routing). players, when set,
+	// supplies the presence list instead of the Register/Unregister-tracked
+	// set (shard role: the game owns login, the client only reports).
+	buildID string
+	gVer    string
+	game    string // shard game addr for login redirect
+	state   string // drain state override ("" = RUNNING)
+	players func() []string
 }
 
 // NewClient builds a shard client for addr (ws://host:port/path). router is
@@ -888,6 +1056,42 @@ func (c *Client) SetHeartbeatInterval(d time.Duration) {
 		return
 	}
 	c.hbInterval = d
+}
+
+// SetBuild records the shard routing stamps reported in the register frame
+// and every heartbeat (buildID via version.BuildID, gVer via version.GVer,
+// game = shard game addr for login redirect). Nil-safe.
+func (c *Client) SetBuild(buildID, gVer, game string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buildID, c.gVer, c.game = buildID, gVer, game
+}
+
+// SetState overrides the drain state reported in heartbeats ("" = RUNNING).
+// The shard role flips this to DRAINING on SIGTERM so the router stops
+// sending NEW sessions while existing ones play on. Nil-safe.
+func (c *Client) SetState(state string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state = state
+}
+
+// SetPlayersProvider supplies the presence list for register/heartbeat
+// frames. When set, the game owns login (shard role) and the client only
+// reports; otherwise presence comes from Register/Unregister. Nil-safe.
+func (c *Client) SetPlayersProvider(players func() []string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.players = players
 }
 
 // Register marks username online locally and returns its pending offline
@@ -1013,11 +1217,17 @@ func (c *Client) forwardRemote(m Message) bool {
 	return true
 }
 
-// localPlayers snapshots the shard's online set as observed through
+// localPlayers snapshots the shard's online set: the provider list when
+// SetPlayersProvider is used (shard role), else the set observed through
 // Client.Register/Unregister.
 func (c *Client) localPlayers() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.players != nil {
+		out := append([]string(nil), c.players()...)
+		sort.Strings(out)
+		return out
+	}
 	out := make([]string, 0, len(c.local))
 	for u := range c.local {
 		out = append(out, u)
@@ -1026,17 +1236,32 @@ func (c *Client) localPlayers() []string {
 	return out
 }
 
+// clientStamps snapshots the R1 routing stamps under lock.
+func (c *Client) clientStamps() (buildID, gVer, game, state string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buildID, c.gVer, c.game, c.state
+}
+
 // handshakeFrame builds the [1, null, {...}] register frame.
 func (c *Client) handshakeFrame() ([]byte, error) {
+	players := c.localPlayers()
+	buildID, gVer, game, state := c.clientStamps()
 	hs := HubHandshake{
-		Type: "hub", Name: c.name, AccessToken: c.token, Players: c.localPlayers(),
+		Type: "hub", Name: c.name, AccessToken: c.token, Players: players,
+		BuildID: buildID, GVer: gVer, State: state, Load: len(players), Addr: game,
 	}
 	return encodeFrame(frameHandshake, nil, hs)
 }
 
 // heartbeatFrame builds the {"t":"heartbeat",...} frame.
 func (c *Client) heartbeatFrame() ([]byte, error) {
-	return json.Marshal(heartbeatMsg{Type: "heartbeat", Name: c.name, Players: c.localPlayers()})
+	players := c.localPlayers()
+	_, _, _, state := c.clientStamps()
+	return json.Marshal(heartbeatMsg{
+		Type: "heartbeat", Name: c.name, Players: players,
+		State: state, Load: len(players),
+	})
 }
 
 // Start dials the hub and serves register/heartbeat/read until ctx ends or

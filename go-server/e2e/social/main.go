@@ -217,7 +217,7 @@ func login(name string) *client {
 	c := &client{conn: conn, name: name, ch: make(chan []json.RawMessage, 4096)}
 	go c.reader()
 	c.drain(1200 * time.Millisecond) // Connected
-	c.send(`[1,{"gVer":1}]`)
+	c.send(`[1,{"gVer":"0.5.5-beta"}]`)
 	c.drain(1200 * time.Millisecond) // Handshake
 	c.send(fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, name))
 	frames := c.drain(2500 * time.Millisecond) // Welcome bulk

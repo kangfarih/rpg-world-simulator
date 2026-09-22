@@ -529,6 +529,11 @@ func persistFriends(username string) {
 	}
 }
 
+// FlushUser persists one player's friends rows outside the disconnect path
+// (pre-shutdown drain barrier; the disconnect path reaches the same store
+// via OnDisconnect).
+func FlushUser(username string) { persistFriends(username) }
+
 // PlayerExists mirrors the TS database.exists gate: an online conn or a
 // persisted players row (instance or name column; m5 keys rows by username).
 func PlayerExists(username string) bool {

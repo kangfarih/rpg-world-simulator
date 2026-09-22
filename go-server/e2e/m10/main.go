@@ -248,7 +248,7 @@ func login(user string) *websocket.Conn {
 	go reader(conn)
 	drain(800 * time.Millisecond)
 	lastFrames = nil
-	send(conn, `[1,{"gVer":1}]`)
+	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(800 * time.Millisecond)
 	lastFrames = nil
 	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, user))

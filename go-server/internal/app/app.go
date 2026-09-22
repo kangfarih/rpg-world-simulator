@@ -30,6 +30,10 @@ const (
 type Config struct {
 	// Modes selects the map/entity overlay set (TESTMAP/CLEAN/COMBAT).
 	Modes world.Modes
+	// Role selects the instance role (ROLE env / --role flag): all-in-one
+	// (default, today's behavior), router (hub server-list + login
+	// routing, no sim), shard (game + hub Client registration).
+	Role string
 	// Port is the raw PORT env ("" = client-server default 9001).
 	Port string
 	// Addr is the resolved listen address (ListenAddr(Port)).
@@ -87,6 +91,7 @@ func FromEnv(getenv func(string) string, args []string) Config {
 	port := getenv("PORT")
 	return Config{
 		Modes:        world.ParseModes(getenv, args),
+		Role:         ParseRole(getenv, args),
 		Port:         port,
 		Addr:         ListenAddr(port),
 		DBPath:       getenv("DB_PATH"),
