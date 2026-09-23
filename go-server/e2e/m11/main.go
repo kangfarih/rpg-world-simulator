@@ -369,6 +369,13 @@ func m11Echo(conn *websocket.Conn, kind, key string) (string, bool) {
 }
 
 func main() {
+	// Startup hygiene guard (warning only — never fail here). M11_HERODMG is
+	// read SERVER-side, so a harness-side value is inert; an empty harness
+	// env is fine when CI sets it server-side only. The harness cannot
+	// verify the server's env.
+	if os.Getenv("M11_HERODMG") == "" {
+		fmt.Println("WARN: M11_HERODMG is unset in the harness env; the SERVER side needs M11_HERODMG=10 (skeleton kill leg). The harness cannot verify the server's env — ignore this warning if the server already runs with it.")
+	}
 	// === 1. Login batches. ===
 	fmt.Println("== login batches ==")
 	c1 := login("m11hero", []int{100, 96})

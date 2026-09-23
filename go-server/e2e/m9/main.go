@@ -6,7 +6,17 @@
 // and engine respawn on the profile timer (bat 20s default; the COMBAT-mode
 // rat's 10s respawn path is already covered by e2e/combat).
 // Not part of the stub build (underscore dirs are ignored by the go tool).
-// Usage: go run ./e2e/m9 (stub must run with TESTMAP=1, the default).
+// Run recipe (harness hygiene — the m9 leg itself is stable, setup flakes it):
+//  1. Fresh DB per run: rm -f the DB_PATH file (or use a unique DB_PATH per
+//     run). A reused DB restores persisted hero state and changes aggro
+//     geometry.
+//  2. M9_MOBDMG=10 on the SERVER side (e.g. M9_MOBDMG=10 go run . or
+//     M9_MOBDMG=10 ./server). Setting it on the harness is inert — the
+//     server reads it in internal/entity/mob.go via os.Getenv.
+//  3. Unique PORT per parallel run (server and harness share PORT).
+//  4. Kill servers by child binary PID: pkill -f "exe/server" (killing the
+//     `go run` parent leaves the child listening -> port contention), or
+//     go build -o /tmp/m9server . && exec it so its PID is the server.
 package main
 
 import (
@@ -218,6 +228,20 @@ func step(conn *websocket.Conn, x, y int) {
 }
 
 func main() {
+	// Startup hygiene guards (warnings only — never fail here).
+	// M9_MOBDMG is read SERVER-side (internal/entity/mob.go via os.Getenv),
+	// so a harness-side value is inert; an empty harness env is fine when CI
+	// sets it server-side only. The harness cannot verify the server's env.
+	if os.Getenv("M9_MOBDMG") == "" {
+		fmt.Println("WARN: M9_MOBDMG is unset in the harness env; the SERVER side needs M9_MOBDMG=10 (without it the hero-death leg takes minutes). The harness cannot verify the server's env — ignore this warning if the server already runs with it.")
+	}
+	// A reused DB restores persisted hero state (position/level) and changes
+	// aggro geometry — prefer a fresh DB per run.
+	if p := os.Getenv("DB_PATH"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			fmt.Printf("WARN: DB_PATH=%q already exists; reused DBs restore persisted hero state and change aggro geometry — prefer a fresh DB per run.\n", p)
+		}
+	}
 	// --- 1. Data-driven spawn via m9test: skeleton profile. ---
 	fmt.Println("== data-driven spawn ==")
 	c1 := login("m9hero", []int{100, 96})
