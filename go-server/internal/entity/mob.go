@@ -20,7 +20,12 @@
 //	StrikeMob         -> S->C Combat Hit [7,1] broadcast (mob swing)
 //	Get/Set/ForgetHeroHP -> m9PlayerHPs hero HP store (stays in root)
 //	HeroPoints        -> S->C Points [8] broadcast for a hero
-//	HeroDied          -> S->C Death [9] broadcast (mob killing blow)
+//	HeroDied          -> status clear + S->C Despawn [13] broadcast + pet
+//	                      despawn + persist flush + S->C Death [29] unicast
+//	                      to self, exactly-once per life (mob killing blow;
+//	                      player handleDeath parity — the root adapter owns
+//	                      the transport; other mobs release the corpse via
+//	                      the gone-target path, cleanCombat outcome)
 //	TeleportHero      -> S->C Teleport broadcast (hero respawn)
 //	SpawnHero         -> S->C Spawn broadcast (welcomePlayer, hero respawn)
 //	HeroRespawned     -> S->C Respawn frame to self (hero respawn)
@@ -430,6 +435,18 @@ type MobWorld interface {
 	SetHeroHP(instance string, hp int)
 	ForgetHeroHP(instance string)
 	HeroPoints(instance string, hp, maxHP int)
+	// HeroDied is the player-death funnel (player handleDeath parity),
+	// exactly-once per life (TS character.hit dead-guard parity): the root
+	// adapter clears the victim's live status entries, broadcasts the
+	// Despawn frame, despawns the owner's pet (no-op without one), flushes
+	// the victim's persist row synchronously, and unicasts Death to the
+	// victim only. Attacker release: the killer's target already cleared
+	// in DamageHero; other mobs release the corpse on their next tick via
+	// the existing gone-target path (corpses leave the Players scan set) —
+	// the world.ts cleanCombat outcome with no new locks (HeroDied runs on
+	// the tick holding m9Mu + the killer's lock, so it takes neither).
+	// PvP accounting and damageTable/skills/combat stops have no Go
+	// counterparts and stay omitted.
 	HeroDied(playerInstance, username, mobInstance string)
 	TeleportHero(instance string, x, y int)
 	SpawnHero(instance string)
@@ -909,12 +926,14 @@ func RespawnMob(m Mob, w GameWorld) {
 	}
 }
 
-// DamageHero applies mob damage: Points frame, Death on empty
-// (character.hitPoints). from is nil for non-mob damage (admin/DoT — no
-// Death frame, like the original); a non-nil from must be lock-held by
+// DamageHero applies mob damage: Points frame, then the HeroDied funnel on
+// empty (character.hitPoints). from is nil for non-mob damage (admin/DoT —
+// no Death frame, like the original); a non-nil from must be lock-held by
 // the caller (the step -> strike path is the only such caller; Go
 // mutexes are not reentrant, so relocking would self-deadlock on every
-// killing blow).
+// killing blow). The killer's target is released here; everything else
+// (status clear, Despawn, pet despawn, save, Death unicast) is HeroDied's,
+// owned by the root adapter.
 func DamageHero(w GameWorld, instance, username string, dmg int, from Mob) {
 	hp := w.GetHeroHP(instance) - dmg
 	if hp < 0 {

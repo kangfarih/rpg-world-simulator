@@ -140,6 +140,12 @@ func abApplyPoison(instance string) { abilities.ApplyPoison(instance) }
 
 func abRemovePoison(instance string) { abilities.RemovePoison(instance) }
 
+// abClearStatus drops the victim's live status-tracker entries on death
+// (player handleDeath status.clear() + setPoison() parity — RemovePoison
+// plus the full tracker clear, unlocks kept). Death-path only; disconnect
+// keeps the heavier abForgetPlayer (mana/target/fx reset).
+func abClearStatus(instance string) { abilities.ClearStatus(instance) }
+
 func abHeroWeaponPoisonous(username string) bool { return abilities.HeroWeaponPoisonous(username) }
 
 func abFreezeApply(instance string) { abilities.FreezeApply(instance) }

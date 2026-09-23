@@ -146,6 +146,14 @@ var gameWorld = gameWorldAdapter{}
 func (gameWorldAdapter) Players() []entity.PlayerView {
 	out := []entity.PlayerView{}
 	for _, c := range worldcore.AllOf[*playerConn]() {
+		// Corpses never aggro (TS: dead players drop out of combat;
+		// cleanCombat + the hit() dead-guard). Without this the next
+		// tick re-acquires the corpse and re-strikes it, rebroadcasting
+		// Points-0 and re-firing HeroDied. Fresh conns read full HP
+		// (GetHeroHP default) and are unaffected.
+		if gameWorld.GetHeroHP(c.Instance) <= 0 {
+			continue
+		}
 		lvl, def := 0, 0
 		if st := m5StateFor(c.Username); st != nil {
 			lvl = st.Level
@@ -236,8 +244,49 @@ func (gameWorldAdapter) HeroPoints(instance string, hp, maxHP int) {
 	}))
 }
 
-func (gameWorldAdapter) HeroDied(playerInstance, _, _ string) {
-	worldcore.Broadcast(pkt(PacketDeath, playerInstance))
+// m9DeathFired marks instances whose HeroDied funnel already ran, so the
+// funnel is exactly-once per life (TS character.hit dead-guard parity:
+// hits on a corpse are silent — no Points-0 rebroadcasts, no duplicate
+// Death/Despawn/save). Lock-free sync.Map: HeroDied runs on the engine
+// tick (holding m9Mu + the killer's m.mu), the StatusTick loop and admin
+// intake, so it can take no subsystem mutexes of its own. Cleared on
+// respawn (m9HandleRespawn) and disconnect (m9PlayerLeave) so the next
+// life dies loudly again.
+var m9DeathFired sync.Map // instance -> true
+
+func (gameWorldAdapter) HeroDied(playerInstance, username, mobInstance string) {
+	// Player handleDeath parity (player/handler.ts handleDeath): status
+	// clear, Despawn broadcast, pet despawn, persist flush, Death unicast
+	// to self. Attacker release: the killer's target already cleared in
+	// DamageHero; every other mob targeting the victim releases it on its
+	// next tick through the existing gone-target path (the corpse leaves
+	// the Players scan set below) — the world.ts cleanCombat outcome with
+	// no new locks. PvP accounting (pvpDeaths/killCallback), the
+	// damageTable reset and the skills/combat stops have no Go counterparts
+	// (no damage table, no hero combat loop — single-swing dispatch — and
+	// gathering is per-swing with no continuous action to stop) and stay
+	// omitted.
+	//
+	// LOCK DISCIPLINE: the strike path calls this holding m9Mu (m9Tick)
+	// and the killer's m.mu — take neither here (self-deadlock). Every
+	// seam below is lock-free or leaf-ordered (tracker/registry/pstateMu
+	// follow the pre-existing m9Mu-outer order; m5 paths never take m9Mu).
+	_ = mobInstance
+	if _, dup := m9DeathFired.LoadOrStore(playerInstance, true); dup {
+		return
+	}
+	abClearStatus(playerInstance) // status.clear() + setPoison() cure; unlocks kept
+	c, _ := worldcore.Find[*playerConn](playerInstance)
+	worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: playerInstance}))
+	if c != nil {
+		petForgetPlayer(c) // disconnect removePet parity; no-op without a pet
+	}
+	m5SaveSync(username) // disconnect persist path reused, not duplicated
+	if c != nil {
+		// Death goes to the victim only (TS sends Death to self);
+		// observers learn of the death via the Despawn above.
+		_ = gnet.Send(c.Conn, pkt(PacketDeath, playerInstance))
+	}
 }
 
 func (gameWorldAdapter) TeleportHero(instance string, x, y int) {
@@ -562,6 +611,7 @@ func m9HandleRespawn(c *playerConn) {
 		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
+	m9DeathFired.Delete(c.Instance) // next life dies loudly again
 	plateauTrack(c)
 	m8OnPositionUpdate(c)  // respawn position can cross an area boundary
 	m10OnPositionUpdate(c) // M10: area callbacks on the respawn tile too
@@ -571,6 +621,7 @@ func m9HandleRespawn(c *playerConn) {
 // m9PlayerLeave drops per-player state on disconnect.
 func m9PlayerLeave(c *playerConn) {
 	m9PlayerHPs.Delete(c.Instance)
+	m9DeathFired.Delete(c.Instance)
 	m9Mu.Lock()
 	for _, m := range m9Mobs {
 		m.mu.Lock()

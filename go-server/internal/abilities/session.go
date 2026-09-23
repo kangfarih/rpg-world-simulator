@@ -525,6 +525,22 @@ func RemovePoison(instance string) {
 	abStatus.Remove(status.Instance(instance), status.KindPoison)
 }
 
+// ClearStatus drops every live status-tracker entry on an instance (player
+// handleDeath parity: status.clear() + the setPoison() cure). Poison,
+// burning, freezing (including the m10 freeze-suffix key) and ability-cast
+// DoT windows stop ticking, so StatusTick emits no further Points damage for
+// the corpse. Mana, last-target, unlock levels and the abilities table rows
+// are untouched (TS keeps abilities across death). The abFx visual mirrors
+// are left for the StatusTick expiry sweep, which translates each vanished
+// tracker entry into the EffectRemove frame the client expects.
+func ClearStatus(instance string) {
+	if instance == "" {
+		return
+	}
+	abStatus.Clear(status.Instance(instance))
+	abStatus.Clear(status.Instance(instance + freezeSuffix))
+}
+
 // HeroWeaponPoisonous reports whether the hero's equipped weapon carries
 // the items.json `poisonous` flag (combat.ts poison-on-hit parity).
 func HeroWeaponPoisonous(username string) bool {
