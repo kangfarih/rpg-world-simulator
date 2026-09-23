@@ -422,6 +422,8 @@ func m5PickupAtTile(c *playerConn, x, y int) {
 }
 
 // m5TrackPos records the authoritative tile and marks the row dirty.
+// The tracked plateauLevel refreshes on the same update (handler.ts:333
+// player.plateauLevel parity — every authoritative position update).
 func m5TrackPos(c *playerConn) {
 	if c.Username == "" {
 		return
@@ -431,6 +433,7 @@ func m5TrackPos(c *playerConn) {
 	st.X, st.Y = c.Sess.PlayerX, c.Sess.PlayerY
 	pstateMu.Unlock()
 	markDirty(c.Username)
+	plateauTrack(c)
 }
 
 // m5RegisterLoot adds a pre-built loot entry to the registry without any
@@ -485,6 +488,16 @@ func handlePlayerAttack(c *playerConn, target string) {
 	if m := m9MobFor(target); m != nil {
 		if m.dead {
 			log.Printf("m5: %s swings at dead %s (ignored)", c.Instance, target)
+			return
+		}
+		// Cross-plateau combat refusal (silent no-swing): the hero and the
+		// mob must share a plateau level (see entity.PlateauCombatBlocked
+		// for the TS-parity note).
+		m.mu.Lock()
+		mobPlateau := m.plateau
+		m.mu.Unlock()
+		if entity.PlateauCombatBlocked(plateauGet(c.Instance), mobPlateau) {
+			log.Printf("m5: %s swings at %s across plateaus (refused)", c.Instance, target)
 			return
 		}
 		abSetTarget(c.Instance, target)

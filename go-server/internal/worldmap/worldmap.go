@@ -49,6 +49,10 @@ type Tile struct {
 
 // World is the loaded world.json plus derived lookup sets. SideLen is
 // Width / MapDivisionSize, computed by Load (mirrors main.go loadWorld).
+// Plateau maps tile index (y*Width+x) to plateau level (map.ts
+// getPlateauLevel; TS `map.plateau`, 26325 entries). Tiles absent from the
+// table are plateau 0. The `high` array (1421 entries) is rendering-only
+// (foreground layer select) and is intentionally not loaded.
 type World struct {
 	Width      int
 	Height     int
@@ -56,6 +60,7 @@ type World struct {
 	Collisions map[int]bool
 	Objects    map[int]bool
 	Cursors    map[int]string
+	Plateau    map[int]int
 	SideLen    int
 }
 
@@ -68,6 +73,7 @@ type worldFile struct {
 	Collisions []int             `json:"collisions"`
 	Objects    []int             `json:"objects"`
 	Cursors    map[string]string `json:"cursors"`
+	Plateau    map[string]int    `json:"plateau"`
 }
 
 // Load reads and parses the world JSON at path, building the collision,
@@ -99,6 +105,14 @@ func Load(path string) (*World, error) {
 		}
 		curSet[id] = v
 	}
+	plateau := make(map[int]int, len(w.Plateau))
+	for k, v := range w.Plateau {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		plateau[id] = v
+	}
 	return &World{
 		Width:      w.Width,
 		Height:     w.Height,
@@ -106,6 +120,7 @@ func Load(path string) (*World, error) {
 		Collisions: collSet,
 		Objects:    objSet,
 		Cursors:    curSet,
+		Plateau:    plateau,
 		SideLen:    w.Width / MapDivisionSize,
 	}, nil
 }
@@ -270,6 +285,19 @@ func Default() *World { return defaultWorld }
 // DefaultErr returns the cached load error, if any.
 func DefaultErr() error { return defaultErr }
 
+// PlateauLevel returns the plateau level at (x,y) (map.ts
+// getPlateauLevel/coordToIndex over `map.plateau`). Pure function: tiles
+// absent from the table (and OOB coordinates) are plateau 0.
+func (w *World) PlateauLevel(x, y int) int {
+	if w == nil || x < 0 || y < 0 || x >= w.Width || y >= w.Height {
+		return 0
+	}
+	if lvl, ok := w.Plateau[y*w.Width+x]; ok {
+		return lvl
+	}
+	return 0
+}
+
 // IsBlocked mirrors the real-terrain half of the root tileBlocked
 // (map.ts:170,201-208): OOB or empty data blocks; otherwise any layer whose
 // unflipped id is in collisions/objects blocks. TESTMAP pond/grass overlays
@@ -310,4 +338,19 @@ func (w *World) IsBlocked(x, y int) bool {
 		}
 	}
 	return false
+}
+
+// IsBlockedRemapped is the per-player gated collision variant (map.ts:234-244
+// dynamic branch in isColliding via getMappedTile): when remap resolves (x,y)
+// to a mapped tile, the collision is evaluated at the mapped tile; otherwise
+// the static tile applies. A nil remap is the static IsBlocked. The caller
+// supplies the per-player dynamic-area resolution (quest/achievement-gated);
+// tile serving itself stays static (documented in the caller).
+func (w *World) IsBlockedRemapped(x, y int, remap func(x, y int) (int, int, bool)) bool {
+	if remap != nil {
+		if mx, my, ok := remap(x, y); ok {
+			return w.IsBlocked(mx, my)
+		}
+	}
+	return w.IsBlocked(x, y)
 }

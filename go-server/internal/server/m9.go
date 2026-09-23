@@ -57,6 +57,10 @@ type m9Mob struct {
 	hp, maxHP      int
 	dead           bool
 
+	// plateau is the bound plateau level from the spawn tile
+	// (mob.ts:148 parity; roam steps + incoming swings gate on it).
+	plateau int
+
 	mu        sync.Mutex
 	target    string // player instance (combat.target)
 	lastAtk   time.Time
@@ -101,6 +105,10 @@ func (m *m9Mob) SetDead(dead bool) { m.dead = dead }
 
 func (m *m9Mob) Target() string     { return m.target }
 func (m *m9Mob) SetTarget(t string) { m.target = t }
+
+// Plateau reports the bound spawn plateau level (mob.ts:148 parity; the
+// caller must hold m.mu like every other accessor).
+func (m *m9Mob) Plateau() int { return m.plateau }
 
 func (m *m9Mob) LastAtk() time.Time      { return m.lastAtk }
 func (m *m9Mob) SetLastAtk(t time.Time)  { m.lastAtk = t }
@@ -149,6 +157,7 @@ func (gameWorldAdapter) Players() []entity.PlayerView {
 			Instance: c.Instance, Username: c.Username,
 			X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 			Level: lvl, Defense: def,
+			Plateau: plateauGet(c.Instance),
 		})
 	}
 	return out
@@ -162,6 +171,8 @@ func (gameWorldAdapter) PlayerPos(instance string) (int, int, bool) {
 }
 
 func (gameWorldAdapter) Blocked(x, y int) bool { return blocked(x, y) }
+
+func (gameWorldAdapter) PlateauLevel(x, y int) int { return plateauLevelOf(x, y) }
 
 func (gameWorldAdapter) SetEntityPos(instance string, x, y int) {
 	worldcore.SetEntityPos(instance, x, y)
@@ -342,6 +353,11 @@ func (gameWorldAdapter) SpawnChestFrame(c entity.ChestSpawn) {
 	}))
 }
 
+func (gameWorldAdapter) FinishAchievement(instance, key string) {
+	c, _ := worldcore.Find[*playerConn](instance)
+	m11FinishAchievement(c, key) // nil-safe (unknown instance/achievement ignored)
+}
+
 // playerViewFor builds one PlayerView for a live conn (m9OnPlayerMoved).
 func playerViewFor(c *playerConn) entity.PlayerView {
 	lvl, def := 0, 0
@@ -355,6 +371,7 @@ func playerViewFor(c *playerConn) entity.PlayerView {
 		Instance: c.Instance, Username: c.Username,
 		X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 		Level: lvl, Defense: def,
+		Plateau: plateauGet(c.Instance),
 	}
 }
 
@@ -412,6 +429,7 @@ func m9SpawnMob(instance, key string, x, y int, over m9Overrides) bool {
 		instance: instance, key: key, prof: *prof,
 		spawnX: x, spawnY: y, x: x, y: y,
 		maxHP: prof.HitPoints, hp: prof.HitPoints,
+		plateau:   plateauLevelOf(x, y), // mob.ts:148 spawn plateau bind
 		lastMove:  time.Now(),
 		lastRoam:  time.Now(),
 		attackers: map[string]time.Time{},
@@ -544,6 +562,7 @@ func m9HandleRespawn(c *playerConn) {
 		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
+	plateauTrack(c)
 	m8OnPositionUpdate(c)  // respawn position can cross an area boundary
 	m10OnPositionUpdate(c) // M10: area callbacks on the respawn tile too
 	log.Printf("m9: %s respawned at %d,%d", c.Username, x, y)
@@ -659,6 +678,7 @@ func m9TestHandler(c *playerConn, data []byte) {
 			c.Sess.PlayerX, c.Sess.PlayerY = d.X, d.Y
 			worldcore.SetEntityPos(c.Instance, d.X, d.Y)
 			worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: d.X, Y: d.Y}))
+			plateauTrack(c)
 			m8OnPositionUpdate(c)
 			m9OnPlayerMoved(c)     // position updates run the aggro scan
 			m10OnPositionUpdate(c) // M10: camera/music/pvp/overlay area callbacks

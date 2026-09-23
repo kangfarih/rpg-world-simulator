@@ -64,10 +64,14 @@ func m10AddChestMob(area *m10Area, instance string, respawnDelay time.Duration) 
 }
 
 // m10KillHooks fires the M10 chest-area death path for a killed mob
-// (handler.ts: mob.area?.removeEntity(mob, attacker) -> onEmpty chest spawn).
-// Called from m9KillMob; killer is unused until achievements land.
+// (handler.ts: mob.area?.removeEntity(mob, attacker) -> onEmpty chest spawn
+// + attacker achievement). killer is nil for killerless kills (no award).
 func m10KillHooks(m *m9Mob, killer *playerConn) {
-	entity.KillHookForMob(m.x, m.y, m.instance, gameWorld)
+	killerInstance := ""
+	if killer != nil {
+		killerInstance = killer.Instance
+	}
+	entity.KillHookForMob(m.x, m.y, m.instance, killerInstance, gameWorld)
 }
 
 // m10ChestFor finds a live chest entity by instance.

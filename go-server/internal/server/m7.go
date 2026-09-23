@@ -346,12 +346,15 @@ func m7SendPrivateMessage(c *playerConn, playerName string, message string) {
 
 // m7Teleport ports character.teleport: set position, Teleport frame to the
 // surrounding regions (which the Go broadcast scopes by the entity tile).
+// The tracked plateauLevel refreshes on the landing tile (door/teleport
+// destinations can sit on a different plateau than the origin).
 func m7Teleport(c *playerConn, x, y int) {
 	c.Sess.PlayerX = x
 	c.Sess.PlayerY = y
 	worldcore.SetEntityPos(c.Instance, x, y)
 	worldcore.UpdateRegion(c, x, y)
 	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
+	plateauTrack(c)
 }
 
 // ---------------------------------------------------------------------------

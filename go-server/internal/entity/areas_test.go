@@ -204,7 +204,7 @@ func TestChestClearSpawnOpen(t *testing.T) {
 	AddChestMob(area, "m1", 4000*time.Millisecond, w)
 
 	// First kill: area not empty, no chest.
-	RemoveChestMob(area, "m1", w)
+	RemoveChestMob(area, "m1", "", w)
 	w.mu.Lock()
 	if len(w.chests) != 0 {
 		w.mu.Unlock()
@@ -213,7 +213,7 @@ func TestChestClearSpawnOpen(t *testing.T) {
 	w.mu.Unlock()
 
 	// Last kill: reward chest spawns at the area spawn tile.
-	RemoveChestMob(area, "m2", w)
+	RemoveChestMob(area, "m2", "", w)
 	ch := area.LiveChest()
 	w.mu.Lock()
 	if len(w.chests) != 1 {
@@ -259,7 +259,7 @@ func TestChestRepopulateRemovesAndGuards(t *testing.T) {
 	area := ChestAreas()[0]
 
 	AddChestMob(area, "m1", 4000*time.Millisecond, w)
-	RemoveChestMob(area, "m1", w)
+	RemoveChestMob(area, "m1", "", w)
 	ch := area.LiveChest()
 	if ch == nil {
 		t.Fatal("no chest after clear")
@@ -285,7 +285,7 @@ func TestChestRepopulateRemovesAndGuards(t *testing.T) {
 	}
 
 	// Clearing again at once is guarded by the adopted respawn delay.
-	RemoveChestMob(area, "m2", w)
+	RemoveChestMob(area, "m2", "", w)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.chests) != nChests {
@@ -299,7 +299,7 @@ func TestKillHookSpawnsChest(t *testing.T) {
 	area := ChestAreas()[0]
 	AddChestMob(area, "mob-1", 0, w) // zero delay: immediate spawn on clear
 
-	KillHookForMob(112, 106, "mob-1", w) // inside the chest area
+	KillHookForMob(112, 106, "mob-1", "", w) // inside the chest area
 	if area.LiveChest() == nil {
 		t.Fatal("kill hook spawned no chest")
 	}
@@ -307,7 +307,7 @@ func TestKillHookSpawnsChest(t *testing.T) {
 	n := len(w.chests)
 	w.mu.Unlock()
 
-	KillHookForMob(0, 0, "mob-1", w) // outside any area: no-op
+	KillHookForMob(0, 0, "mob-1", "", w) // outside any area: no-op
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.chests) != n {

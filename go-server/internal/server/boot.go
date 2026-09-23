@@ -1676,7 +1676,8 @@ var resourceEntities = func() map[string][2]int {
 // (map.ts:170,201-208): OOB or empty data blocks; otherwise any layer whose
 // unflipped id is in `collisions` blocks. Objects are also treated as
 // blocking here to match the c flag buildTile emits (client refuses those
-// requests itself anyway). Dynamic areas/doors/noclip are out of scope.
+// requests itself anyway). Dynamic per-player remap applies in blockedForPlayer;
+// doors trigger on Step landing (handleDoorStep); noclip stays admin-only.
 // In test mode the same real-terrain rule applies on top of the cloned base,
 // with overlays: pond water always blocks, forced-grass tiles (demo resources, showcase
 // grid, demos) always walk.
@@ -1815,7 +1816,7 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 		if checkSpeed(s, dx+dy) && !m13NoclipAllowed(c.Username) {
 			return rejectLocked(c, "speed request")
 		}
-		if blocked(*mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.Username) {
+		if blockedForPlayer(c, *mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.Username) {
 			stopPlayer(c)
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 		}
@@ -1850,9 +1851,10 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 			m8OnPositionUpdate(c)  // M8: lobby area enter/exit callbacks
 			m9OnPlayerMoved(c)     // M9: aggro scan on position update (Node detectAggro)
 			m10OnPositionUpdate(c) // M10: detectAreas parity (pvp/overlay/camera/music)
+			handleDoorStep(c)      // doors fire on stopping on a door tile (player.ts:1280)
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
-			blocked(*mv.NextGridX, *mv.NextGridY) &&
+			blockedForPlayer(c, *mv.NextGridX, *mv.NextGridY) &&
 			!targetsResource(*mv.NextGridX, *mv.NextGridY, mv.TargetInstance, s.Target) {
 			stopPlayer(c)
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
@@ -2212,6 +2214,8 @@ func registerDisconnectHooks() {
 		}
 		// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
 		m10ForgetPlayer(c.Instance)
+		// Plateau: drop the tracked plateauLevel.
+		plateauForget(c.Instance)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)

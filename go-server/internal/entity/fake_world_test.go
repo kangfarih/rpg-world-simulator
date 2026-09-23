@@ -13,6 +13,7 @@ type simFake struct {
 	mu       sync.Mutex
 	players  []PlayerView
 	blocked  func(x, y int) bool
+	plateau  func(x, y int) int
 	heroHP   map[string]int
 	entityAt map[string][2]int
 
@@ -44,6 +45,11 @@ type simFake struct {
 	effects  []effectCall
 	freezes  []freezeCall
 	chests   []ChestSpawn
+	finAchs  []finAchCall
+}
+
+type finAchCall struct {
+	instance, key string
 }
 
 type moveCall struct {
@@ -163,6 +169,13 @@ func (f *simFake) Blocked(x, y int) bool {
 		return f.blocked(x, y)
 	}
 	return false
+}
+
+func (f *simFake) PlateauLevel(x, y int) int {
+	if f.plateau != nil {
+		return f.plateau(x, y)
+	}
+	return 0
 }
 
 func (f *simFake) SetEntityPos(instance string, x, y int) {
@@ -365,6 +378,12 @@ func (f *simFake) SpawnChestFrame(c ChestSpawn) {
 	f.chests = append(f.chests, c)
 }
 
+func (f *simFake) FinishAchievement(instance, key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finAchs = append(f.finAchs, finAchCall{instance, key})
+}
+
 // fireDelays runs recorded respawn timers (manual clock).
 func (f *simFake) fireDelays() {
 	f.mu.Lock()
@@ -394,6 +413,7 @@ type testMob struct {
 	hp, maxHP int
 	dead      bool
 	target    string
+	plateau   int
 	lastAtk   time.Time
 	lastMove  time.Time
 	lastRoam  time.Time
@@ -429,6 +449,7 @@ func (m *testMob) Dead() bool              { return m.dead }
 func (m *testMob) SetDead(dead bool)       { m.dead = dead }
 func (m *testMob) Target() string          { return m.target }
 func (m *testMob) SetTarget(t string)      { m.target = t }
+func (m *testMob) Plateau() int            { return m.plateau }
 func (m *testMob) LastAtk() time.Time      { return m.lastAtk }
 func (m *testMob) SetLastAtk(t time.Time)  { m.lastAtk = t }
 func (m *testMob) LastMove() time.Time     { return m.lastMove }

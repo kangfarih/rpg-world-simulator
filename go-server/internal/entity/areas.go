@@ -27,9 +27,10 @@
 //     work in the stub (documented divergence).
 //
 // Chest entity OPEN flow (entities.ts spawnChest onOpen): open despawns the
-// chest, rolls one item, spawns it at the chest tile (persistent — no blink
-// expiry, matching the isStatic=false spawnItem in Node's chest flow), and
-// rewards the area achievement when achievements land (logged TODO).
+// chest, rolls one item and spawns it at the chest tile (persistent — no
+// blink expiry, matching the isStatic=false spawnItem in Node's chest flow).
+// The area achievement fires at CLEAR time (RemoveChestMob, chest.ts onEmpty
+// parity), never on open.
 //
 // Everything transport/world related stays with the root adapter and is
 // reached only through the AreaWorld seam (root helpers in parentheses):
@@ -109,6 +110,9 @@ type AreaWorld interface {
 	FreezeApply(instance string)
 	FreezeClear(instance string)
 	SpawnChestFrame(c ChestSpawn)
+	// FinishAchievement finishes an achievement for the player behind
+	// instance (quest.Finish path: chest clear rewards, door achievements).
+	FinishAchievement(instance, key string)
 }
 
 // ChestSpawn is the Spawn-frame descriptor for a reward chest
@@ -145,6 +149,12 @@ type Area struct {
 
 	Mapping   int `json:"mapping"`   // dynamic: mapped counterpart area id
 	Animation int `json:"animation"` // dynamic: mapped animation area id
+
+	// Quest/Achievement gate dynamic collision remaps (area.ts
+	// fulfillsRequirement) and names the chest clear reward (chest.ts
+	// onEmpty attacker achievement).
+	Quest       string `json:"quest"`
+	Achievement string `json:"achievement"`
 
 	Polygon []struct {
 		X int `json:"x"`
@@ -280,6 +290,8 @@ var (
 	dynamicAreas []*Area
 	dynamicByID  = map[int]*Area{}
 	areasLoaded  bool
+	doors        = map[int]*Door{}
+	areasWidth   int
 
 	// playerAreas mirrors player.overlayArea/cameraArea/currentSong/pvp —
 	// keyed by connection instance (player.ts change-detection fields).
@@ -297,6 +309,8 @@ func resetAreas() {
 	cameraAreas, musicAreas, pvpAreas, overlayAreas = nil, nil, nil, nil
 	chestAreas, dynamicAreas = nil, nil
 	dynamicByID = map[int]*Area{}
+	doors = map[int]*Door{}
+	areasWidth = 0
 	areasLoaded = false
 	areasMu.Unlock()
 	stateMu.Lock()
@@ -332,13 +346,15 @@ func LoadAreas(doc []byte) {
 		return
 	}
 	var parsed struct {
+		Width int `json:"width"`
 		Areas struct {
-			Camera  []Area `json:"camera"`
-			Music   []Area `json:"music"`
-			PVP     []Area `json:"pvp"`
-			Overlay []Area `json:"overlay"`
-			Chests  []Area `json:"chests"`
-			Dynamic []Area `json:"dynamic"`
+			Camera  []Area    `json:"camera"`
+			Music   []Area    `json:"music"`
+			PVP     []Area    `json:"pvp"`
+			Overlay []Area    `json:"overlay"`
+			Chests  []Area    `json:"chests"`
+			Dynamic []Area    `json:"dynamic"`
+			Doors   []rawDoor `json:"doors"`
 		} `json:"areas"`
 	}
 	if err := json.Unmarshal(doc, &parsed); err != nil {
@@ -359,6 +375,11 @@ func LoadAreas(doc []byte) {
 	chestAreas = cp(parsed.Areas.Chests)
 	dynamicAreas = cp(parsed.Areas.Dynamic)
 
+	// map.ts loadDoors parity: link areas.doors by destination id, keyed by
+	// entry tile index (needs the map width from the same document).
+	areasWidth = parsed.Width
+	doors = loadDoors(parsed.Areas.Doors, parsed.Width)
+
 	// dynamic.ts link(): map `mapping`/`animation` ids to their areas.
 	for _, a := range dynamicAreas {
 		dynamicByID[a.ID] = a
@@ -372,8 +393,8 @@ func LoadAreas(doc []byte) {
 		}
 	}
 
-	log.Printf("m10: areas loaded camera=%d music=%d pvp=%d overlay=%d chests=%d dynamic=%d",
-		len(cameraAreas), len(musicAreas), len(pvpAreas), len(overlayAreas), len(chestAreas), len(dynamicAreas))
+	log.Printf("m10: areas loaded camera=%d music=%d pvp=%d overlay=%d chests=%d dynamic=%d doors=%d",
+		len(cameraAreas), len(musicAreas), len(pvpAreas), len(overlayAreas), len(chestAreas), len(dynamicAreas), len(doors))
 }
 
 // AreasLoaded reports whether LoadAreas has run (single boot load).
@@ -451,8 +472,10 @@ func AddChestMob(area *Area, instance string, respawnDelay time.Duration, w Game
 // RemoveChestMob ports Area.removeEntity + onEmpty (mob handler death
 // path): drop the mob from the area; when the last one leaves, spawn the
 // reward chest guarded by the respawn delay (chest.ts spawnChest +
-// Utils.timePassed).
-func RemoveChestMob(area *Area, instance string, w GameWorld) {
+// Utils.timePassed) and award the area achievement to the clearing attacker
+// (chest.ts onEmpty attacker achievement finish). attackerInstance is "" for
+// killerless clears (no award, TS attacker-undefined parity).
+func RemoveChestMob(area *Area, instance, attackerInstance string, w GameWorld) {
 	area.mobMu.Lock()
 	idx := -1
 	for i, m := range area.mobs {
@@ -470,6 +493,7 @@ func RemoveChestMob(area *Area, instance string, w GameWorld) {
 		delay = RespawnDelay // Node fallback: MobDefaults.RESPAWN_DELAY
 	}
 	canSpawn := empty && time.Now().UnixMilli()-area.lastSpawn >= delay.Milliseconds()
+	achievement := area.Achievement
 	if canSpawn {
 		area.lastSpawn = time.Now().UnixMilli()
 	}
@@ -479,17 +503,20 @@ func RemoveChestMob(area *Area, instance string, w GameWorld) {
 		return
 	}
 	spawnChestEntity(area, w)
+	if empty && achievement != "" && attackerInstance != "" {
+		w.FinishAchievement(attackerInstance, achievement)
+	}
 }
 
 // KillHookForMob fires the chest-area death path for a killed mob
 // (handler.ts: mob.area?.removeEntity(mob, attacker) -> onEmpty chest
-// spawn). Called from KillMob.
-func KillHookForMob(mobX, mobY int, mobInstance string, w GameWorld) {
+// spawn). Called from KillMob. killerInstance is "" for killerless kills.
+func KillHookForMob(mobX, mobY int, mobInstance, killerInstance string, w GameWorld) {
 	area := ChestAreaAt(mobX, mobY)
 	if area == nil {
 		return
 	}
-	RemoveChestMob(area, mobInstance, w)
+	RemoveChestMob(area, mobInstance, killerInstance, w)
 }
 
 // spawnChestEntity ports entities.ts spawnChest for the chest-AREA flow:
@@ -534,8 +561,9 @@ func ChestAt(x, y int) bool {
 
 // OpenChest ports Chest.getItem roll + entities.ts spawnChest onOpen:
 // despawn the chest, roll one entry (key:count:probability, Utils.randomInt
-// inclusive), spawn the item at the chest tile as a persistent M5 loot
-// entity, and log the (future) achievement reward.
+// inclusive) and spawn the item at the chest tile as a persistent M5 loot
+// entity. The area achievement is NOT awarded here: TS awards it in the
+// onEmpty clear callback (RemoveChestMob), not on open.
 func OpenChest(chest *Chest, openerUsername string, w GameWorld) {
 	// Remove the chest first (onOpen -> this.remove(chest)).
 	chest.Area.mobMu.Lock()

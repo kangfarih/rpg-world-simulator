@@ -345,13 +345,16 @@ func Manhattan(ax, ay, bx, by int) int {
 // PlayerView is the per-player snapshot the engine needs (aggro scan,
 // leash, damage). The root adapter builds it from the players map +
 // m5 state; Level/Defense are the raw m5 values (0 when unknown) and the
-// Node fallback gates (>1) live in the predicates below.
+// Node fallback gates (>1) live in the predicates below. Plateau is the
+// hero's tracked plateauLevel (handler.ts:333 parity) for the cross-plateau
+// combat gate.
 type PlayerView struct {
 	Instance string
 	Username string
 	X, Y     int
 	Level    int // raw m5 level (0 = unknown)
 	Defense  int // raw m5 defense skill (0 = unknown)
+	Plateau  int // tracked plateauLevel (0 = default/unset)
 }
 
 // Mob is the live mob state, implemented by the root m9Mob (the single
@@ -386,6 +389,10 @@ type Mob interface {
 	DropAttacker(inst string)
 	Attackers() map[string]time.Time // copy
 	ClearAttackers()
+	// Plateau is the mob's bound plateau level, set at spawn from the
+	// spawn tile (mob.ts:148) and never changed afterwards (respawns
+	// return to spawn, so the level is stable).
+	Plateau() int
 }
 
 // MobSpawn is the Spawn-frame descriptor for a mob (Mob.serialize:
@@ -405,11 +412,14 @@ type MobSpawn struct {
 // SpawnMobFrame/MobPoints/StrikeMob/HeroPoints/HeroDied/TeleportHero/
 // SpawnHero/HeroRespawned (broadcast/send frame builders),
 // Get/Set/ForgetHeroHP (m9PlayerHPs store), AfterDelay (time.AfterFunc),
-// ApplyPoison (abApplyPoison).
+// ApplyPoison (abApplyPoison), PlateauLevel (map.getPlateauLevel).
 type MobWorld interface {
 	Players() []PlayerView
 	PlayerPos(instance string) (x, y int, ok bool)
 	Blocked(x, y int) bool
+	// PlateauLevel is map.getPlateauLevel (map.ts): the plateau level at
+	// (x,y), 0 when the tile carries none. Serves the roam-step gate.
+	PlateauLevel(x, y int) int
 	SetEntityPos(instance string, x, y int)
 	Despawn(instance string)
 	MoveMob(instance string, x, y int)
@@ -718,7 +728,10 @@ func sendToSpawn(m Mob, w GameWorld) {
 }
 
 // roamMob ports handler.handleRoaming: random point around spawn within
-// roamDistance, collision guard, plateau skipped (flat TESTMAP).
+// roamDistance, plateau gate, collision guard. A mob is bound to its spawn
+// plateau level and cannot roam onto a different one (mob/handler.ts:184);
+// only roam STEPS are gated, never spawn positions (showcase/chase legs are
+// unaffected — a refused draw simply retries on the next roam interval).
 // Call with the mob lock held.
 func roamMob(m Mob, w GameWorld) {
 	p := m.Profile()
@@ -734,6 +747,9 @@ func roamMob(m Mob, w GameWorld) {
 	if nx == mx && ny == my {
 		return
 	}
+	if m.Plateau() != w.PlateauLevel(nx, ny) {
+		return
+	}
 	if w.Blocked(nx, ny) {
 		return
 	}
@@ -741,12 +757,31 @@ func roamMob(m Mob, w GameWorld) {
 	w.MoveMob(m.Instance(), nx, ny)
 }
 
+// PlateauCombatBlocked ports the cross-plateau combat refusal: combat never
+// crosses plateau levels (silent no-swing, TS combat-loop parity).
+//
+// TS-parity note: the exact Node rule is narrower — character.ts
+// isNearTarget gates only RANGED attacks (attacker.plateauLevel >=
+// target.plateauLevel, so higher-or-equal may snipe down) while melee
+// adjacency is ungated, and combat.ts:292 is the shouldTeleportNearby
+// (stuck-mob teleport) guard, not a combat-start gate. The Go engine has no
+// hero range model and no combat loop (single-swing dispatch both ways), so
+// both swings take the conservative symmetric gate: any plateau difference
+// refuses the swing. No-op on flat maps (all e2e legs run on plateau 0).
+func PlateauCombatBlocked(attackerPlateau, targetPlateau int) bool {
+	return attackerPlateau != targetPlateau
+}
+
 // strikeMob mirrors combat.sendAttack (melee path): player damage + Combat
 // Hit broadcast. Damage 0 hits still emit the Hit frame (Node does too).
+// Cross-plateau swings are refused silently (PlateauCombatBlocked parity).
 // Call with the mob lock held.
 func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 	if m.Overrides().NoAttack {
 		return // M3 rat demo semantics
+	}
+	if PlateauCombatBlocked(m.Plateau(), viewer.Plateau) {
+		return
 	}
 	defLvl := 1
 	if viewer.Defense > defLvl {
@@ -831,7 +866,11 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	if hasKiller {
 		w.SpawnLoot(key, mx, my, killer.Username)
 	}
-	KillHookForMob(mx, my, inst, w) // chest-area onEmpty (reward chest spawn)
+	killerInstance := ""
+	if hasKiller {
+		killerInstance = killer.Instance
+	}
+	KillHookForMob(mx, my, inst, killerInstance, w) // chest-area onEmpty (reward chest spawn)
 	if hasKiller {
 		w.QuestKill(killer.Instance, key) // quest kill stages + achievements
 	}
