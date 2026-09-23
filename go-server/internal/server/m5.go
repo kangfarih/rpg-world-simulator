@@ -180,6 +180,7 @@ type m5State struct {
 	X, Y   int
 	Level  int
 	HP     int
+	Rank   int // Modules.Ranks value (persist rank column parity)
 	Inv    []m5Slot
 	Bank   []m5Slot
 	Equip  []m5Slot // length ModulesEquipmentCount; Count 0 = empty slot
@@ -275,6 +276,9 @@ func xpDeps() player.Deps {
 			}
 			prev := s.Level
 			s.XP += amount
+			if s.XP < 0 {
+				s.XP = 0 // TS subtraction floors at 0 (no negative XP store)
+			}
 			s.Level = expToLevel(s.XP)
 			if s.Level < 1 {
 				s.Level = 1
@@ -626,7 +630,7 @@ func m5Snapshot(key string) *m5State {
 	if !ok {
 		return nil
 	}
-	cp := &m5State{X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Skills: map[int]*m5Skill{}}
+	cp := &m5State{X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank, Skills: map[int]*m5Skill{}}
 	cp.Inv = append(cp.Inv, st.Inv...)
 	cp.Bank = append(cp.Bank, st.Bank...)
 	cp.Equip = append(cp.Equip, st.Equip...)
@@ -641,7 +645,7 @@ func m5Snapshot(key string) *m5State {
 // carry no enchantments, matching the bank table).
 func m5ToPersist(st *m5State) persist.State {
 	ps := persist.State{
-		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP,
+		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
 		Skills: make(map[int]persist.Skill, len(st.Skills)),
 	}
 	for _, s := range st.Inv {
@@ -663,7 +667,7 @@ func m5ToPersist(st *m5State) persist.State {
 // normalizing the fixed ModulesEquipmentCount slot array (slot indexing
 // must never panic) exactly like the old m5Load tail.
 func persistToM5(ps persist.State) *m5State {
-	st := &m5State{X: ps.X, Y: ps.Y, Level: ps.Level, HP: ps.HP, Skills: map[int]*m5Skill{}}
+	st := &m5State{X: ps.X, Y: ps.Y, Level: ps.Level, HP: ps.HP, Rank: ps.Rank, Skills: map[int]*m5Skill{}}
 	for _, s := range ps.Inv {
 		st.Inv = append(st.Inv, m5Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchParse(s.Ench)})
 	}
@@ -770,6 +774,10 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		st = m5StateFor(key)
 		markDirty(key)
 	}
+	// Rank durability (database.setRank parity): a persisted offline /setrank
+	// lands on the session at login. Fresh rows carry 0 (None), a no-op.
+	c.rank = st.Rank
+	chatStateFor(c).rank = st.Rank
 	c.Sess.PlayerX, c.Sess.PlayerY = st.X, st.Y
 	worldcore.SetEntityPos(c.Instance, st.X, st.Y)
 	worldcore.UpdateRegion(c, st.X, st.Y)

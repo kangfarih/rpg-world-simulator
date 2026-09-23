@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -274,9 +275,15 @@ func TestAddexpSilentMiss(t *testing.T) {
 	if len(p.skills.adds) != 1 {
 		t.Fatalf("addexp did not award: %v", p.skills.adds)
 	}
+	// Negative amounts pass through to the award path (TS addexp
+	// subtraction: any non-zero x reaches skill.addExperience).
+	AdminProgressionCommands(admin, "addexp", []string{"health", "-50"}, d)
+	if len(p.skills.adds) != 2 {
+		t.Fatalf("negative addexp did not award: %v", p.skills.adds)
+	}
 	AdminProgressionCommands(admin, "addexperience", []string{"nope", "50"}, d)
 	AdminProgressionCommands(admin, "addexp", []string{"health"}, d)
-	if len(p.skills.adds) != 1 {
+	if len(p.skills.adds) != 2 {
 		t.Fatalf("addexp miss was not silent: %v %v", p.skills.adds, bus.notifs["a1"])
 	}
 	if len(bus.notifs["a1"]) != 0 {
@@ -385,8 +392,34 @@ func TestOpenbankSetpetMisc(t *testing.T) {
 	if !admin.container {
 		t.Fatal("openbank did not grant container access")
 	}
-	if !bus.hasOpcode("a1", 21, 0) {
-		t.Fatalf("openbank did not send bank Batch: %v", bus.sent["a1"])
+	// TS NPC-Bank frame (commands.ts /openbank: NPCPacket Bank {slots});
+	// the stock client renders it with no banker NPC context
+	// (connection.ts handleNPC Bank -> menu.getBank().show(slots)).
+	if !bus.hasOpcode("a1", 31, 2) {
+		t.Fatalf("openbank did not send NPC Bank frame: %v", bus.sent["a1"])
+	}
+	// Payload shape: {slots:[{index,key,count,enchantments}]} carrying the
+	// target's bank (bank.serialize() parity).
+	found := false
+	for _, f := range bus.sent["a1"] {
+		if f.id != 31 || f.opcode != 2 {
+			continue
+		}
+		var payload struct {
+			Slots []struct {
+				Key   string `json:"key"`
+				Count int    `json:"count"`
+			} `json:"slots"`
+		}
+		if err := json.Unmarshal(f.data, &payload); err != nil {
+			t.Fatalf("openbank NPC Bank payload unreadable: %v", err)
+		}
+		if len(payload.Slots) == 1 && payload.Slots[0].Key == "gold" && payload.Slots[0].Count == 10 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("openbank NPC Bank payload missing victim slots: %v", bus.sent["a1"])
 	}
 	AdminProgressionCommands(admin, "openbank", []string{"ghost"}, d)
 	if !bus.hasNotif("a1", "Could not find player: ghost") {

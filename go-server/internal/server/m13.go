@@ -990,10 +990,12 @@ func (m13abilities) ResetAbilities(c controller.CommandConn) {
 	if pc == nil {
 		return
 	}
-	// Client reload signal (abilities.reset loadCallback -> Ability Batch).
+	// abilities.reset() parity: clear the server-side unlock map, then the
+	// client reload signal (loadCallback -> Ability Batch, empty now).
+	abResetAbilities(pc.Username)
 	_ = gnet.Send(pc.Conn, abLoginBatch(pc.Username))
 	markDirty(pc.Username)
-	log.Printf("m13: %s reset abilities (client reload; registry clear needs abilities pkg support)", pc.Username)
+	log.Printf("m13: %s reset abilities", pc.Username)
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1017,7 @@ func (m13ranks) SetRank(target controller.CommandConn, rank int) {
 	st := m5StateFor(pc.Username)
 	pstateMu.Lock()
 	x, y, level := st.X, st.Y, st.Level
+	st.Rank = rank // durable across relogin via the persist rank column
 	pstateMu.Unlock()
 	ph := welcomePlayer(pc.Instance)
 	ph.X, ph.Y = x, y
@@ -1023,12 +1026,24 @@ func (m13ranks) SetRank(target controller.CommandConn, rank int) {
 	markDirty(pc.Username)
 }
 func (m13ranks) SetRankOffline(username string, rank int) {
-	// No durable rank column exists in the Go players table (rank is
-	// session state, seeded at login) — database.setRank has no
-	// equivalent; flag the row for the persist flush like every rank
-	// mutation and log the intent.
-	markDirty(username)
-	log.Printf("m13: setrank offline %s rank=%d (no durable rank store)", username, rank)
+	// database.setRank parity: persist the rank for an offline player so the
+	// login path restores it. Missing row = warn like TS (`No player found
+	// with the username ...`), no stub insert.
+	if dbConn == nil || username == "" {
+		return
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	res, err := dbConn.Exec(`UPDATE players SET rank=? WHERE instance=?`, rank, username)
+	if err != nil {
+		log.Printf("m13: setrank offline %s: %v", username, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		log.Printf("m13: No player found with the username %s.", username)
+		return
+	}
+	log.Printf("m13: setrank offline %s rank=%d", username, rank)
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,9 +1063,10 @@ func (m13pets) GrantPet(c controller.CommandConn, key string) {
 
 // ---------------------------------------------------------------------------
 // controller.PoisonAdmin seam (status Tracker pipeline + region scan).
-// Poison Has/Clear bookkeeping lives here because the status engine owns
-// the tracker and exposes Apply only (abApplyPoison, the same call the
-// poisonous-weapon hook rides via gameWorldAdapter.ApplyPoison).
+// Poison Apply/Clear ride the status engine (abApplyPoison/abRemovePoison,
+// the same calls the poisonous-weapon hook rides via
+// gameWorldAdapter.ApplyPoison); the toggle bookkeeping below mirrors the
+// controller-side expiry map.
 // ---------------------------------------------------------------------------
 
 type m13poisonStore struct{}
@@ -1086,6 +1102,10 @@ func (m13poisonStore) PoisonApply(instance string) {
 	})
 }
 func (m13poisonStore) PoisonClear(instance string) {
+	// Early cure (character.ts setPoison() with no argument): drop the Venom
+	// DoT in the status engine, not just the toggle bookkeeping below —
+	// otherwise the 30s ticks keep hitting after the cure notify.
+	abRemovePoison(instance)
 	m13poisonMu.Lock()
 	delete(m13poisoned, instance)
 	m13poisonMu.Unlock()

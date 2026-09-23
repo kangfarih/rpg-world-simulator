@@ -163,8 +163,9 @@ type AwardResult struct {
 type Deps struct {
 	// ApplyAward atomically awards amount XP to skill for key (creating the
 	// skill at 1 when missing, recomputing combat level for combat skills)
-	// and returns the applied result. Nil-amount (<1) awards are rejected
-	// by the caller before this runs (m5AddXP early return verbatim).
+	// and returns the applied result. Zero-amount awards are rejected by the
+	// caller before this runs (m5AddXP early return verbatim); negative
+	// amounts subtract with XP clamped at 0 (TS addexp subtraction parity).
 	ApplyAward func(key string, skill, amount int) AwardResult
 	// Broadcast fans frames out (worldcore.Broadcast parity).
 	Broadcast func(frames ...[]any)
@@ -183,9 +184,16 @@ type Deps struct {
 
 // AddXP awards skill XP, emitting Experience Skill + Skill Update, and on
 // level-up a Sync broadcast + Healing FX heal anim. Returns new level
-// (m5AddXP verbatim; amount < 1 returns 1 with no state touched).
+// (m5AddXP verbatim; amount == 0 returns 1 with no state touched).
+// Negative amounts mirror the TS addexp subtraction (commands.ts addexp
+// passes any non-zero x to skill.addExperience, which does
+// setExperience(experience + x)): XP is reduced, clamped at 0 (TS
+// expToLevel goes to -1 below 0; the Go state floors level at 1), with the
+// same frames as the positive path (a level change fans out Sync either
+// way). Only /addexp can supply negatives — combat/gather/store/quest
+// awards are guarded positive at their call sites.
 func AddXP(d Deps, c *Conn, key string, skill, amount int) int {
-	if amount < 1 {
+	if amount == 0 {
 		return 1
 	}
 	res := d.ApplyAward(key, skill, amount)

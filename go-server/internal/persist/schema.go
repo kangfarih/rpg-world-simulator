@@ -34,7 +34,12 @@ const SchemaVersionKey = "schema_version"
 // so v1 binaries keep booting against a v2 DB for every table they know
 // (they only refuse via the version gate below, which is the intended
 // roll-forward-only direction).
-const CurrentSchemaVersion = 2
+//
+// v3 adds `players.rank` (Modules.Ranks value, DEFAULT 0 = None;
+// database.setRank parity for offline /setrank). Expand-only: a new column
+// with a DEFAULT that no older query names, so v2 binaries keep reading
+// and writing every column they know.
+const CurrentSchemaVersion = 3
 
 // checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
 // row) are stamped with the current version; older versions are re-stamped

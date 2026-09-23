@@ -485,18 +485,23 @@ func PoisonCommand(c CommandConn, instance string, d CommandDeps) {
 	}
 }
 
-// OpenBankOf grants the admin container access and sends the target's
-// bank as a Container Batch (the banker NPC frame path, with the named
-// player's slots — the /openbank parity).
+// OpenBankOf grants the admin container access and sends the target's bank
+// as an NPC Bank frame (commands.ts /openbank: `new NPCPacket(
+// Opcodes.NPC.Bank, player.bank.serialize())` — {slots:[...]}, no NPC
+// instance context). The stock client renders this without a banker NPC:
+// connection.ts handleNPC Bank is just `menu.getBank().show(info.slots!)`
+// with no entity lookup, so no Container Batch fallback is needed. The slot
+// shape matches bank.serialize() (clientInfo=false): index/key/count/
+// enchantments only.
 func OpenBankOf(c CommandConn, username string, d CommandDeps) {
 	c.GrantContainerAccess()
 	slots := d.Inv.BankSlots(username)
-	out := make([]any, 0, len(slots))
+	out := make([]protocol.SlotData, 0, len(slots))
 	for i, s := range slots {
-		out = append(out, map[string]any{
-			"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+		out = append(out, protocol.SlotData{
+			Index: i, Key: s.Key, Count: s.Count, Enchantments: map[string]any{},
 		})
 	}
-	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerBatch,
-		protocol.ContainerData{Type: protocol.ContainerTypeBank, Data: &protocol.ContainerBatchPayload{Slots: out}}))
+	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketNPC, protocol.NPCBank,
+		protocol.NpcPacketData{Slots: out}))
 }

@@ -33,8 +33,17 @@ func (f *fakeHandler) SetAdmin(u string) string {
 func (f *fakeHandler) SetMod(u string) string {
 	return f.record("setmod " + u)
 }
+func (f *fakeHandler) RemoveAdmin(u string) string {
+	return f.record("removeadmin " + u)
+}
+func (f *fakeHandler) RemoveMod(u string) string {
+	return f.record("removemod " + u)
+}
 func (f *fakeHandler) IPBan(ip string) string {
 	return f.record("ipban " + ip)
+}
+func (f *fakeHandler) UnbanIP(ip string) string {
+	return f.record("unbanip " + ip)
 }
 func (f *fakeHandler) Save() string { return f.record("save") }
 
@@ -54,6 +63,10 @@ func TestParse(t *testing.T) {
 		{"/timeout alice", "timeout", []string{"alice"}},
 		{"/setadmin alice", "setadmin", []string{"alice"}},
 		{"/setmod alice", "setmod", []string{"alice"}},
+		{"/removeadmin alice", "removeadmin", []string{"alice"}},
+		{"/removemod alice", "removemod", []string{"alice"}},
+		{"/unbanip 1.2.3.4", "unbanip", []string{"1.2.3.4"}},
+		{"/UNBANIP 1.2.3.4", "unbanip", []string{"1.2.3.4"}},
 		{"/ipban 1.2.3.4", "ipban", []string{"1.2.3.4"}},
 		{"/IPBAN 1.2.3.4", "ipban", []string{"1.2.3.4"}},
 		{"/PLAYERS", "players", nil},
@@ -100,7 +113,11 @@ func TestExecDispatch(t *testing.T) {
 		{"/timeout alice", "timeout alice"},
 		{"/setadmin alice", "setadmin alice"},
 		{"/setmod alice", "setmod alice"},
+		{"/removeadmin alice", "removeadmin alice"},
+		{"/removeadmin Alice Smith", "removeadmin Alice Smith"},
+		{"/removemod alice", "removemod alice"},
 		{"/ipban 1.2.3.4", "ipban 1.2.3.4"},
+		{"/unbanip 1.2.3.4", "unbanip 1.2.3.4"},
 	}
 	for _, c := range cases {
 		f := &fakeHandler{}
@@ -126,7 +143,8 @@ func TestExecUnknown(t *testing.T) {
 }
 
 func TestExecMissingArg(t *testing.T) {
-	for _, line := range []string{"/kill", "/kick", "/timeout", "/setadmin", "/setmod", "/ipban"} {
+	for _, line := range []string{"/kill", "/kick", "/timeout", "/setadmin", "/setmod",
+		"/removeadmin", "/removemod", "/ipban", "/unbanip"} {
 		f := &fakeHandler{}
 		got := Exec(f, line)
 		if got == "" {

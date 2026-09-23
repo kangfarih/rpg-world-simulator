@@ -23,8 +23,7 @@ import (
 )
 
 // Commands lists the slash commands dispatched by Exec, in the order they
-// appear in the TS switch (minus the rank-strip/unban aliases, see
-// divergences below).
+// appear in the TS switch.
 var Commands = []string{
 	"players",
 	"total",
@@ -34,7 +33,10 @@ var Commands = []string{
 	"timeout",
 	"setadmin",
 	"setmod",
+	"removeadmin",
+	"removemod",
 	"ipban",
+	"unbanip",
 	"save",
 }
 
@@ -58,7 +60,17 @@ type Handler interface {
 	Timeout(username string) string
 	SetAdmin(username string) string
 	SetMod(username string) string
+	// RemoveAdmin strips the admin rank (TS removeadmin: setRank() default
+	// None + target notify + sync; offline yields 'Player is not logged in.').
+	RemoveAdmin(username string) string
+	// RemoveMod strips the moderator rank (TS removemod, same shape as
+	// RemoveAdmin).
+	RemoveMod(username string) string
 	IPBan(ip string) string
+	// UnbanIP clears an IP ban (TS unbanip: database.setIpBan(ip, false)).
+	// Same-IP conns stay connected (TS shares the kick loop with ipban; the
+	// Go console deliberately does not re-kick on unban).
+	UnbanIP(ip string) string
 	Save() string
 }
 
@@ -139,11 +151,28 @@ func Exec(h Handler, line string) string {
 			return "Usage: /setmod <username>"
 		}
 		return h.SetMod(username)
+	case "removeadmin":
+		username := strings.Join(args, " ")
+		if username == "" {
+			return "Usage: /removeadmin <username>"
+		}
+		return h.RemoveAdmin(username)
+	case "removemod":
+		username := strings.Join(args, " ")
+		if username == "" {
+			return "Usage: /removemod <username>"
+		}
+		return h.RemoveMod(username)
 	case "ipban":
 		if len(args) == 0 {
 			return "Malformed command, expected /ipban <ip>"
 		}
 		return h.IPBan(args[0])
+	case "unbanip":
+		if len(args) == 0 {
+			return "Malformed command, expected /unbanip <ip>"
+		}
+		return h.UnbanIP(args[0])
 	default:
 		return fmt.Sprintf("Unknown command: %s", name)
 	}
@@ -161,12 +190,13 @@ func Exec(h Handler, line string) string {
 //     interior spacing is not preserved.
 //   - Missing username args return "Usage: /<command> <username>" without
 //     calling the handler; TS would look up the empty name and log
-//     "Player is not logged in." The ipban message keeps the exact TS
-//     "Malformed command, expected /ipban <ip>" text.
-//   - removeadmin/removemod/unbanip aliases from the TS switch have no
-//     Handler methods (spec scope is the ten listed commands); they report
-//     "Unknown command" here. The caller may map them onto SetAdmin/SetMod
-//     (strip) or IPBan as needed.
+//     "Player is not logged in." The ipban/unbanip messages keep the exact TS
+//     "Malformed command, expected /<command> <ip>" text (TS builds it from
+//     the command name, so unbanip carries its own name).
+//   - TS unbanip shares the ipban kick loop (same-IP conns are rejected with
+//     'banned' even on unban) and falls through to save (missing break).
+//     Neither is mirrored: UnbanIP only clears the ban (same-IP stays
+//     connected) and every command returns after its own handler call.
 //   - Output is returned as a string for the caller to print; TS logs via
 //     log.info inside each case. Handler implementations own the world
 //     effects (online lookups, hits, closes, rank sets, bans, saves).

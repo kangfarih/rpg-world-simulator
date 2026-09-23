@@ -105,6 +105,36 @@ func opsConfigure() {
 			}
 			target.rank = rank
 			chatStateFor(target).rank = rank
+			st := m5StateFor(username)
+			pstateMu.Lock()
+			st.Rank = rank // durable across relogin via the persist rank column
+			pstateMu.Unlock()
+			markDirty(username)
+			return target.Username, true
+		},
+		StripPlayerRank: func(username string) (string, bool) {
+			// TS removeadmin/removemod: player.setRank() (rank None + [50])
+			// + 'Your ranks have been stripped from you.' + sync.
+			// Online path mirrors m13ranks.SetRank (rank fields + [50] +
+			// Sync) plus the strip notify.
+			target := m7PlayerByName(username)
+			if target == nil {
+				return "", false
+			}
+			target.rank = 0 // Modules.Ranks.None
+			chatStateFor(target).rank = 0
+			_ = gnet.Send(target.Conn, pkt(PacketRank, 0)) // RankPacket(None)
+			m6Notify(target, "Your ranks have been stripped from you.")
+			st := m5StateFor(target.Username)
+			pstateMu.Lock()
+			x, y, level := st.X, st.Y, st.Level
+			st.Rank = 0 // durable across relogin via the persist rank column
+			pstateMu.Unlock()
+			ph := welcomePlayer(target.Instance)
+			ph.X, ph.Y = x, y
+			ph.Level = intp(level)
+			worldcore.Broadcast(pkt(PacketSync, ph))
+			markDirty(target.Username)
 			return target.Username, true
 		},
 		AdminRank:     RankAdmin,
@@ -126,6 +156,12 @@ func opsConfigure() {
 				worldcore.RemoveClient(k)
 			}
 			return len(conns)
+		},
+		UnbanIP: func(ip string) {
+			// database.setIpBan(ip, false) parity: clear the ban only.
+			// Same-IP conns stay connected (TS shares the kick loop with
+			// ipban; the Go console deliberately does not re-kick on unban).
+			gnet.UnbanIP(ip)
 		},
 		SaveWorld: flushDirty,
 	})

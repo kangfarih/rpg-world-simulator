@@ -76,6 +76,11 @@ type OpsDeps struct {
 	// SetPlayerRank sets the rank, reporting the display name
 	// (console SetAdmin/SetMod parity).
 	SetPlayerRank func(username string, rank int) (display string, ok bool)
+	// StripPlayerRank strips the rank back to None, reporting the display
+	// name (console RemoveAdmin/RemoveMod parity: TS removeadmin/removemod
+	// do player.setRank() + target notify + sync; offline yields
+	// 'Player is not logged in.').
+	StripPlayerRank func(username string) (display string, ok bool)
 	// AdminRank/ModeratorRank are the Modules.Ranks values for SetAdmin/SetMod.
 	AdminRank     int
 	ModeratorRank int
@@ -84,6 +89,10 @@ type OpsDeps struct {
 	// BanIP bans the IP and drops its connections, reporting the dropped
 	// count (console IPBan parity).
 	BanIP func(ip string) int
+	// UnbanIP clears the IP ban without dropping connections (console
+	// UnbanIP parity: TS unbanip is database.setIpBan(ip, false); same-IP
+	// conns stay connected).
+	UnbanIP func(ip string)
 	// SaveWorld flushes dirty player rows (console Save parity).
 	SaveWorld func()
 }
@@ -282,6 +291,19 @@ func (o opsConsole) SetMod(username string) string {
 	return consoleSetRank(username, opsDeps.ModeratorRank, "a moderator")
 }
 
+func consoleStripRank(username string) string {
+	name, ok := opsDeps.StripPlayerRank(username)
+	if !ok {
+		return "Player is not logged in."
+	}
+	return fmt.Sprintf("%s's ranks have been stripped.", name)
+}
+
+func (o opsConsole) RemoveAdmin(username string) string {
+	return consoleStripRank(username)
+}
+func (o opsConsole) RemoveMod(username string) string { return consoleStripRank(username) }
+
 func (opsConsole) IPBan(ip string) string {
 	if ip == "list" {
 		out := opsDeps.BannedIPs()
@@ -293,6 +315,13 @@ func (opsConsole) IPBan(ip string) string {
 	}
 	dropped := opsDeps.BanIP(ip)
 	return fmt.Sprintf("Banned %s (%d connection(s) dropped).", ip, dropped)
+}
+
+func (opsConsole) UnbanIP(ip string) string {
+	opsDeps.UnbanIP(ip)
+	// TS logs 'IP %s has been banned.' even for unban (console.ts shares the
+	// log line across ipban/unbanip) — mirrored exactly.
+	return fmt.Sprintf("IP %s has been banned.", ip)
 }
 
 func (opsConsole) Save() string {

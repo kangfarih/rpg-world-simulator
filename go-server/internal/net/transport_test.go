@@ -154,3 +154,27 @@ func TestHubAcceptGate(t *testing.T) {
 		t.Fatalf("limiter count after failed upgrade = %d, want 0", n)
 	}
 }
+
+// TestHubUnbanIP clears the ban (console /unbanip parity) without touching
+// anything else: the IP is re-admitted and other bans survive.
+func TestHubUnbanIP(t *testing.T) {
+	h := NewHub()
+	h.BanIP("1.2.3.4")
+	h.BanIP("5.6.7.8")
+	h.UnbanIP("1.2.3.4")
+	h.UnbanIP("9.9.9.9") // absent is a no-op
+	for _, ip := range h.BannedIPs() {
+		if ip == "1.2.3.4" {
+			t.Fatalf("BannedIPs = %v, want 1.2.3.4 cleared", h.BannedIPs())
+		}
+	}
+	found := false
+	for _, ip := range h.BannedIPs() {
+		if ip == "5.6.7.8" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("BannedIPs = %v, want 5.6.7.8 retained", h.BannedIPs())
+	}
+}

@@ -62,6 +62,32 @@ func TestClearSilences(t *testing.T) {
 	}
 }
 
+// Remove drops one kind and leaves the others ticking (setPoison() cure
+// parity: curing poison must not clear a concurrent ability window).
+func TestRemoveDropsOneKind(t *testing.T) {
+	tr := NewTracker()
+	tr.Apply("p1", KindPoison, 5, 30_000, 0)
+	tr.Apply("p1", KindFreezing, 0, 60_000, 0)
+
+	// Cure the poison before its first tick: no poison ticks ever emit.
+	tr.Remove("p1", KindPoison)
+	if tr.Has("p1", KindPoison) {
+		t.Fatal("Has(poison) = true after Remove, want false")
+	}
+	if !tr.Has("p1", KindFreezing) {
+		t.Fatal("Has(freezing) = false after poison Remove, want true")
+	}
+	if got := tr.Tick(2000); len(got) != 0 {
+		t.Fatalf("Tick(2000) = %v, want no poison tick after cure", got)
+	}
+	if got := tr.Tick(30_000); len(got) == 0 {
+		t.Fatal("Tick(30000) emitted nothing, want the surviving freezing cadence untouched")
+	}
+	// Removing an absent kind/instance is a no-op.
+	tr.Remove("p1", KindPoison)
+	tr.Remove("ghost", KindPoison)
+}
+
 // Freeze is present for its duration (movement/heal gates consult Has) and
 // ticks cold damage on the 10s EFFECT_RATE cadence; burning ticks 20.
 func TestFreezePresenceAndColdDamage(t *testing.T) {

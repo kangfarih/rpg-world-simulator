@@ -118,6 +118,8 @@ func abGrantAbility(c *playerConn, username, key string, level int) bool {
 
 func abHas(username, key string) bool { return abilities.Has(username, key) }
 
+func abResetAbilities(username string) { abilities.ResetAbilities(username) }
+
 func abLoadAbilities(username string) { abilities.LoadAbilities(username) }
 
 func abLoginBatch(username string) []any { return abilities.LoginBatch(username) }
@@ -135,6 +137,8 @@ func abUse(c *playerConn, key string) { abilities.Use(abConn(c), key) }
 func itoa(v int64) string { return abilities.Itoa(v) }
 
 func abApplyPoison(instance string) { abilities.ApplyPoison(instance) }
+
+func abRemovePoison(instance string) { abilities.RemovePoison(instance) }
 
 func abHeroWeaponPoisonous(username string) bool { return abilities.HeroWeaponPoisonous(username) }
 

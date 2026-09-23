@@ -232,6 +232,23 @@ func (t *Tracker) Clear(inst Instance) {
 	delete(t.fx, inst)
 }
 
+// Remove drops one kind on inst, leaving the other effects untouched (TS
+// status.remove / character.setPoison() cure parity: curing poison must not
+// clear ability-cast Running/ThickSkin windows sharing the instance). After
+// Remove, Tick emits nothing for that kind and Has reports false for it.
+func (t *Tracker) Remove(inst Instance, kind Kind) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m := t.fx[inst]
+	if m == nil {
+		return
+	}
+	delete(m, kind)
+	if len(m) == 0 {
+		delete(t.fx, inst)
+	}
+}
+
 // Has reports whether inst currently holds kind (TS status.has). Presence
 // covers persistent (duration < 0) entries. Note: expiry is reaped on Tick,
 // so an entry past its duration still reports true until the next Tick.

@@ -421,6 +421,15 @@ func (h *Hub) BanIP(ip string) {
 	h.ipBans[ip] = true
 }
 
+// UnbanIP clears an IP ban (console /unbanip parity:
+// database.setIpBan(ip, false)). Same-IP conns stay connected — unban
+// never drops; only the ban path drops matching conns.
+func (h *Hub) UnbanIP(ip string) {
+	h.ipMu.Lock()
+	defer h.ipMu.Unlock()
+	delete(h.ipBans, ip)
+}
+
 // BannedIPs lists banned IPs (console /ipban list parity, sorted).
 func (h *Hub) BannedIPs() []string {
 	h.ipMu.Lock()
@@ -475,6 +484,9 @@ func SetAccepting(b bool) { DefaultHub.SetAccepting(b) }
 
 // BanIP records an IP ban.
 func BanIP(ip string) { DefaultHub.BanIP(ip) }
+
+// UnbanIP clears an IP ban (same-IP conns stay connected).
+func UnbanIP(ip string) { DefaultHub.UnbanIP(ip) }
 
 // BannedIPs lists banned IPs.
 func BannedIPs() []string { return DefaultHub.BannedIPs() }

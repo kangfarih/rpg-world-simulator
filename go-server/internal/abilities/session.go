@@ -263,6 +263,21 @@ func Has(username, key string) bool {
 	return abLevels[username][key] > 0
 }
 
+// ResetAbilities clears the server-side ability unlock map for username
+// (abilities.ts reset(): `this.abilities = {}` — the same store the C->S
+// Ability QuickSlot opcode writes and LoginBatch reads). The client reloads
+// from the next Ability Batch (empty list when nothing is unlocked). Like
+// TS, persisted rows are untouched: a relogin restores from the DB.
+func ResetAbilities(username string) {
+	if username == "" {
+		return
+	}
+	abMu.Lock()
+	defer abMu.Unlock()
+	delete(abLevels, username)
+	delete(abQuick, username)
+}
+
 // LoadAbilities restores persisted unlocks into memory (m11LoadQuests
 // precedent — called before the login batches are built).
 func LoadAbilities(username string) {
@@ -496,6 +511,18 @@ func ApplyPoison(instance string) {
 		return
 	}
 	abStatus.Apply(status.Instance(instance), status.KindPoison, 0, 0, time.Now().UnixMilli())
+}
+
+// RemovePoison cures Venom on an instance (character.ts setPoison() with no
+// argument clears the poison). Only the poison entry is dropped — ability
+// windows and freeze keys sharing the instance are untouched. The /poison
+// toggle-off cure path must call this; otherwise the 30s Venom DoT keeps
+// ticking after the cure notify.
+func RemovePoison(instance string) {
+	if instance == "" {
+		return
+	}
+	abStatus.Remove(status.Instance(instance), status.KindPoison)
 }
 
 // HeroWeaponPoisonous reports whether the hero's equipped weapon carries

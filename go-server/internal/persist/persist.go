@@ -89,11 +89,14 @@ type StatsBlob struct {
 // Equipment is dense by type index (holes are zero Slots); LoadPlayer sizes
 // it to maxType+1 (nil when no rows) and the root pads/truncates it to the
 // fixed ModulesEquipmentCount array exactly like the old m5Load.
+// Rank is the Modules.Ranks value (database.setRank parity: offline /setrank
+// persists here, the login path restores it onto the session).
 type State struct {
 	X      int
 	Y      int
 	Level  int
 	HP     int
+	Rank   int
 	Inv    []Slot
 	Bank   []Slot
 	Equip  []Slot
@@ -104,7 +107,7 @@ type State struct {
 // Snapshot deep-copies a State (nil-safe for the Skills map).
 func (s *Store) Snapshot(st State) State {
 	cp := State{
-		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP,
+		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
 		Skills: make(map[int]Skill, len(st.Skills)),
 	}
 	cp.Inv = append(cp.Inv, st.Inv...)
@@ -179,6 +182,10 @@ func (s *Store) EnsureSchema() error {
 			return fmt.Errorf("ddl: %w", err)
 		}
 	}
+	// v3 migration (expand-only): `players.rank` with a DEFAULT, so
+	// pre-v3 rows read back 0 (None). Ignore failure = column exists
+	// (M12 inventory.enchantments precedent in Open).
+	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN rank INT DEFAULT 0`)
 	return s.checkSchemaVersion()
 }
 
@@ -257,10 +264,10 @@ func (s *Store) WritePlayer(key string, st State) error {
 	}
 	extraRaw, _ := json.Marshal(extra)
 	if _, err := s.db.Exec(
-		`INSERT INTO players(instance,name,x,y,level,hp,data) VALUES(?,?,?,?,?,?,?) `+
+		`INSERT INTO players(instance,name,x,y,level,hp,data,rank) VALUES(?,?,?,?,?,?,?,?) `+
 			`ON CONFLICT(instance) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y,`+
-			`level=excluded.level,hp=excluded.hp,data=excluded.data`,
-		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw)); err != nil {
+			`level=excluded.level,hp=excluded.hp,data=excluded.data,rank=excluded.rank`,
+		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw), st.Rank); err != nil {
 		log.Printf("m5: save players %s: %v", key, err)
 		return err
 	}
@@ -384,8 +391,8 @@ func (s *Store) LoadPlayer(key string) (State, bool) {
 	st := State{Skills: map[int]Skill{}}
 	var data string
 	err := s.db.QueryRow(
-		`SELECT name,x,y,level,hp,data FROM players WHERE instance=?`, key,
-	).Scan(&name, &st.X, &st.Y, &st.Level, &st.HP, &data)
+		`SELECT name,x,y,level,hp,data,rank FROM players WHERE instance=?`, key,
+	).Scan(&name, &st.X, &st.Y, &st.Level, &st.HP, &data, &st.Rank)
 	if err != nil {
 		return State{}, false
 	}
