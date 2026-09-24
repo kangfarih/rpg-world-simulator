@@ -2,10 +2,10 @@
 //
 // Plateau (map.ts getPlateauLevel over `map.plateau`, handler.ts:333,
 // mob.ts:148): every authoritative player position update refreshes the
-// player's tracked plateauLevel (hooked into m5TrackPos, which already runs
-// on Movement Started/Step, handoffs and warp landings, plus m7Teleport and
-// the debug/respawn teleports that set positions directly). Mobs track their
-// spawn plateau in m9SpawnMob (mob.ts:148 parity).
+// player's tracked plateauLevel (hooked into m5TrackPos, which runs on
+// Movement Started/Step, handoffs, warp landings and every server-side
+// teleport: m7Teleport, m8Teleport, respawn, test tp, login seedPos).
+// Mobs track their spawn plateau in m9SpawnMob (mob.ts:148 parity).
 //
 // Cross-plateau combat (both swings, silent no-swing) and the mob roam-step
 // refusal live at their dispatch points; see entity.PlateauCombatBlocked for
@@ -47,8 +47,9 @@ func plateauLevelOf(x, y int) int {
 }
 
 // plateauTrack refreshes the tracked plateauLevel from the connection's
-// authoritative tile. Called from m5TrackPos (movement/handoff/warp paths)
-// and directly from teleports that bypass it.
+// authoritative tile. Called from m5TrackPos (movement/handoff/warp/teleport
+// paths) and directly from m7Teleport/m9 respawn (idempotent double refresh
+// alongside the m5TrackPos call there).
 func plateauTrack(c *playerConn) {
 	if c == nil {
 		return

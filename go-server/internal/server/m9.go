@@ -600,6 +600,8 @@ func m9DamagePlayer(c *playerConn, dmg int, from *m9Mob) {
 
 // m9HandleRespawn ports incoming.handleRespawn -> player.respawn: only when
 // dead; teleport to spawn + Spawn broadcast + Respawn{x,y} + Points sync.
+// The respawn tile is tracked via m5TrackPos (persist parity: a disconnect
+// right after respawn must relogin at spawn, not at the death tile).
 func m9HandleRespawn(c *playerConn) {
 	if m9PlayerHP(c) > 0 {
 		log.Printf("m9: invalid respawn request from %s", c.Username)
@@ -612,6 +614,7 @@ func m9HandleRespawn(c *playerConn) {
 		return
 	}
 	m9DeathFired.Delete(c.Instance) // next life dies loudly again
+	m5TrackPos(c)                   // tracks the respawn tile (plateauTrack rides along)
 	plateauTrack(c)
 	m8OnPositionUpdate(c)  // respawn position can cross an area boundary
 	m10OnPositionUpdate(c) // M10: area callbacks on the respawn tile too
@@ -729,6 +732,7 @@ func m9TestHandler(c *playerConn, data []byte) {
 			c.Sess.PlayerX, c.Sess.PlayerY = d.X, d.Y
 			worldcore.SetEntityPos(c.Instance, d.X, d.Y)
 			worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: d.X, Y: d.Y}))
+			m5TrackPos(c) // persist parity: the test tile must survive a save
 			plateauTrack(c)
 			m8OnPositionUpdate(c)
 			m9OnPlayerMoved(c)     // position updates run the aggro scan

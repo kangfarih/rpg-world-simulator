@@ -823,9 +823,10 @@ func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 
 // HitMob applies hero damage to a mob: Points, retaliate, death
 // (Node handler.handleHit + handleDeath). attacker is nil for
-// non-player damage (DoTs, admin commands). alive reports whether the
-// mob is still registered (the old m9MobFor check); the respawn timer
-// only fires when it does.
+// non-player damage (DoTs, admin commands); a killerless killing blow
+// still runs the full KillMob path (unowned loot, chest hooks, respawn).
+// alive reports whether the mob is still registered (the old m9MobFor
+// check); the respawn timer only fires when it does.
 func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, alive func() bool) {
 	m.Lock()
 	if m.Dead() {
@@ -858,7 +859,12 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 
 // KillMob ports handler.handleDeath: despawn + kill credit (M5 loot) +
 // chest-area onEmpty + M11 quest credit + destroy (respawn timer restores
-// full HP at spawn). killer is nil for non-player kills.
+// full HP at spawn). killer is nil for non-player kills (environmental
+// deaths: DoT ticks, admin commands — no attacker is invented). A
+// killerless kill still drops loot (unowned, owner "") and still runs the
+// chest-area hook; the quest hook fires with an empty killer instance,
+// which the root adapter resolves to a nil conn (nil-safe no-op: no quest
+// or statistics credit is invented for anyone).
 func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	m.Lock()
 	if m.Dead() {
@@ -879,18 +885,13 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	delay := RespawnDelayFor(o, p)
 	log.Printf("m9: %s (%s) died -> respawn in %v", inst, key, delay)
 
-	hasKiller := killer != nil
-	if hasKiller {
-		w.SpawnLoot(key, mx, my, killer.Username)
+	owner, killerInstance := "", ""
+	if killer != nil {
+		owner, killerInstance = killer.Username, killer.Instance
 	}
-	killerInstance := ""
-	if hasKiller {
-		killerInstance = killer.Instance
-	}
+	w.SpawnLoot(key, mx, my, owner)
 	KillHookForMob(mx, my, inst, killerInstance, w) // chest-area onEmpty (reward chest spawn)
-	if hasKiller {
-		w.QuestKill(killer.Instance, key) // quest kill stages + achievements
-	}
+	w.QuestKill(killerInstance, key)                // quest kill stages + achievements (nil-safe when "")
 	w.AfterDelay(delay, func() {
 		if alive == nil || alive() {
 			RespawnMob(m, w)
@@ -927,13 +928,14 @@ func RespawnMob(m Mob, w GameWorld) {
 }
 
 // DamageHero applies mob damage: Points frame, then the HeroDied funnel on
-// empty (character.hitPoints). from is nil for non-mob damage (admin/DoT —
-// no Death frame, like the original); a non-nil from must be lock-held by
-// the caller (the step -> strike path is the only such caller; Go
-// mutexes are not reentrant, so relocking would self-deadlock on every
-// killing blow). The killer's target is released here; everything else
-// (status clear, Despawn, pet despawn, save, Death unicast) is HeroDied's,
-// owned by the root adapter.
+// empty (character.hitPoints). from is nil for non-mob damage (DoT ticks,
+// admin commands): the funnel still runs as an environmental death (empty
+// mobInstance — no killer is invented; HeroDied stays exactly-once per
+// life). A non-nil from must be lock-held by the caller (the step ->
+// strike path is the only such caller; Go mutexes are not reentrant, so
+// relocking would self-deadlock on every killing blow). The killer's
+// target is released here; everything else (status clear, Despawn, pet
+// despawn, save, Death unicast) is HeroDied's, owned by the root adapter.
 func DamageHero(w GameWorld, instance, username string, dmg int, from Mob) {
 	hp := w.GetHeroHP(instance) - dmg
 	if hp < 0 {
@@ -941,11 +943,19 @@ func DamageHero(w GameWorld, instance, username string, dmg int, from Mob) {
 	}
 	w.SetHeroHP(instance, hp)
 	w.HeroPoints(instance, hp, HeroMaxHP)
-	if hp <= 0 && from != nil {
-		// Caller holds from's lock (see above); clear without relocking.
-		from.SetTarget("")
-		w.HeroDied(instance, username, from.Instance())
-		log.Printf("m9: %s (%s) died to %s", instance, username, from.Instance())
+	if hp <= 0 {
+		mobInstance := ""
+		if from != nil {
+			// Caller holds from's lock (see above); clear without relocking.
+			from.SetTarget("")
+			mobInstance = from.Instance()
+		}
+		w.HeroDied(instance, username, mobInstance)
+		if mobInstance != "" {
+			log.Printf("m9: %s (%s) died to %s", instance, username, mobInstance)
+		} else {
+			log.Printf("m9: %s (%s) died (environmental, no attacker)", instance, username)
+		}
 	}
 }
 

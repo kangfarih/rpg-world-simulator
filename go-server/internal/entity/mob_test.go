@@ -376,7 +376,12 @@ func TestHitRetaliateKillRespawn(t *testing.T) {
 	}
 }
 
-func TestKillWithoutKillerSkipsCredit(t *testing.T) {
+// Environmental mob death (DoT tick, admin command): no attacker exists,
+// so no killer is invented — but the full KillMob path still runs: Despawn,
+// unowned loot (owner ""), chest hooks, the quest hook with an empty killer
+// instance (nil-safe no-op downstream: no quest or statistics credit for
+// anyone), and the respawn timer.
+func TestKillWithoutKillerDropsUnownedLoot(t *testing.T) {
 	resetAreas()
 	w := newSimFake()
 	m := newTestMob("mob-dot", "rat", ratProfile(), 100, 100)
@@ -386,8 +391,14 @@ func TestKillWithoutKillerSkipsCredit(t *testing.T) {
 	if len(w.despawns) != 1 {
 		t.Fatalf("despawns = %v", w.despawns)
 	}
-	if len(w.lootDrops) != 0 || len(w.quests) != 0 {
-		t.Fatalf("killerless kill credited loot=%v quests=%v", w.lootDrops, w.quests)
+	if len(w.lootDrops) != 1 || w.lootDrops[0].mobKey != "rat" || w.lootDrops[0].owner != "" {
+		t.Fatalf("environmental kill must drop unowned loot: %+v", w.lootDrops)
+	}
+	if len(w.quests) != 1 || w.quests[0].killer != "" || w.quests[0].mobKey != "rat" {
+		t.Fatalf("quest hook must fire killerless (no credit): %+v", w.quests)
+	}
+	if len(w.delays) != 1 {
+		t.Fatalf("respawn timer missing: %+v", w.delays)
 	}
 }
 
@@ -422,13 +433,18 @@ func TestDamageHeroDeathHook(t *testing.T) {
 		t.Fatalf("deaths = %+v", w.deaths)
 	}
 
-	// Lethal without a source: Points to zero, NO Death frame (admin/DoT).
+	// Lethal without a source (DoT tick, admin command): Points to zero and
+	// the HeroDied funnel still runs as an environmental death (empty
+	// mobInstance — no killer is invented).
 	w2 := newSimFake()
 	DamageHero(w2, "hero-1", "hero", HeroMaxHP, nil)
 	w2.mu.Lock()
 	defer w2.mu.Unlock()
-	if w2.heroHP["hero-1"] != 0 || len(w2.deaths) != 0 || len(w2.heroPts) != 1 {
-		t.Fatalf("sourceless kill hp=%v deaths=%v pts=%v", w2.heroHP, w2.deaths, w2.heroPts)
+	if w2.heroHP["hero-1"] != 0 || len(w2.heroPts) != 1 {
+		t.Fatalf("sourceless kill hp=%v pts=%v", w2.heroHP, w2.heroPts)
+	}
+	if len(w2.deaths) != 1 || w2.deaths[0].player != "hero-1" || w2.deaths[0].username != "hero" || w2.deaths[0].mob != "" {
+		t.Fatalf("environmental death must run the funnel killerless: %+v", w2.deaths)
 	}
 }
 

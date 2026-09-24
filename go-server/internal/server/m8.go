@@ -205,13 +205,15 @@ func m8SyncTick(gameKey string, res minigame.TickResult) {
 
 // m8Teleport ports character.teleport for minigame moves (position update +
 // Teleport broadcast; the region recompute happens inside the broadcast's
-// interest resolution and updateClientRegion here).
+// interest resolution and updateClientRegion here). The landing tile is
+// tracked via m5TrackPos (persist parity with walked movement).
 func m8Teleport(c *playerConn, x, y int) {
 	c.Sess.PlayerX = x
 	c.Sess.PlayerY = y
 	worldcore.SetEntityPos(c.Instance, x, y)
 	worldcore.UpdateRegion(c, x, y)
 	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
+	m5TrackPos(c)
 }
 
 // ---------------------------------------------------------------------------

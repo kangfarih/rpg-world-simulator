@@ -2772,12 +2772,15 @@ func handleConn(conn *websocket.Conn) {
 				// M8 e2e hook (TESTMAP only): seedPos teleports the freshly
 				// logged-in player to a tile (usually inside a minigame lobby
 				// area) so the harness skips the long walk from spawn.
+				// Tracked via m5TrackPos (same helper walked movement uses:
+				// st.X/Y + dirty + plateau), so saves persist the seeded
+				// tile rather than the stale spawn tile.
 				if len(login.SeedPos) == 2 && testMode && !cleanMode && !combatMode {
 					x, y := login.SeedPos[0], login.SeedPos[1]
 					c.Sess.PlayerX, c.Sess.PlayerY = x, y
 					worldcore.SetEntityPos(c.Instance, x, y)
 					worldcore.UpdateRegion(c, x, y)
-					markDirty(c.Username)
+					m5TrackPos(c)
 					ph.X, ph.Y = x, y
 					extra = append(extra, pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
 					// M8: the position change may cross a lobby area boundary
