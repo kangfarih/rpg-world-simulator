@@ -744,11 +744,47 @@ func m9PlayerHP(c *playerConn) int {
 
 // m9DamagePlayer applies mob damage: Points frame, Death on empty.
 func m9DamagePlayer(c *playerConn, dmg int, from *m9Mob) {
+	m9DamagePlayerThorns(c, dmg, from, false)
+}
+
+// m9DamagePlayerThorns ports player/handler.ts handleHit thorns block with
+// the TS shape mirrored exactly: the dead/no-attacker guard and the
+// isThorns loop guard live on RECEIPT, and the reflect call itself passes
+// no thorns flag (mob receipt never reflects, so no loop is possible).
+func m9DamagePlayerThorns(c *playerConn, dmg int, from *m9Mob, isThorns bool) {
+	if c == nil {
+		return
+	}
 	var f entity.Mob
 	if from != nil {
 		f = from
 	}
 	entity.DamageHero(gameWorld, c.Instance, c.Username, dmg, f)
+	// Prevent endless loops of thorn damage.
+	if isThorns {
+		return
+	}
+	// Dead heroes and attackerless hits never reflect.
+	if from == nil || gameWorld.GetHeroHP(c.Instance) <= 0 {
+		return
+	}
+	thornsLevel := heroThornsLevel(c.Username)
+	if thornsLevel < 1 {
+		return
+	}
+	// 40% chance to activate thorns.
+	if !thornsRoll(combatRand) {
+		return
+	}
+	// Thorns damage is 10% per level of thorns enchantment, reflected via
+	// attacker.hit(thornsDamage, player) — the full mob damage pipeline
+	// (Points/death/loot + the attacker's own on-hit procs, TS-exact).
+	thornsDamage := thornsReflect(dmg, thornsLevel)
+	entity.HitMob(from,
+		&entity.PlayerView{Instance: c.Instance, Username: c.Username},
+		thornsDamage, gameWorld, time.Now(), func() bool {
+			return mobAlive(from)
+		})
 }
 
 // m9HandleRespawn ports incoming.handleRespawn -> player.respawn: only when

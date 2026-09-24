@@ -142,6 +142,7 @@ var (
 	abQuick     = map[string]map[string]int{} // username -> ability -> quickSlot
 	abLastCast  = map[string]int64{}          // username+"\x00"+key -> unix ms
 	abMana      = map[string]int{}            // instance -> current mana
+	abManaWarn  = map[string]bool{}           // instance -> LOW_MANA warned (displayedManaWarning)
 	abTarget    = map[string]string{}         // instance -> last attack target
 	abFxMu      sync.Mutex
 	abFx        = map[string]map[int]bool{} // instance -> effectID (ability casts)
@@ -345,6 +346,97 @@ func ManaFor(instance string) int {
 	return maxMana
 }
 
+// SetMana pins the session mana for an instance, clamped to [0, cap]
+// (TESTMAP/debug + test setup; live swings use SpendMana/HealMana).
+func SetMana(instance string, value int) {
+	if instance == "" {
+		return
+	}
+	if value < 0 {
+		value = 0
+	}
+	if value > maxMana {
+		value = maxMana
+	}
+	abMu.Lock()
+	abMana[instance] = value
+	abMu.Unlock()
+}
+
+// SpendMana decrements session mana by cost (floored at 0) and broadcasts
+// the Points mana frame (player.ts handleAttack mana.decrement + handleMana
+// parity). Reports the new totals.
+func SpendMana(instance string, cost int) (mana, max int) {
+	if instance == "" {
+		return ManaFor(instance), maxMana
+	}
+	abMu.Lock()
+	m, ok := abMana[instance]
+	if !ok {
+		m = maxMana
+	}
+	m -= cost
+	if m < 0 {
+		m = 0
+	}
+	abMana[instance] = m
+	abMu.Unlock()
+	if sdeps.Broadcast != nil {
+		sdeps.Broadcast(protocol.Pkt(protocol.PacketPoints, protocol.PointsData{
+			Instance: instance, Mana: abIntp(m), MaxMana: abIntp(maxMana),
+		}))
+	}
+	return m, maxMana
+}
+
+// ManaWarningShown reports whether the LOW_MANA one-shot warning already
+// fired for an instance (player.ts displayedManaWarning parity).
+func ManaWarningShown(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	abMu.Lock()
+	defer abMu.Unlock()
+	return abManaWarn[instance]
+}
+
+// SetManaWarning arms/disarms the LOW_MANA one-shot warning for an
+// instance (set on warn, cleared once mana suffices for a swing).
+func SetManaWarning(instance string, shown bool) {
+	if instance == "" {
+		return
+	}
+	abMu.Lock()
+	if shown {
+		abManaWarn[instance] = true
+	} else {
+		delete(abManaWarn, instance)
+	}
+	abMu.Unlock()
+}
+
+// HasPoison reports a live Venom entry for an instance (character.ts
+// heal() poison gate parity — poison lives on the status tracker, not in
+// Modules.Effects, so it uses the KindPoison sentinel key).
+func HasPoison(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	return abStatus.Has(status.Instance(instance), status.KindPoison)
+}
+
+// HasFreeze reports area freezing for an instance (m10 FreezeApply parity:
+// the tracker entry rides the derived freeze-suffix key, not the base
+// instance key, so HasStatusEffect(Freezing) alone misses it).
+func HasFreeze(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	abFxMu.Lock()
+	defer abFxMu.Unlock()
+	return abFreezeSet[instance]
+}
+
 // SetTarget records the hero's last attack target (RequiresTarget gate).
 func SetTarget(instance, target string) {
 	if instance == "" {
@@ -366,6 +458,9 @@ func LiveTarget(instance string) string {
 	abMu.Unlock()
 	if t == "" {
 		return ""
+	}
+	if sdeps.TargetAlive == nil {
+		return t // unconfigured seam: no liveness data, treated as live
 	}
 	if alive, checkable := sdeps.TargetAlive(t); !checkable {
 		return t // unknown entity kinds (players/NPCs): no liveness data
@@ -541,7 +636,10 @@ func HealMana(instance string, amount int) (applied, mana, max int) {
 		return 0, ManaFor(instance), maxMana
 	}
 	abMu.Lock()
-	m := ManaFor(instance)
+	m, ok := abMana[instance]
+	if !ok {
+		m = maxMana
+	}
 	applied = amount
 	if m+applied > maxMana {
 		applied = maxMana - m
@@ -710,6 +808,7 @@ func ForgetPlayer(instance string) {
 	abStatus.Clear(status.Instance(instance + freezeSuffix))
 	abMu.Lock()
 	delete(abMana, instance)
+	delete(abManaWarn, instance)
 	delete(abTarget, instance)
 	abMu.Unlock()
 	abFxMu.Lock()

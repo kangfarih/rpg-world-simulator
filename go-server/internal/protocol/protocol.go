@@ -321,9 +321,19 @@ const (
 // Experience4 LevelUp5 Critical6 Stun7 Profession8 Freezing9 Burning10
 // Terror11 Explosive12. Autos use Normal, Sunder uses Critical.
 const (
-	HitsNormal   = 0
-	HitsCritical = 6
-	HitsHeal     = 2
+	HitsNormal     = 0
+	HitsPoison     = 1
+	HitsCritical   = 6
+	HitsHeal       = 2
+	HitsMana       = 3
+	HitsExperience = 4
+	HitsLevelUp    = 5
+	HitsStun       = 7
+	HitsProfession = 8
+	HitsFreezing   = 9
+	HitsBurning    = 10
+	HitsTerror     = 11
+	HitsExplosive  = 12
 )
 
 // Client-sided effects (Modules.Effects in modules.ts): None0 Critical1

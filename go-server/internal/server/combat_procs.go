@@ -1,0 +1,424 @@
+// Combat procs — five audited-missing TS behaviors (behavior change
+// INTENDED; everything else frozen).
+//
+// TS sources (read first; numbers/strings/gates are exact):
+//  1. Passive regen: character.ts:40 (HEAL_RATE=7000 via modules.ts:627),
+//     :100 (7s interval), :312 heal(amount=1) gates — dead/poisoned,
+//     combat.started, attacker count, full, freezing/burning/terror.
+//  2. Hero damage-type rolls: player.ts:2575 getDamageType,
+//     formulas.ts:397 getEffectChance (randomInt(0,100)<5, i.e. 5%).
+//  3. Bloodsucking proc: character.ts:292 (30% gate `randomInt(0,100)>30
+//     return`, heal floor(damage*0.05*level), players via Heal packet).
+//  4. Thorns reflect: player/handler.ts:192 (dead/no-attacker guard,
+//     isThorns loop guard, chestplate Thorns level, 40% gate
+//     `randomInt(0,100)>40 return`, reflect floor(damage*level*0.1) via
+//     attacker.hit(thornsDamage, player) — WITHOUT isThorns=true).
+//  5. Magic mana cost: player/handler.ts:219 (weapon manaCost,
+//     hasManaForAttack gate, LOW_MANA notify once via
+//     displayedManaWarning flag).
+//
+// No packet-shape inventions: Combat Hit / Points / Heal / Effect frames
+// reuse the frozen builders. No balance changes beyond the mechanics.
+// One ticker: regen rides the central 20Hz Engine (boot.go tickEngine)
+// throttled to HEAL_RATE — no per-entity goroutines.
+package server
+
+import (
+	"log"
+	"math"
+	"math/rand"
+	"time"
+
+	"rpg-world-server/internal/abilities"
+	"rpg-world-server/internal/entity"
+	worldcore "rpg-world-server/internal/world"
+)
+
+// Enchantment IDs (modules.ts Enchantment enum order: Bloodsucking0,
+// Critical1, Evasion2, Thorns3, Explosive4, Stun5, AntiStun6, Splash7,
+// DoubleEdged8 — controller trade.go:928-932 carries the same mapping).
+const (
+	enchBloodsucking = 0
+	enchCritical     = 1
+	enchThorns       = 3
+	enchExplosive    = 4
+	enchStun         = 5
+)
+
+// Effects IDs (modules.ts Effects enum) for the regen gates + stun apply.
+const (
+	fxTerror   = 2
+	fxStun     = 4
+	fxBurning  = 16
+	fxFreezing = 17
+)
+
+const (
+	// healRateInterval is Modules.Constants.HEAL_RATE (modules.ts:627).
+	healRateInterval = 7 * time.Second
+	// stunDurationMs is Modules.Constants.STUN_DURATION (modules.ts:653).
+	stunDurationMs = int64(10_000)
+	// dotStatusDurationMs is FREEZING/BURNING_DURATION (modules.ts:649-650).
+	dotStatusDurationMs = int64(60_000)
+)
+
+// combatRand is the proc-roll source (TS Utils.randomInt parity: inclusive
+// bounds — randomInt(min,max) = min+floor(rand*(max-min+1))). Tests pass
+// seeded sources; live rolls use this one.
+var combatRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+// effectChance ports Formulas.getEffectChance (formulas.ts:397):
+// randomInt(0,100)<5, i.e. a 5% roll.
+func effectChance(r *rand.Rand) bool {
+	return r.Intn(101) < 5
+}
+
+// hasEnch reports whether an equipment enchantment map carries id.
+func hasEnch(ench Enchantments, id int) bool {
+	if ench == nil {
+		return false
+	}
+	_, ok := ench[id]
+	return ok
+}
+
+// enchLevel reports the enchantment level (0 when absent).
+func enchLevel(ench Enchantments, id int) int {
+	if ench == nil {
+		return 0
+	}
+	if e, ok := ench[id]; ok {
+		return e.Level
+	}
+	return 0
+}
+
+// heroEquipSlot snapshots one equipment slot (lock-brief; returns zero on
+// missing/short rows — m5StateFor normalizes the 12-slot array).
+func heroEquipSlot(username string, slot int) m5Slot {
+	st := m5StateFor(username)
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	if slot < 0 || slot >= len(st.Equip) {
+		return m5Slot{}
+	}
+	return st.Equip[slot]
+}
+
+// heroIsArcher ports player/character isArcher for the hero: the equipped
+// weapon is archer-typed (item.ts isArcherWeapon — type `weaponarcher`).
+// Unknown/absent weapons are melee.
+func heroIsArcher(username string) bool {
+	w := heroEquipSlot(username, EquipmentWeapon)
+	if w.Key == "" {
+		return false
+	}
+	it := m6ItemInfoFor(w.Key)
+	return it != nil && it.Type == "weaponarcher"
+}
+
+// heroIsMagic ports weapon.isMagic (item.ts isMagicWeapon — type
+// `weaponmagic`) for the hero's equipped weapon.
+func heroIsMagic(username string) bool {
+	w := heroEquipSlot(username, EquipmentWeapon)
+	if w.Key == "" {
+		return false
+	}
+	it := m6ItemInfoFor(w.Key)
+	return it != nil && it.Type == "weaponmagic"
+}
+
+// heroManaCost ports equipment.getWeapon().manaCost (weapon.ts:54 from
+// items.json `manaCost`) for the hero's equipped weapon (0 when none).
+func heroManaCost(username string) int {
+	w := heroEquipSlot(username, EquipmentWeapon)
+	if w.Key == "" {
+		return 0
+	}
+	if it := m6ItemInfoFor(w.Key); it != nil {
+		return it.ManaCost
+	}
+	return 0
+}
+
+// heroBloodsucking ports player.hasBloodsucking + getBloodsuckingLevel
+// (player.ts:1718 + :2633): weapon Bloodsucking enchantment present, level
+// `...?.level || 1` (default 1 per character.ts:714).
+func heroBloodsucking(username string) (bool, int) {
+	w := heroEquipSlot(username, EquipmentWeapon)
+	if w.Key == "" || !hasEnch(w.Ench, enchBloodsucking) {
+		return false, 0
+	}
+	if lv := enchLevel(w.Ench, enchBloodsucking); lv > 0 {
+		return true, lv
+	}
+	return true, 1
+}
+
+// heroThornsLevel ports chestplate.getThornsLevel (impl/chestplate.ts:25):
+// 0 when the chestplate lacks the Thorns enchantment.
+func heroThornsLevel(username string) int {
+	c := heroEquipSlot(username, EquipmentChestplate)
+	if c.Key == "" || !hasEnch(c.Ench, enchThorns) {
+		return 0
+	}
+	return enchLevel(c.Ench, enchThorns)
+}
+
+// heroDamageType ports player.getDamageType (player.ts:2575) over the
+// hero's equipped weapon + arrows. Returns the hit type and the AoE radius
+// (explosive sets aoe=1 on the attacker, character.ts:61 + player.ts:2595).
+// Damage numbers are untouched (the existing 8-12 roll shape stays); only
+// the TYPE (+ AoE flag) changes. Rolls use effectChance (5%) each, in TS
+// order. Lookups skip gracefully when items/equipment are absent.
+func heroDamageType(username string, r *rand.Rand) (hitType, aoe int) {
+	weapon := heroEquipSlot(username, EquipmentWeapon)
+	if heroIsArcher(username) {
+		arrows := heroEquipSlot(username, EquipmentArrows)
+		if arrows.Key != "" {
+			if it := m6ItemInfoFor(arrows.Key); it != nil {
+				if it.Freezing && effectChance(r) {
+					return HitsFreezing, 0
+				}
+				if it.Burning && effectChance(r) {
+					return HitsBurning, 0
+				}
+			}
+		}
+		if hasEnch(weapon.Ench, enchStun) && effectChance(r) {
+			return HitsStun, 0
+		}
+		if hasEnch(weapon.Ench, enchExplosive) && effectChance(r) {
+			return HitsExplosive, 1
+		}
+	} else if hasEnch(weapon.Ench, enchCritical) && effectChance(r) {
+		return HitsCritical, 0
+	}
+	return HitsNormal, 0
+}
+
+// bloodsuckRoll ports the character.ts:294 gate (`randomInt(0,100) > 30
+// return`): the proc fires on rolls <= 30.
+func bloodsuckRoll(r *rand.Rand) bool {
+	return r.Intn(101) <= 30
+}
+
+// bloodsuckHeal ports character.ts:297: 5% of damage per bloodsucking
+// level, floored. Level defaults to 1 (character.ts:714).
+func bloodsuckHeal(damage, level int) int {
+	if level < 1 {
+		level = 1
+	}
+	return int(math.Floor(float64(damage) * (0.05 * float64(level))))
+}
+
+// thornsRoll ports the player/handler.ts:206 gate (`randomInt(0,100) > 40
+// return`): thorns fires on rolls <= 40.
+func thornsRoll(r *rand.Rand) bool {
+	return r.Intn(101) <= 40
+}
+
+// thornsReflect ports player/handler.ts:209: 10% of damage per thorns
+// level, floored.
+func thornsReflect(damage, level int) int {
+	return int(math.Floor(float64(damage) * float64(level) * 0.1))
+}
+
+// heroMagicGate ports player/handler.ts:219 handleAttack for staff/magic
+// swings: weapon manaCost via hasManaForAttack (player.ts:1700 — mana >=
+// manaCost), `misc:LOW_MANA` notify once via the displayedManaWarning flag
+// (warn + block the swing when short; clear the flag + consume on swing
+// when mana suffices). Reports false when the swing must not happen.
+func heroMagicGate(c *playerConn) bool {
+	if c == nil || !heroIsMagic(c.Username) {
+		return true
+	}
+	cost := heroManaCost(c.Username)
+	if abilities.ManaFor(c.Instance) < cost {
+		if !abilities.ManaWarningShown(c.Instance) {
+			m6Notify(c, "misc:LOW_MANA")
+			abilities.SetManaWarning(c.Instance, true)
+		}
+		log.Printf("m5: %s staff swing refused (low mana)", c.Instance)
+		return false
+	}
+	abilities.SetManaWarning(c.Instance, false)
+	abilities.SpendMana(c.Instance, cost)
+	return true
+}
+
+// applyHitStatus ports combat.ts:198 (sendAttack: hit, then
+// target.addStatusEffect(hit)) for status-carrying hero hit types — Stun,
+// Freezing, Burning via the existing status pipeline (Effect Add frame +
+// tracker entry). Normal/Critical/Explosive carry no status (character.ts
+// addStatusEffect returns early on Normal; Terror is mob-side only). Skips
+// dead victims (TS death clears status).
+func applyHitStatus(target string, hitType int) {
+	if target == "" {
+		return
+	}
+	var effect int
+	var duration int64
+	switch hitType {
+	case HitsStun:
+		effect, duration = fxStun, stunDurationMs
+	case HitsFreezing:
+		effect, duration = fxFreezing, dotStatusDurationMs
+	case HitsBurning:
+		effect, duration = fxBurning, dotStatusDurationMs
+	default:
+		return
+	}
+	abilities.ApplyStatusEffect(target, effect, duration)
+}
+
+// explosiveSplash ports character.ts handleAoE for a hero's explosive
+// swing: every OTHER engine mob within Chebyshev 1 of the victim takes
+// floor(damage/(manhattan+1)) (distance = getDistance+1, hit.ts aoe range)
+// through the full damage pipeline (Combat Hit frame + HitMob Points/death/
+// loot). The primary victim is excluded (already struck). PvP filtering has
+// no stub counterpart (hero swings never target heroes), so only mobs splash.
+func explosiveSplash(victim *m9Mob, attacker *playerConn, dmg int) {
+	if victim == nil || dmg < 1 {
+		return
+	}
+	victim.mu.Lock()
+	vx, vy := victim.x, victim.y
+	victim.mu.Unlock()
+	var av *entity.PlayerView
+	if attacker != nil {
+		av = &entity.PlayerView{Instance: attacker.Instance, Username: attacker.Username}
+	}
+	m9Mu.Lock()
+	type splash struct {
+		m   *m9Mob
+		dmg int
+	}
+	var hits []splash
+	for _, m := range m9Mobs {
+		if m == victim {
+			continue
+		}
+		m.mu.Lock()
+		if m.dead {
+			m.mu.Unlock()
+			continue
+		}
+		mx, my := m.x, m.y
+		m.mu.Unlock()
+		if entity.Cheb(mx, my, vx, vy) > 1 {
+			continue
+		}
+		sec := int(math.Floor(float64(dmg) / float64(entity.Manhattan(mx, my, vx, vy)+1)))
+		if sec < 1 {
+			continue
+		}
+		hits = append(hits, splash{m: m, dmg: sec})
+	}
+	m9Mu.Unlock()
+	attackerInst := ""
+	if attacker != nil {
+		attackerInst = attacker.Instance
+	}
+	for _, h := range hits {
+		h.m.mu.Lock()
+		target := h.m.instance
+		h.m.mu.Unlock()
+		worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
+			Instance: attackerInst, Target: target,
+			Hit: HitData{Type: HitsNormal, Damage: h.dmg},
+		}))
+		entity.HitMob(h.m, av, h.dmg, gameWorld, time.Now(), func() bool {
+			return mobAlive(h.m)
+		})
+	}
+}
+
+// regenEligible ports the character.ts:312 heal() gates in order: dead or
+// poisoned → no; in combat (combat.started / attacker count — heroes reuse
+// the live-target + mob-targeting seam, mobs their target/attackers map) →
+// no; full → no; freezing/burning/terror → no.
+func regenEligible(dead, poisoned, inCombat, full, freezing, burning, terror bool) bool {
+	if dead || poisoned {
+		return false
+	}
+	if inCombat {
+		return false
+	}
+	if full {
+		return false
+	}
+	if freezing || burning || terror {
+		return false
+	}
+	return true
+}
+
+// heroRegenEligible evaluates the regen gates for one live hero instance.
+func heroRegenEligible(instance string, hp int) bool {
+	return regenEligible(
+		hp <= 0,
+		abilities.HasPoison(instance),
+		m6vitals{}.InCombat(instance),
+		hp >= entity.HeroMaxHP,
+		abilities.HasStatusEffect(instance, fxFreezing) || abilities.HasFreeze(instance),
+		abilities.HasStatusEffect(instance, fxBurning),
+		abilities.HasStatusEffect(instance, fxTerror),
+	)
+}
+
+// runRegenSweep heals every eligible hero and engine mob by +1 HP
+// (character.ts:312 heal(amount=1) → hitPoints.increment(1)) reusing the
+// existing Points sync paths (hero HeroPoints seam, mob MobPoints path).
+// Lock order m9Mu -> m.mu (m9Tick parity); tracker/registry calls are leaf
+// (their own mutexes, never reversed).
+func runRegenSweep() {
+	for _, c := range worldcore.AllOf[*playerConn]() {
+		hp := gameWorld.GetHeroHP(c.Instance)
+		if !heroRegenEligible(c.Instance, hp) {
+			continue
+		}
+		gameWorld.SetHeroHP(c.Instance, hp+1)
+		gameWorld.HeroPoints(c.Instance, hp+1, entity.HeroMaxHP)
+	}
+	m9Mu.Lock()
+	defer m9Mu.Unlock()
+	for _, m := range m9Mobs {
+		m.mu.Lock()
+		if m.dead {
+			m.mu.Unlock()
+			continue
+		}
+		eligible := regenEligible(
+			false,
+			abilities.HasPoison(m.instance),
+			m.target != "" || len(m.attackers) > 0,
+			m.hp >= m.maxHP,
+			abilities.HasStatusEffect(m.instance, fxFreezing),
+			abilities.HasStatusEffect(m.instance, fxBurning),
+			abilities.HasStatusEffect(m.instance, fxTerror),
+		)
+		if !eligible {
+			m.mu.Unlock()
+			continue
+		}
+		m.hp++
+		hp, max, inst := m.hp, m.maxHP, m.instance
+		m.mu.Unlock()
+		gameWorld.MobPoints(inst, hp, max)
+	}
+}
+
+// regenLastSweep throttles the Engine-driven sweep to HEAL_RATE.
+var regenLastSweep time.Time
+
+// combatRegenTick is the Engine subsystem entry (boot.go tickEngine): the
+// ONE ticker for passive regen — no per-entity goroutines.
+func combatRegenTick() {
+	now := time.Now()
+	if !regenLastSweep.IsZero() && now.Sub(regenLastSweep) < healRateInterval {
+		return
+	}
+	regenLastSweep = now
+	runRegenSweep()
+}

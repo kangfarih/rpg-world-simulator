@@ -143,9 +143,16 @@ const (
 )
 
 const (
-	HitsNormal   = protocol.HitsNormal
-	HitsCritical = protocol.HitsCritical
-	HitsHeal     = protocol.HitsHeal
+	HitsNormal     = protocol.HitsNormal
+	HitsPoison     = protocol.HitsPoison
+	HitsCritical   = protocol.HitsCritical
+	HitsHeal       = protocol.HitsHeal
+	HitsStun       = protocol.HitsStun
+	HitsFreezing   = protocol.HitsFreezing
+	HitsBurning    = protocol.HitsBurning
+	HitsTerror     = protocol.HitsTerror
+	HitsExplosive  = protocol.HitsExplosive
+	HitsProfession = protocol.HitsProfession
 )
 
 const (

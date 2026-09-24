@@ -515,13 +515,45 @@ func handlePlayerAttack(c *playerConn, target string) {
 			log.Printf("m5: %s swings at %s across plateaus (refused)", c.Instance, target)
 			return
 		}
+		// Magic mana gate (player/handler.ts handleAttack): staff swings
+		// need mana — LOW_MANA + no swing when short.
+		if !heroMagicGate(c) {
+			return
+		}
 		abSetTarget(c.Instance, target)
 		worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: c.Instance, Action: ActionAttack}))
+		// Hero damage-type roll (player.ts getDamageType): the TYPE (+ AoE
+		// flag) changes, damage numbers stay in the 8-12 roll shape.
+		hitType, aoe := heroDamageType(c.Username, combatRand)
+		hit := HitData{Type: hitType, Damage: dmg}
+		if aoe > 0 {
+			hit.Aoe = intp(aoe)
+		}
 		worldcore.Broadcast(pktOp(PacketCombat, CombatHit, combatData{
 			Instance: c.Instance, Target: target,
-			Hit: HitData{Type: HitsNormal, Damage: dmg},
+			Hit: hit,
 		}))
 		m9PlayerHit(m, c, dmg)
+		// TS combat.ts sendAttack order: hit, then target.addStatusEffect.
+		// Skip corpses (TS death clears status; the engine has no death
+		// clear, so a tracker entry on a corpse would leak).
+		m.mu.Lock()
+		victimDead := m.dead
+		m.mu.Unlock()
+		if !victimDead {
+			applyHitStatus(target, hitType)
+		}
+		// Explosive splash damages nearby mobs (character.ts handleAoE).
+		if aoe > 0 {
+			explosiveSplash(m, c, dmg)
+		}
+		// Bloodsucking proc on the attacker (character.ts handleBloodsucking
+		// — inside hit(), before the death check, so it runs here too).
+		if ok, level := heroBloodsucking(c.Username); ok && bloodsuckRoll(combatRand) {
+			if heal := bloodsuckHeal(dmg, level); heal >= 1 {
+				m6vitals{}.HealHero(c.Instance, heal, 0)
+			}
+		}
 		// TS combat.ts poison-on-hit: a poisonous weapon poisons the victim.
 		if abHeroWeaponPoisonous(c.Username) {
 			abApplyPoison(target)
@@ -537,10 +569,22 @@ func handlePlayerAttack(c *playerConn, target string) {
 			log.Printf("m5: %s swings at dead boss (ignored)", c.Instance)
 			return
 		}
+		// Magic mana gate + damage-type roll (same hero-swing rules as the
+		// engine-mob path; no splash victim on the legacy dummy).
+		if !heroMagicGate(c) {
+			combatMu.Unlock()
+			return
+		}
+		hitType, _ := heroDamageType(c.Username, combatRand)
 		abSetTarget(c.Instance, target)
-		applyBossHitLocked(c.Instance, dmg, HitsNormal, nil, false, -1, true)
+		applyBossHitLocked(c.Instance, dmg, hitType, nil, false, -1, true)
 		died := combatDead
 		combatMu.Unlock()
+		if ok, level := heroBloodsucking(c.Username); ok && bloodsuckRoll(combatRand) {
+			if heal := bloodsuckHeal(dmg, level); heal >= 1 {
+				m6vitals{}.HealHero(c.Instance, heal, 0)
+			}
+		}
 		m5AwardCombatXP(c, c.Username, dmg, false, false)
 		if died {
 			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.Instance)

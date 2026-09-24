@@ -2167,6 +2167,7 @@ var tickOnce sync.Once
 // same functions, same order as the inline calls it replaces).
 var tickEngine = &worldcore.Engine{Subs: []worldcore.Subsystem{
 	{Name: "abilities", Tick: abStatusTick}, // DoT ticks -> Points, expiries -> EffectRemove
+	{Name: "regen", Tick: combatRegenTick},  // passive +1/7s regen (heroes + engine mobs)
 	{Name: "pets", Tick: petTick},           // pet follow steps / teleports (no-op with no pets)
 	{Name: "events", Tick: worldEventTick},  // event rotation -> global notices (no-op when none due)
 }}

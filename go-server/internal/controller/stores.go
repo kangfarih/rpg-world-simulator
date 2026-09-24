@@ -194,6 +194,9 @@ type ItemInfo struct {
 	MediumBowl   bool
 	WeaponType   string // item.ts weaponType (sword/bow/staff/...) for attack styles
 	AttackRange  int    // item.ts attackRange (0 = engine default)
+	ManaCost     int    // item.ts manaCost (staff swings; 0 = free)
+	Freezing     bool   // item.ts freezing (ice arrows)
+	Burning      bool   // item.ts burning (fire arrows)
 }
 
 var (
@@ -233,6 +236,9 @@ func LoadItems() error {
 			MediumBowl   bool    `json:"mediumBowl"`
 			WeaponType   string  `json:"weaponType"`
 			AttackRange  int     `json:"attackRange"`
+			ManaCost     int     `json:"manaCost"`
+			Freezing     bool    `json:"freezing"`
+			Burning      bool    `json:"burning"`
 		}
 		if err := json.Unmarshal(raw, &items); err != nil {
 			econItemsErr = err
@@ -248,7 +254,8 @@ func LoadItems() error {
 				Edible: v.Edible, Interactable: v.Interactable, Plugin: v.Plugin,
 				HealAmount: v.HealAmount, HealPercent: v.HealPercent, ManaAmount: v.ManaAmount,
 				Effect: v.Effect, Duration: v.Duration, SmallBowl: v.SmallBowl, MediumBowl: v.MediumBowl,
-				WeaponType: v.WeaponType, AttackRange: v.AttackRange}
+				WeaponType: v.WeaponType, AttackRange: v.AttackRange,
+				ManaCost: v.ManaCost, Freezing: v.Freezing, Burning: v.Burning}
 		}
 		log.Printf("m6: items=%d", len(econItems))
 	})
