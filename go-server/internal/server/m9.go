@@ -621,6 +621,26 @@ func m9HandleRespawn(c *playerConn) {
 	log.Printf("m9: %s respawned at %d,%d", c.Username, x, y)
 }
 
+// m9MobTargeting reports whether any live engine mob currently targets the
+// instance (character.getAttackerCount/inCombat parity for the item-use
+// combat gate). Lock order m9Mu -> m.mu, leaf use only.
+func m9MobTargeting(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	m9Mu.Lock()
+	defer m9Mu.Unlock()
+	for _, m := range m9Mobs {
+		m.mu.Lock()
+		target, dead := m.target, m.dead
+		m.mu.Unlock()
+		if !dead && target == instance {
+			return true
+		}
+	}
+	return false
+}
+
 // m9PlayerLeave drops per-player state on disconnect.
 func m9PlayerLeave(c *playerConn) {
 	m9PlayerHPs.Delete(c.Instance)

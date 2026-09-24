@@ -18,6 +18,11 @@ type fakeConn struct {
 	username  string
 	x, y      int
 	container bool
+	// EconomyConn session state.
+	storeOpen string
+	canAccess bool
+	talkKey   string
+	talkIndex int
 }
 
 func (c *fakeConn) InstanceID() string    { return c.instance }
@@ -26,9 +31,22 @@ func (c *fakeConn) TileX() int            { return c.x }
 func (c *fakeConn) TileY() int            { return c.y }
 func (c *fakeConn) GrantContainerAccess() { c.container = true }
 
+// EconomyConn seam (bank/talk session state).
+func (c *fakeConn) StoreOpen() string     { return c.storeOpen }
+func (c *fakeConn) SetStoreOpen(s string) { c.storeOpen = s }
+func (c *fakeConn) CanAccess() bool       { return c.canAccess }
+func (c *fakeConn) SetCanAccess(b bool)   { c.canAccess = b }
+func (c *fakeConn) TalkKey() string       { return c.talkKey }
+func (c *fakeConn) SetTalkKey(s string)   { c.talkKey = s }
+func (c *fakeConn) TalkIndex() int        { return c.talkIndex }
+func (c *fakeConn) SetTalkIndex(i int)    { c.talkIndex = i }
+
 type fakeStore struct {
 	inv   map[string][]Slot
+	bank  map[string][]Slot
+	equip map[string][]Slot
 	attrs map[string]fakeAttr
+	xp    map[string]map[int]int
 }
 
 type fakeAttr struct {
@@ -39,7 +57,7 @@ type fakeAttr struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{inv: map[string][]Slot{}, attrs: map[string]fakeAttr{}}
+	return &fakeStore{inv: map[string][]Slot{}, bank: map[string][]Slot{}, equip: map[string][]Slot{}, attrs: map[string]fakeAttr{}, xp: map[string]map[int]int{}}
 }
 
 func (s *fakeStore) SlotAt(username string, index int) (Slot, bool) {
@@ -114,8 +132,14 @@ func (s *fakeStore) SetSlotEnchantments(username string, index int, ench protoco
 }
 
 func (s *fakeStore) SkillLevel(username string, skill int) int { return 1 }
-func (s *fakeStore) AddXP(c Conn, skill, amount int) int       { return 1 }
-func (s *fakeStore) MarkDirty(username string)                 {}
+func (s *fakeStore) AddXP(c Conn, skill, amount int) int {
+	if s.xp[c.PlayerName()] == nil {
+		s.xp[c.PlayerName()] = map[int]int{}
+	}
+	s.xp[c.PlayerName()][skill] += amount
+	return 1
+}
+func (s *fakeStore) MarkDirty(username string) {}
 func (s *fakeStore) SeedItem(username, itemKey string, count int) int {
 	return s.AddItem(username, itemKey, count)
 }
@@ -148,6 +172,52 @@ func (s *fakeStore) MaxStack(key string) int {
 	}
 	return 1
 }
+
+// EconomyStore seam (bank/equipment/total-level).
+func (s *fakeStore) InventorySlots(username string) []Slot {
+	out := make([]Slot, len(s.inv[username]))
+	copy(out, s.inv[username])
+	return out
+}
+
+func (s *fakeStore) SetInventory(username string, slots []Slot) {
+	out := make([]Slot, len(slots))
+	copy(out, slots)
+	s.inv[username] = out
+}
+
+func (s *fakeStore) BankSlots(username string) []Slot {
+	out := make([]Slot, len(s.bank[username]))
+	copy(out, s.bank[username])
+	return out
+}
+
+func (s *fakeStore) SetBank(username string, slots []Slot) {
+	out := make([]Slot, len(slots))
+	copy(out, slots)
+	s.bank[username] = out
+}
+
+func (s *fakeStore) EquipSlot(username string, slotType int) (Slot, bool) {
+	eq := s.equip[username]
+	if slotType < 0 || slotType >= len(eq) {
+		return Slot{}, false
+	}
+	return eq[slotType], true
+}
+
+func (s *fakeStore) SetEquip(username string, slotType int, slot Slot) {
+	eq := s.equip[username]
+	for len(eq) <= slotType {
+		eq = append(eq, Slot{})
+	}
+	eq[slotType] = slot
+	s.equip[username] = eq
+}
+
+func (s *fakeStore) EquipLen(username string) int { return protocol.ModulesEquipmentCount }
+
+func (s *fakeStore) TotalLevel(username string) int { return 1 }
 
 type frame struct {
 	id     int
@@ -185,6 +255,26 @@ func (b *fakeBus) SendTo(instance string, frames ...[]any) {
 
 func (b *fakeBus) Notify(instance string, message string) {
 	b.notifs[instance] = append(b.notifs[instance], message)
+}
+
+// EconomyBus seam (Sync broadcasts).
+func (b *fakeBus) Broadcast(frames ...[]any) {
+	for _, f := range frames {
+		var fr frame
+		if len(f) > 0 {
+			if id, ok := f[0].(int); ok {
+				fr.id = id
+			}
+		}
+		if len(f) > 2 {
+			if op, ok := f[1].(int); ok {
+				fr.opcode = op
+			}
+			raw, _ := json.Marshal(f[2])
+			fr.data = raw
+		}
+		b.sent["broadcast"] = append(b.sent["broadcast"], fr)
+	}
 }
 
 func (b *fakeBus) hasOpcode(instance string, id, opcode int) bool {

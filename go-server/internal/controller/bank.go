@@ -110,6 +110,9 @@ func HandleContainerSelect(c EconomyConn, msg *protocol.ClientContainer, d Econo
 		return
 	}
 	if *msg.Type == protocol.ContainerTypeInventory {
+		if HandleInventoryUse(c, d, *msg.FromIndex) {
+			return
+		}
 		EquipFromInventory(c, d, *msg.FromIndex)
 		return
 	}

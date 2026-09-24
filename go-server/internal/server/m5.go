@@ -24,11 +24,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"sync"
 	"time"
 
+	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/persist"
@@ -484,6 +486,13 @@ func handlePlayerAttack(c *playerConn, target string) {
 		return
 	}
 	dmg := 8 + rand.Intn(5)
+	// Attack-style damage bonus (formulas.getMaxDamage parity): the hero's
+	// current style scales the swing (bots keep their own styles via
+	// combatMaxDamageFloat). Round (not truncate) so slash/crush/shared
+	// stay observable on the small 8-12 hero roll.
+	if mult := controller.StyleDamageMult(controller.AttackStyleFor(m6deps(), c.Username)); mult != 1 {
+		dmg = int(math.Round(float64(dmg) * mult))
+	}
 	// M9: engine mobs first — Points/retaliate/death/respawn/loot live in
 	// the engine now (m9PlayerHit -> m9KillMob -> m5SpawnLoot).
 	// M11_HERODMG debug accelerator (mirrors M9_MOBDMG): keeps the e2e's

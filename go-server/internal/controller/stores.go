@@ -132,6 +132,10 @@ type EconomyDeps struct {
 	Quests QuestTalk
 	Pets   PetHooks
 	World  WorldLookup
+	// Vitals carries live hero state for the item-use plugins (items.go).
+	// Nil = plugins report unhandled (no consume); the live adapter always
+	// sets it (m6deps).
+	Vitals Vitals
 }
 
 // depsForEnchant converts economy deps to trade Deps for the shared
@@ -176,6 +180,20 @@ type ItemInfo struct {
 	Level        int
 	Poisonous    bool
 	Undroppable  bool
+	// Item-use plugin fields (player.ts handleContainerSelect + slot.ts
+	// edible/interactable plumbing + data/plugins/items/*.ts).
+	Edible       bool
+	Interactable bool
+	Plugin       string
+	HealAmount   int
+	HealPercent  float64 // items.json percent (healingitem divides by 100)
+	ManaAmount   int
+	Effect       string // effectpotion `effect` (accuracy/strength/...)
+	Duration     int64  // effectpotion `duration` ms (default 60_000)
+	SmallBowl    bool
+	MediumBowl   bool
+	WeaponType   string // item.ts weaponType (sword/bow/staff/...) for attack styles
+	AttackRange  int    // item.ts attackRange (0 = engine default)
 }
 
 var (
@@ -193,16 +211,28 @@ func LoadItems() error {
 			return
 		}
 		var items map[string]struct {
-			Name         string `json:"name"`
-			Description  string `json:"description"`
-			Price        int    `json:"price"`
-			Stackable    bool   `json:"stackable"`
-			MaxStackSize int    `json:"maxStackSize"`
-			Type         string `json:"type"`
-			Skill        string `json:"skill"`
-			Level        int    `json:"level"`
-			Poisonous    bool   `json:"poisonous"`
-			Undroppable  bool   `json:"undroppable"`
+			Name         string  `json:"name"`
+			Description  string  `json:"description"`
+			Price        int     `json:"price"`
+			Stackable    bool    `json:"stackable"`
+			MaxStackSize int     `json:"maxStackSize"`
+			Type         string  `json:"type"`
+			Skill        string  `json:"skill"`
+			Level        int     `json:"level"`
+			Poisonous    bool    `json:"poisonous"`
+			Undroppable  bool    `json:"undroppable"`
+			Edible       bool    `json:"edible"`
+			Interactable bool    `json:"interactable"`
+			Plugin       string  `json:"plugin"`
+			HealAmount   int     `json:"healAmount"`
+			HealPercent  float64 `json:"healPercent"`
+			ManaAmount   int     `json:"manaAmount"`
+			Effect       string  `json:"effect"`
+			Duration     int64   `json:"duration"`
+			SmallBowl    bool    `json:"smallBowl"`
+			MediumBowl   bool    `json:"mediumBowl"`
+			WeaponType   string  `json:"weaponType"`
+			AttackRange  int     `json:"attackRange"`
 		}
 		if err := json.Unmarshal(raw, &items); err != nil {
 			econItemsErr = err
@@ -214,7 +244,11 @@ func LoadItems() error {
 				max = protocol.ModulesMaxStack
 			}
 			econItems[k] = &ItemInfo{Name: v.Name, Description: v.Description, Price: v.Price, Stackable: v.Stackable, MaxStackSize: max,
-				Type: v.Type, Skill: v.Skill, Level: v.Level, Poisonous: v.Poisonous, Undroppable: v.Undroppable}
+				Type: v.Type, Skill: v.Skill, Level: v.Level, Poisonous: v.Poisonous, Undroppable: v.Undroppable,
+				Edible: v.Edible, Interactable: v.Interactable, Plugin: v.Plugin,
+				HealAmount: v.HealAmount, HealPercent: v.HealPercent, ManaAmount: v.ManaAmount,
+				Effect: v.Effect, Duration: v.Duration, SmallBowl: v.SmallBowl, MediumBowl: v.MediumBowl,
+				WeaponType: v.WeaponType, AttackRange: v.AttackRange}
 		}
 		log.Printf("m6: items=%d", len(econItems))
 	})

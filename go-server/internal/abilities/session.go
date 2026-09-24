@@ -525,6 +525,95 @@ func RemovePoison(instance string) {
 	abStatus.Remove(status.Instance(instance), status.KindPoison)
 }
 
+// ManaMax reports the hero mana cap (welcomePlayer mana/maxMana parity).
+func ManaMax() int { return maxMana }
+
+// ManaState reports current/max mana for an instance (welcome default).
+func ManaState(instance string) (mana, maxMana int) {
+	return ManaFor(instance), maxMana
+}
+
+// HealMana adds amount mana, clamped to the cap, and broadcasts the Points
+// frame (player.heal mana-branch parity: increment + sync). It reports the
+// applied amount plus the new totals.
+func HealMana(instance string, amount int) (applied, mana, max int) {
+	if instance == "" || amount < 1 {
+		return 0, ManaFor(instance), maxMana
+	}
+	abMu.Lock()
+	m := ManaFor(instance)
+	applied = amount
+	if m+applied > maxMana {
+		applied = maxMana - m
+	}
+	m += applied
+	abMana[instance] = m
+	abMu.Unlock()
+	if sdeps.Broadcast != nil {
+		sdeps.Broadcast(protocol.Pkt(protocol.PacketPoints, protocol.PointsData{
+			Instance: instance, Mana: abIntp(m), MaxMana: abIntp(maxMana),
+		}))
+	}
+	return applied, m, maxMana
+}
+
+// HasStatusEffect reports a live tracker entry for an Effects ID
+// (status.has parity for the item-use plugins).
+func HasStatusEffect(instance string, effectID int) bool {
+	if instance == "" {
+		return false
+	}
+	return abStatus.Has(status.Instance(instance), status.Kind(effectID))
+}
+
+// ApplyStatusEffect records a timed Effects-ID entry, mirrors it into abFx
+// so the StatusTick expiry sweep emits the EffectRemove frame, and
+// broadcasts Effect Add (status.addWithTimeout + client visual parity).
+func ApplyStatusEffect(instance string, effectID int, durationMs int64) {
+	if instance == "" {
+		return
+	}
+	nowMs := time.Now().UnixMilli()
+	abStatus.Apply(status.Instance(instance), status.Kind(effectID), 0, durationMs, nowMs)
+	abFxMu.Lock()
+	m := abFx[instance]
+	if m == nil {
+		m = map[int]bool{}
+		abFx[instance] = m
+	}
+	m[effectID] = true
+	abFxMu.Unlock()
+	if sdeps.Broadcast != nil {
+		sdeps.Broadcast(protocol.PktOp(protocol.PacketEffect, protocol.EffectAdd,
+			protocol.EffectData{Instance: instance, Effect: effectID}))
+	}
+}
+
+// RemoveStatusEffect drops one Effects-ID entry + its abFx mirror and
+// broadcasts Effect Remove. Absent effects are a silent no-op
+// (status.remove parity: no frame for entries that were never added).
+func RemoveStatusEffect(instance string, effectID int) {
+	if instance == "" {
+		return
+	}
+	if !abStatus.Has(status.Instance(instance), status.Kind(effectID)) {
+		return
+	}
+	abStatus.Remove(status.Instance(instance), status.Kind(effectID))
+	abFxMu.Lock()
+	if abFx[instance] != nil {
+		delete(abFx[instance], effectID)
+		if len(abFx[instance]) == 0 {
+			delete(abFx, instance)
+		}
+	}
+	abFxMu.Unlock()
+	if sdeps.Broadcast != nil {
+		sdeps.Broadcast(protocol.PktOp(protocol.PacketEffect, protocol.EffectRemove,
+			protocol.EffectData{Instance: instance, Effect: effectID}))
+	}
+}
+
 // ClearStatus drops every live status-tracker entry on an instance (player
 // handleDeath parity: status.clear() + the setPoison() cure). Poison,
 // burning, freezing (including the m10 freeze-suffix key) and ability-cast

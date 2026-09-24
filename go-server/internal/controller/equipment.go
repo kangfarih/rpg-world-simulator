@@ -406,7 +406,10 @@ func HandleEquipment(c EconomyConn, data []byte, d EconomyDeps) {
 		}
 		UnequipType(c, d, *msg.Type)
 	case protocol.EquipmentStyle:
-		// Attack-style switching needs the weapon stat engine (deferred).
+		if msg.Style == nil {
+			return
+		}
+		UpdateAttackStyle(c, d, *msg.Style)
 	}
 }
 

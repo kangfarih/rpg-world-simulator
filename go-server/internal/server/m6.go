@@ -13,7 +13,10 @@ package server
 import (
 	"encoding/json"
 
+	"rpg-world-server/internal/abilities"
 	"rpg-world-server/internal/controller"
+	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/protocol"
 	worldcore "rpg-world-server/internal/world"
 )
 
@@ -293,7 +296,84 @@ func m6deps() controller.EconomyDeps {
 	return controller.EconomyDeps{
 		Store: m6store{}, Bus: m6bus{}, Peers: m6peers{},
 		Quests: m6quests{}, Pets: m6pets{}, World: m6world{},
+		Vitals: m6vitals{},
 	}
+}
+
+// ---------------------------------------------------------------------------
+// controller.Vitals seam (item-use plugins: healing/poison/effects).
+// ---------------------------------------------------------------------------
+
+// m6vitals implements controller.Vitals over the hero HP store
+// (gameWorldAdapter Get/SetHeroHP + HeroPoints), the ability mana/status
+// tracker (abilities.*) and the engine mob targets (m9MobTargeting).
+type m6vitals struct{}
+
+func (m6vitals) HeroHP(instance string) (int, int) {
+	return gameWorld.GetHeroHP(instance), entity.HeroMaxHP
+}
+
+func (m6vitals) HeroMana(instance string) (int, int) {
+	return abilities.ManaState(instance)
+}
+
+// HealHero ports player.heal(amount, 'hitpoints'/'mana') (player.ts:504-541):
+// clamp into the pool, Heal frame with the requested amount + Points sync.
+func (m6vitals) HealHero(instance string, hpAmount, manaAmount int) {
+	if hpAmount > 0 {
+		hp := gameWorld.GetHeroHP(instance)
+		if hp < entity.HeroMaxHP {
+			want := hp + hpAmount
+			if want > entity.HeroMaxHP {
+				want = entity.HeroMaxHP
+			}
+			gameWorld.SetHeroHP(instance, want)
+			worldcore.Broadcast(protocol.Pkt(protocol.PacketHeal, protocol.HealData{
+				Instance: instance, Type: "hitpoints", Amount: hpAmount,
+			}))
+			gameWorld.HeroPoints(instance, want, entity.HeroMaxHP)
+		}
+	}
+	if manaAmount > 0 {
+		if applied, _, _ := abilities.HealMana(instance, manaAmount); applied > 0 {
+			worldcore.Broadcast(protocol.Pkt(protocol.PacketHeal, protocol.HealData{
+				Instance: instance, Type: "mana", Amount: manaAmount,
+			}))
+		}
+	}
+}
+
+// DamageHero ports the black-potion delayed self-hit (player.hit parity via
+// entity.DamageHero: Points + the exactly-once death funnel).
+func (m6vitals) DamageHero(instance string, dmg int) {
+	if dmg < 0 {
+		dmg = 0
+	}
+	username := ""
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil {
+		username = c.Username
+	}
+	entity.DamageHero(gameWorld, instance, username, dmg, nil)
+}
+
+func (m6vitals) CurePoison(instance string) { abRemovePoison(instance) }
+
+// InCombat ports character.inCombat (character.ts:769-776: has target or
+// attackers) over the hero's live target plus engine mob attackers.
+func (m6vitals) InCombat(instance string) bool {
+	return abLiveTarget(instance) != "" || m9MobTargeting(instance)
+}
+
+func (m6vitals) HasEffect(instance string, effect int) bool {
+	return abilities.HasStatusEffect(instance, effect)
+}
+
+func (m6vitals) AddEffect(instance string, effect int, durationMs int64) {
+	abilities.ApplyStatusEffect(instance, effect, durationMs)
+}
+
+func (m6vitals) RemoveEffect(instance string, effect int) {
+	abilities.RemoveStatusEffect(instance, effect)
 }
 
 // ---------------------------------------------------------------------------
