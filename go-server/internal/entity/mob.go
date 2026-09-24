@@ -194,6 +194,10 @@ type MobOverrides struct {
 	Aggro    int  // override aggroRange (0 = profile)
 	Leash    int  // override roamDistance (0 = profile)
 	Respawn  time.Duration
+	// NoRespawn marks boss-spawned minions (TS minion.respawnable = false):
+	// KillMob still runs the full death pipeline but schedules no respawn
+	// timer. False for every default mob, whose path is unchanged.
+	NoRespawn bool
 }
 
 // LoadProfiles unmarshals mobs.json + spawns.json payloads (the file reads
@@ -683,6 +687,16 @@ func StepMob(m Mob, w GameWorld, now time.Time) {
 			return
 		}
 		p := m.Profile()
+		// Mob-plugin combat override (attackRange/attackRate): a single
+		// registry lookup; unlisted keys keep the profile untouched.
+		if ar, rate, ok := pluginCombatOverride(m.MobKey(), m.Instance()); ok {
+			if ar >= 0 {
+				p.AttackRange = ar
+			}
+			if rate > 0 {
+				p.AttackRate = rate
+			}
+		}
 		sx, sy := m.SpawnPos()
 		if OutsideRoaming(sx, sy, p.RoamDistance, viewer.X, viewer.Y, p.RoamDistance*2) {
 			// Multi-attacker retarget omitted (stub scope: sendToSpawn).
@@ -818,6 +832,9 @@ func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 		w.ApplyPoison(viewer.Instance)
 	}
 	w.StrikeMob(m.Instance(), viewer.Instance, dmg)
+	// Mob-plugin attack hook (combat.onAttack port: forestdragon special,
+	// queen-ant terror attackAll, santa gift cycle). No-op for default mobs.
+	pluginOnAttack(m, p, w)
 	log.Printf("m9: %s hits %s dmg=%d hp=%d/%d", m.Instance(), viewer.Username, dmg, w.GetHeroHP(viewer.Instance), HeroMaxHP)
 }
 
@@ -841,17 +858,31 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 	if attacker != nil {
 		m.TouchAttacker(attacker.Instance, now)
 		// Retaliate (handler.handleHit): idle mobs swing back; busy mobs
-		// keep their current target.
-		if m.Target() == "" && !m.Overrides().NoAttack {
+		// keep their current target. Worker-ant minions never respond
+		// (ant.ts handleHit no-op); wild ants retaliate normally.
+		if m.Target() == "" && !m.Overrides().NoAttack && !pluginSuppressRetaliate(m.MobKey(), m.Instance()) {
 			m.SetTarget(attacker.Instance)
 			m.SetLastTgt(now)
 		}
 	}
 	maxHP := m.MaxHP()
 	inst := m.Instance()
+	// Mob-plugin hit snapshot (handleHit port): built only for listed keys;
+	// default mobs skip the copy entirely.
+	var snap pluginHitSnap
+	if HasMobPlugin(m.MobKey()) {
+		mx, my := m.Pos()
+		sx, sy := m.SpawnPos()
+		snap = pluginHitSnap{
+			key: m.MobKey(), inst: inst, hp: hp, maxHP: maxHP,
+			x: mx, y: my, sx: sx, sy: sy,
+			prof: m.Profile(), attackers: m.Attackers(),
+		}
+	}
 	m.Unlock()
 
 	w.MobPoints(inst, hp, maxHP)
+	pluginOnHit(snap, w)
 	if hp <= 0 {
 		KillMob(m, attacker, w, alive)
 	}
@@ -883,7 +914,11 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 
 	w.Despawn(inst)
 	delay := RespawnDelayFor(o, p)
-	log.Printf("m9: %s (%s) died -> respawn in %v", inst, key, delay)
+	if o.NoRespawn {
+		log.Printf("m9: %s (%s) died -> destroyed (minion, no respawn)", inst, key)
+	} else {
+		log.Printf("m9: %s (%s) died -> respawn in %v", inst, key, delay)
+	}
 
 	owner, killerInstance := "", ""
 	if killer != nil {
@@ -892,6 +927,15 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	w.SpawnLoot(key, mx, my, owner)
 	KillHookForMob(mx, my, inst, killerInstance, w) // chest-area onEmpty (reward chest spawn)
 	w.QuestKill(killerInstance, key)                // quest kill stages + achievements (nil-safe when "")
+	// Mob-plugin death hook (handleDeath port: minion cleanup + state
+	// reset). No-op for default mobs and untracked instances.
+	pluginOnDeath(key, inst, w)
+	// Minion death note (minion.onDeathImpl port: prune the boss list,
+	// restore queen attackRate). No-op unless inst is a tracked minion.
+	pluginNoteMinionDeath(inst, w)
+	if o.NoRespawn {
+		return // boss-spawned minion (TS respawnable=false): stay destroyed
+	}
 	w.AfterDelay(delay, func() {
 		if alive == nil || alive() {
 			RespawnMob(m, w)
@@ -917,9 +961,12 @@ func RespawnMob(m Mob, w GameWorld) {
 		MoveSpeed: p.MovementSpeed, AttackRange: p.AttackRange,
 	}
 	delay := RespawnDelayFor(m.Overrides(), p)
+	mobKey := m.MobKey()
 	m.Unlock()
 	w.SetEntityPos(inst, sx, sy)
 	w.SpawnMobFrame(s)
+	// Mob-plugin spawn hook (fresh-life state reset). No-op by default.
+	pluginOnSpawn(mobKey, inst)
 	// addMob -> addToChestArea parity on respawn (handler.handleRespawn
 	// re-registers the mob with its chest area).
 	if area := ChestAreaAt(sx, sy); area != nil {

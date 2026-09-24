@@ -31,6 +31,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"rpg-world-server/internal/entity"
@@ -543,13 +544,23 @@ func (m *m9Mob) respawnDelay() time.Duration {
 // m9Tick is the 500ms AI pass over every live mob.
 func m9Tick() {
 	m9Mu.Lock()
-	defer m9Mu.Unlock()
 	now := time.Now()
+	var plugMobs []*m9Mob
 	for _, m := range m9Mobs {
 		if m.dead {
 			continue
 		}
 		entity.StepMob(m, gameWorld, now)
+		// Tick-plugin mobs are collected for a second pass AFTER the
+		// registry lock is released: PluginTick uses the full PluginHost
+		// (spawn/remove/lookup take m9Mu), so it must never run under it.
+		if entity.HasMobPluginTick(m.key) {
+			plugMobs = append(plugMobs, m)
+		}
+	}
+	m9Mu.Unlock()
+	for _, m := range plugMobs {
+		entity.PluginTick(m, gameWorld, time.Now())
 	}
 }
 
@@ -575,6 +586,148 @@ func m9Respawn(m *m9Mob) {
 	}
 	entity.RespawnMob(m, gameWorld)
 	log.Printf("m9: %s respawned full HP=%d", m.instance, m.maxHP)
+}
+
+// ---------------------------------------------------------------------------
+// Mob-plugin host (entity.PluginHost over the live registry).
+//
+// Minions spawn through the existing m9SpawnMob path (Spawn broadcast +
+// chest-area registration + plateau bind) with the TS Default.spawn
+// post-conditions layered on: non-respawning, boss aggro range, forced
+// aggression. Cleanup runs the full killerless KillMob pipeline (Despawn
+// broadcast + unowned loot + nil-safe quest hook, no respawn timer) and then
+// drops the registry entry (TS destroy). Mob talk reuses the existing Chat
+// bubble frame (TS talkCallback surface). No new packet shapes.
+// ---------------------------------------------------------------------------
+
+// m9MinionSeq disambiguates minion instances per boss.
+var m9MinionSeq atomic.Int64
+
+func (gameWorldAdapter) SpawnMinion(bossInstance, key string, x, y int, opts entity.MinionOpts) string {
+	inst := fmt.Sprintf("%s-minion-%d", bossInstance, m9MinionSeq.Add(1))
+	over := m9Overrides{Aggro: opts.AggroRange, Leash: opts.RoamDistance, NoRespawn: true}
+	if !m9SpawnMob(inst, key, x, y, over) {
+		return ""
+	}
+	if m := m9MobFor(inst); m != nil {
+		m.mu.Lock()
+		if opts.AlwaysAggressive {
+			m.prof.AlwaysAggro = true
+		}
+		if opts.AttackRange > 0 {
+			m.prof.AttackRange = opts.AttackRange
+		}
+		if opts.NoRoam {
+			f := false
+			m.prof.Roaming = &f
+		}
+		m.mu.Unlock()
+	}
+	return inst
+}
+
+func (gameWorldAdapter) KillMinion(instance string) {
+	m := m9MobFor(instance)
+	if m == nil {
+		return
+	}
+	entity.KillMob(m, nil, gameWorld, func() bool { return mobAlive(m) })
+	m9Remove(instance) // TS destroy: no registry entry, no respawn
+}
+
+func (gameWorldAdapter) MinionDied(bossInstance, minionInstance string) {
+	_ = bossInstance
+	m9Remove(minionInstance)
+}
+
+func (gameWorldAdapter) SetMobTarget(mobInstance, playerInstance string) {
+	m := m9MobFor(mobInstance)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dead {
+		return
+	}
+	m.target = playerInstance
+	m.attackers[playerInstance] = time.Now()
+}
+
+func (gameWorldAdapter) TeleportMob(mobInstance string, x, y int) {
+	m := m9MobFor(mobInstance)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.x, m.y = x, y
+	m.mu.Unlock()
+	gameWorld.MoveMob(mobInstance, x, y)
+}
+
+func (gameWorldAdapter) ClearMobCombat(mobInstance string) {
+	m := m9MobFor(mobInstance)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.target = ""
+	m.attackers = map[string]time.Time{}
+}
+
+func (gameWorldAdapter) MobPos(instance string) (int, int, bool) {
+	m := m9MobFor(instance)
+	if m == nil {
+		return 0, 0, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.x, m.y, true
+}
+
+func (gameWorldAdapter) MobTalk(mobInstance, message string) {
+	chatRouter{}.SendBubble(mobInstance, message, true, "")
+}
+
+func (gameWorldAdapter) HealMob(instance string, amount int) {
+	m := m9MobFor(instance)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.dead {
+		m.mu.Unlock()
+		return
+	}
+	hp := m.hp + amount
+	if hp > m.maxHP {
+		hp = m.maxHP
+	}
+	m.hp = hp
+	max := m.maxHP
+	m.mu.Unlock()
+	gameWorld.MobPoints(instance, hp, max)
+}
+
+func (gameWorldAdapter) FollowStep(mobInstance string, tx, ty int) {
+	m := m9MobFor(mobInstance)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.dead {
+		m.mu.Unlock()
+		return
+	}
+	nx, ny, ok := entity.ChaseStep(m.x, m.y, tx, ty, 1, blocked)
+	if ok {
+		m.x, m.y = nx, ny
+	}
+	m.mu.Unlock()
+	if ok {
+		gameWorld.MoveMob(mobInstance, nx, ny)
+	}
 }
 
 // ---------------------------------------------------------------------------
