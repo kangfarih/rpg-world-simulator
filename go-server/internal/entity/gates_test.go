@@ -239,7 +239,8 @@ func TestChestClearKillerlessAwardsNothing(t *testing.T) {
 }
 
 // Plateau gate matrix: roam steps changing plateau are refused
-// (mob/handler.ts:184), strikes across plateaus are refused silently.
+// (mob/handler.ts:184); strikes use RangedBlocked (melee ungated, only
+// ranged shooting UP refused).
 func TestPlateauGateMatrix(t *testing.T) {
 	// Roam: mob bound to plateau 1 inside a 5x5 plateau-1 box around its
 	// spawn; every draw outside the box must be refused, draws inside land.
@@ -288,19 +289,60 @@ func TestPlateauGateMatrix(t *testing.T) {
 	}
 }
 
-func TestStrikeAcrossPlateauSilent(t *testing.T) {
-	// Strike matrix via PlateauCombatBlocked (both directions symmetric).
-	if !PlateauCombatBlocked(0, 1) || !PlateauCombatBlocked(1, 0) {
-		t.Fatal("cross-plateau swings must block")
+func TestRangedBlockedMatrix(t *testing.T) {
+	// TS-exact matrix (character.ts:785 isRanged = attackRange > 1;
+	// isNearTarget: ranged requires attacker.plateauLevel >=
+	// target.plateauLevel, melee has NO plateau check).
+	// Default range 1 is melee: never blocked, even across plateaus.
+	if RangedBlocked(1, 0, 1) || RangedBlocked(1, 1, 0) || RangedBlocked(1, 0, 0) {
+		t.Fatal("melee (range 1) must never be plateau-blocked")
 	}
-	if PlateauCombatBlocked(0, 0) || PlateauCombatBlocked(1, 1) {
-		t.Fatal("same-plateau swings must pass")
+	// Zero/negative ranges are also melee.
+	if RangedBlocked(0, 0, 1) || RangedBlocked(-1, 0, 1) {
+		t.Fatal("non-positive range must count as melee (never blocked)")
 	}
+	// Ranged shooting UP is refused.
+	if !RangedBlocked(2, 0, 1) || !RangedBlocked(8, 0, 1) {
+		t.Fatal("ranged shooting UP a plateau must block")
+	}
+	// Ranged level or DOWN is allowed.
+	if RangedBlocked(8, 1, 1) || RangedBlocked(8, 1, 0) || RangedBlocked(9, 2, 0) {
+		t.Fatal("ranged level/down must pass")
+	}
+}
 
+func TestStrikeMeleeCrossPlateauAllowed(t *testing.T) {
+	// Melee mob on plateau 0 strikes a plateau-1 hero: allowed (the
+	// e2e leash-demo shape: hero on 1, rat on 0).
 	w := newSimFake()
 	w.withPlayer("hero-1", "hero", 101, 100, 1, 1)
 	w.players[0].Plateau = 1 // hero upstairs, mob on 0
-	m := newTestMob("mob-plat2", "rat", ratProfile(), 100, 100)
+	m := newTestMob("mob-melee", "rat", ratProfile(), 100, 100)
+	m.plateau = 0
+	m.mu.Lock()
+	m.target = "hero-1"
+	m.lastAtk = m.lastAtk.Add(-time.Hour) // attack clock ready
+	m.mu.Unlock()
+	StepMob(m, w, time.Now())
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.strikes) == 0 {
+		t.Fatal("melee cross-plateau strike must fire")
+	}
+	if len(w.heroPts) == 0 {
+		t.Fatal("melee cross-plateau strike must damage hero")
+	}
+}
+
+func TestStrikeRangedUpRefused(t *testing.T) {
+	// Ranged mob (archer range 8) on plateau 0 vs plateau-1 hero:
+	// refused silently (new correct behavior).
+	w := newSimFake()
+	w.withPlayer("hero-1", "hero", 101, 100, 1, 1)
+	w.players[0].Plateau = 1
+	prof := ratProfile()
+	prof.AttackRange = 8
+	m := newTestMob("mob-ranged-up", "rat", prof, 100, 100)
 	m.plateau = 0
 	m.mu.Lock()
 	m.target = "hero-1"
@@ -310,9 +352,41 @@ func TestStrikeAcrossPlateauSilent(t *testing.T) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.strikes) != 0 {
-		t.Fatalf("cross-plateau strike fired: %+v", w.strikes)
+		t.Fatalf("ranged-up strike fired: %+v", w.strikes)
 	}
 	if len(w.heroPts) != 0 {
-		t.Fatalf("cross-plateau strike damaged hero: %+v", w.heroPts)
+		t.Fatalf("ranged-up strike damaged hero: %+v", w.heroPts)
+	}
+}
+
+func TestStrikeRangedLevelDownAllowed(t *testing.T) {
+	// Ranged mob shooting level or DOWN: allowed.
+	for _, tc := range []struct {
+		name       string
+		mobPlateau int
+		heroPlat   int
+	}{
+		{"level", 1, 1},
+		{"down", 1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newSimFake()
+			w.withPlayer("hero-1", "hero", 101, 100, 1, 1)
+			w.players[0].Plateau = tc.heroPlat
+			prof := ratProfile()
+			prof.AttackRange = 8
+			m := newTestMob("mob-ranged", "rat", prof, 100, 100)
+			m.plateau = tc.mobPlateau
+			m.mu.Lock()
+			m.target = "hero-1"
+			m.lastAtk = m.lastAtk.Add(-time.Hour)
+			m.mu.Unlock()
+			StepMob(m, w, time.Now())
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			if len(w.strikes) == 0 {
+				t.Fatalf("ranged %s strike must fire", tc.name)
+			}
+		})
 	}
 }

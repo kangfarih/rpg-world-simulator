@@ -503,13 +503,15 @@ func handlePlayerAttack(c *playerConn, target string) {
 			log.Printf("m5: %s swings at dead %s (ignored)", c.Instance, target)
 			return
 		}
-		// Cross-plateau combat refusal (silent no-swing): the hero and the
-		// mob must share a plateau level (see entity.PlateauCombatBlocked
-		// for the TS-parity note).
+		// TS-exact plateau gate (character.ts isNearTarget): only RANGED
+		// attackers (attackRange > 1) shooting UP a plateau are refused
+		// (silent no-swing, see entity.RangedBlocked). The hero has no
+		// range model (welcomePlayer AttackRange 1; player.sync weapon
+		// recompute unmodeled), so the hero always swings as melee (1).
 		m.mu.Lock()
 		mobPlateau := m.plateau
 		m.mu.Unlock()
-		if entity.PlateauCombatBlocked(plateauGet(c.Instance), mobPlateau) {
+		if entity.RangedBlocked(1, plateauGet(c.Instance), mobPlateau) {
 			log.Printf("m5: %s swings at %s across plateaus (refused)", c.Instance, target)
 			return
 		}

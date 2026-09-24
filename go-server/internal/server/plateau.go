@@ -7,10 +7,10 @@
 // teleport: m7Teleport, m8Teleport, respawn, test tp, login seedPos).
 // Mobs track their spawn plateau in m9SpawnMob (mob.ts:148 parity).
 //
-// Cross-plateau combat (both swings, silent no-swing) and the mob roam-step
-// refusal live at their dispatch points; see entity.PlateauCombatBlocked for
-// the TS-parity note (Node gates ranged via >= and leaves melee adjacent;
-// the Go engine takes the conservative symmetric gate on both swings).
+// The mob roam-step refusal lives at its dispatch point, and each swing
+// direction carries the TS-exact ranged-only plateau gate at its own
+// dispatch point (see entity.RangedBlocked: character.ts isNearTarget —
+// melee adjacency is ungated, only ranged shooting UP is refused).
 //
 // Dynamic collision (map.ts:234-244): blockedForPlayer resolves the tile for
 // one player through the quest/achievement-gated dynamic remap before the

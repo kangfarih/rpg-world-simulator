@@ -788,30 +788,28 @@ func roamMob(m Mob, w GameWorld) {
 	w.MoveMob(m.Instance(), nx, ny)
 }
 
-// PlateauCombatBlocked ports the cross-plateau combat refusal: combat never
-// crosses plateau levels (silent no-swing, TS combat-loop parity).
-//
-// TS-parity note: the exact Node rule is narrower — character.ts
-// isNearTarget gates only RANGED attacks (attacker.plateauLevel >=
-// target.plateauLevel, so higher-or-equal may snipe down) while melee
-// adjacency is ungated, and combat.ts:292 is the shouldTeleportNearby
-// (stuck-mob teleport) guard, not a combat-start gate. The Go engine has no
-// hero range model and no combat loop (single-swing dispatch both ways), so
-// both swings take the conservative symmetric gate: any plateau difference
-// refuses the swing. No-op on flat maps (all e2e legs run on plateau 0).
-func PlateauCombatBlocked(attackerPlateau, targetPlateau int) bool {
-	return attackerPlateau != targetPlateau
+// RangedBlocked ports character.ts isNearTarget's plateau clause
+// (character.ts:785 isRanged() = attackRange > 1): only a RANGED attacker
+// is plateau-gated, and only when shooting UP (attacker.plateauLevel <
+// target.plateauLevel — level or DOWN may shoot, never UP). Melee
+// (attackRange <= 1, the default) is adjacency-only with NO plateau check
+// (distance itself is handled elsewhere — NearTarget/chase, untouched).
+// combat.ts:292 shouldTeleportNearby is a stuck-mob teleport guard, NOT a
+// combat gate, and is deliberately not ported here (the Go engine has no
+// stuck-teleport equivalent — noted as a separate optional gap).
+func RangedBlocked(attackerRange, attackerPlateau, targetPlateau int) bool {
+	return attackerRange > 1 && attackerPlateau < targetPlateau
 }
 
 // strikeMob mirrors combat.sendAttack (melee path): player damage + Combat
 // Hit broadcast. Damage 0 hits still emit the Hit frame (Node does too).
-// Cross-plateau swings are refused silently (PlateauCombatBlocked parity).
-// Call with the mob lock held.
+// Plateau gate is RangedBlocked parity (melee adjacency is ungated; only a
+// ranged mob shooting UP is refused silently). Call with the mob lock held.
 func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 	if m.Overrides().NoAttack {
 		return // M3 rat demo semantics
 	}
-	if PlateauCombatBlocked(m.Plateau(), viewer.Plateau) {
+	if RangedBlocked(p.AttackRange, m.Plateau(), viewer.Plateau) {
 		return
 	}
 	defLvl := 1
