@@ -696,8 +696,8 @@ func m5Snapshot(key string) *m5State {
 }
 
 // m5ToPersist converts an in-memory player state to the persist snapshot
-// (inventory enchantments serialized to the DB column format; bank rows
-// carry no enchantments, matching the bank table).
+// (inventory + equipment enchantments serialized to the DB column format;
+// bank rows carry no enchantments, matching the bank table).
 func m5ToPersist(st *m5State) persist.State {
 	ps := persist.State{
 		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
@@ -710,7 +710,7 @@ func m5ToPersist(st *m5State) persist.State {
 		ps.Bank = append(ps.Bank, persist.Slot{Key: s.Key, Count: s.Count})
 	}
 	for _, e := range st.Equip {
-		ps.Equip = append(ps.Equip, persist.Slot{Key: e.Key, Count: e.Count})
+		ps.Equip = append(ps.Equip, persist.Slot{Key: e.Key, Count: e.Count, Ench: m5SlotEnchJSON(e)})
 	}
 	for id, s := range st.Skills {
 		ps.Skills[id] = persist.Skill{Level: s.Level, XP: s.XP}
@@ -731,7 +731,7 @@ func persistToM5(ps persist.State) *m5State {
 	}
 	eslots := make([]m5Slot, 0, len(ps.Equip))
 	for _, s := range ps.Equip {
-		eslots = append(eslots, m5Slot{Key: s.Key, Count: s.Count})
+		eslots = append(eslots, m5Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchParse(s.Ench)})
 	}
 	eq := make([]m5Slot, ModulesEquipmentCount)
 	copy(eq, eslots)
@@ -890,7 +890,9 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		if e.Key == "" || e.Count < 1 {
 			continue
 		}
-		eqs = append(eqs, m6EquipmentData(t, e.Key, e.Count, true))
+		data := m6EquipmentData(t, e.Key, e.Count, true)
+		data["enchantments"] = enchAny(e.Ench)
+		eqs = append(eqs, data)
 	}
 	if len(eqs) > 0 {
 		extra = append(extra, pktOp(PacketEquipment, EquipmentBatch, equipBatchData{Equipments: eqs}))

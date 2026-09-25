@@ -55,9 +55,10 @@ import (
 )
 
 // Slot is one inventory/bank/equipment entry. Ench carries the raw
-// enchantments JSON for the inventory.enchantments column ("{}" when none);
-// bank/equipment rows carry "" (their tables have no such column, matching
-// the root writePlayer which only persists enchantments for inventory).
+// enchantments JSON for the inventory.enchantments and
+// equipment.enchantments columns ("{}" when none); bank rows carry ""
+// (their table has no such column, matching the root writePlayer which
+// only persists enchantments for inventory and equipment).
 type Slot struct {
 	Key   string
 	Count int
@@ -186,6 +187,10 @@ func (s *Store) EnsureSchema() error {
 	// pre-v3 rows read back 0 (None). Ignore failure = column exists
 	// (M12 inventory.enchantments precedent in Open).
 	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN rank INT DEFAULT 0`)
+	// v4 migration (expand-only): `equipment.enchantments` with a DEFAULT,
+	// so pre-v4 rows read back '{}' (no enchantments). Ignore failure =
+	// column exists (rank precedent above).
+	_, _ = s.db.Exec(`ALTER TABLE equipment ADD COLUMN enchantments TEXT DEFAULT '{}'`)
 	return s.checkSchemaVersion()
 }
 
@@ -302,7 +307,7 @@ func (s *Store) WritePlayer(key string, st State) error {
 			continue
 		}
 		if _, err := s.db.Exec(
-			`INSERT INTO equipment(player,type,item,count) VALUES(?,?,?,?)`, key, t, e.Key, e.Count); err != nil {
+			`INSERT INTO equipment(player,type,item,count,enchantments) VALUES(?,?,?,?,?)`, key, t, e.Key, e.Count, e.Ench); err != nil {
 			log.Printf("m5: save equipment %s: %v", key, err)
 			return err
 		}
@@ -424,20 +429,21 @@ func (s *Store) LoadPlayer(key string) (State, bool) {
 		st.Bank = append(st.Bank, Slot{Key: k, Count: c})
 	}
 	brows.Close()
-	if erows, err := s.db.Query(`SELECT type,item,count FROM equipment WHERE player=?`, key); err == nil {
+	if erows, err := s.db.Query(`SELECT type,item,count,enchantments FROM equipment WHERE player=?`, key); err == nil {
 		byType := map[int]Slot{}
 		maxT := -1
 		for erows.Next() {
 			var t int
 			var k string
 			var c int
-			if err := erows.Scan(&t, &k, &c); err != nil {
+			var ench string
+			if err := erows.Scan(&t, &k, &c, &ench); err != nil {
 				continue
 			}
 			if t < 0 {
 				continue
 			}
-			byType[t] = Slot{Key: k, Count: c}
+			byType[t] = Slot{Key: k, Count: c, Ench: ench}
 			if t > maxT {
 				maxT = t
 			}

@@ -39,7 +39,13 @@ const SchemaVersionKey = "schema_version"
 // database.setRank parity for offline /setrank). Expand-only: a new column
 // with a DEFAULT that no older query names, so v2 binaries keep reading
 // and writing every column they know.
-const CurrentSchemaVersion = 3
+//
+// v4 adds `equipment.enchantments` (raw enchantments JSON, DEFAULT '{}' =
+// none; M12 inventory.enchantments parity so enchanted gear survives the
+// DB round-trip). Expand-only: a new column with a DEFAULT that no older
+// query names, so v3 binaries keep reading and writing every column they
+// know.
+const CurrentSchemaVersion = 4
 
 // checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
 // row) are stamped with the current version; older versions are re-stamped

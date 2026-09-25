@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -29,9 +30,11 @@ func TestRankRoundTrip(t *testing.T) {
 	}
 }
 
-// A v2 database (players table without the rank column, version stamp 2)
-// migrates expand-only on open: the rank column appears with DEFAULT 0,
-// existing rows read back Rank 0, and the version re-stamps to v3.
+// A v2 database (players table without the rank column, equipment table
+// without the enchantments column, version stamp 2) migrates expand-only
+// on open: the rank column appears with DEFAULT 0, the equipment
+// enchantments column appears with DEFAULT '{}', existing rows read back
+// Rank 0, and the version re-stamps to CurrentSchemaVersion.
 func TestRankMigrationFromV2(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v2.db")
 	db, err := sql.Open("sqlite", path)
@@ -63,8 +66,8 @@ func TestRankMigrationFromV2(t *testing.T) {
 		t.Fatalf("Open v2 DB: %v", err)
 	}
 	defer s.Close(nil)
-	if v, _ := s.GetMeta(SchemaVersionKey); v != "3" {
-		t.Fatalf("schema_version after migrate = %q, want 3", v)
+	if v, _ := s.GetMeta(SchemaVersionKey); v != strconv.Itoa(CurrentSchemaVersion) {
+		t.Fatalf("schema_version after migrate = %q, want %q", v, strconv.Itoa(CurrentSchemaVersion))
 	}
 	got, ok := s.LoadPlayer("v2hero")
 	if !ok {
