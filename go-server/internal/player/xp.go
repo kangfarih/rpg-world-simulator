@@ -43,6 +43,26 @@ const (
 	SkillForaging      = 15
 )
 
+// Attack style ids mirror Modules.AttackStyle (modules.ts:158-179).
+// Only the melee styles route XP; the archery/magic styles (Accurate,
+// Fast, Focused, LongRange) never reach the style switch live because
+// archer/magic weapons early-return via the class flags first (exactly
+// as in TS) — should one ever arrive, it falls to the default branch.
+const (
+	StyleNone      = 0
+	StyleStab      = 1
+	StyleSlash     = 2
+	StyleDefensive = 3
+	StyleCrush     = 4
+	StyleShared    = 5
+	StyleHack      = 6
+	StyleChop      = 7
+	StyleAccurate  = 8
+	StyleFast      = 9
+	StyleFocused   = 10
+	StyleLongRange = 11
+)
+
 // SkillName names a skill id for logs (m5SkillName verbatim).
 func SkillName(id int) string {
 	switch id {
@@ -180,6 +200,16 @@ type Deps struct {
 	Lookup func(instance string) (Conn, bool)
 	// XPBoost reports the 1.5x experience event (worldXPBoost parity).
 	XPBoost func() bool
+	// Style reports the attacker's CURRENT attack style (the attack-style
+	// store: last explicit switch, else the equipped weapon's first
+	// style — player.handleExperience reads weapon.attackStyle live).
+	// Nil = StyleNone, which takes the default (Strength) branch and
+	// preserves the pre-parity melee behavior.
+	Style func() int
+	// HasMana reports hasManaForAttack (player.ts:1700 — current mana >=
+	// the equipped weapon's manaCost, 0 for non-magic weapons so always
+	// true). False halves the award. Nil = true (no halving, legacy).
+	HasMana func() bool
 }
 
 // AddXP awards skill XP, emitting Experience Skill + Skill Update, and on
@@ -219,8 +249,33 @@ func AddXP(d Deps, c *Conn, key string, skill, amount int) int {
 	return res.Level
 }
 
-// AwardCombatXP ports player.handleExperience (slash default: Strength +
-// Health; archers/mages route by class flag). damage < 1 is a no-op.
+// AwardCombatXP ports player.handleExperience (player.ts:990-1107)
+// TS-exact: damage < 1 no-op; experience = damage * EXPERIENCE_PER_HIT
+// (2, via getExperiencePerHit which already carries the 1.5x event);
+// low-mana halving (Math.floor(experience/2) when !hasManaForAttack);
+// Health ceil(xp/4); then class routing (archer -> Archery, mage ->
+// Magic, both ceil(xp*0.75)) ahead of the weapon attackStyle switch
+// (Stab -> Accuracy, Slash -> Strength, Defensive -> Defense, all
+// ceil(xp*0.75); Crush -> Accuracy+Strength ceil(xp*0.375) each;
+// Shared -> Accuracy+Strength+Defense ceil(xp*0.25) each; Hack ->
+// Strength+Defense ceil(xp*0.375) each; Chop -> Accuracy+Defense
+// floor(xp*0.375) each — note floor, not ceil; default/unarmed ->
+// Strength ceil(xp*0.75)). The 0.375/0.75/0.25 factors are exactly
+// representable in binary, so the integer forms ((3*xp+7)/8,
+// (3*xp+3)/4, (xp+3)/4, (3*xp)/8) match Math.ceil/floor bit-for-bit.
+//
+// The archer/mage params carry the weapon class (weapon.isArcher /
+// isMagic — wired by the server adapter from the equipped weapon) and
+// keep precedence over Style exactly as in TS.
+//
+// The `false` withInfo arg TS passes to every addExperience call is
+// intentionally NOT mirrored: withInfo=false only suppresses the
+// Experience Skill popup packet (skills.ts:180 — the Skill Update +
+// level-up popup/Sync still send), while Go AddXP has no such param
+// and always emits Experience Skill + Skill Update. Suppressing the
+// popup here would change live packet flow (the combat e2e counts
+// Experience Skill frames), so the divergence is documented, not
+// ported — no packet-shape changes.
 func AwardCombatXP(d Deps, c *Conn, key string, damage int, archer, mage bool) {
 	if damage < 1 {
 		return
@@ -229,14 +284,43 @@ func AwardCombatXP(d Deps, c *Conn, key string, damage int, archer, mage bool) {
 	if d.XPBoost != nil && d.XPBoost() {
 		xp = xp * 3 / 2 // world: 1.5x experience event (experiencePerHit parity)
 	}
-	AddXP(d, c, key, SkillHealth, (xp+3)/4)
+	if d.HasMana != nil && !d.HasMana() {
+		xp /= 2 // Math.floor(experience / 2) — integer division floors.
+	}
+	AddXP(d, c, key, SkillHealth, (xp+3)/4) // Math.ceil(experience / 4).
 	switch {
 	case archer:
 		AddXP(d, c, key, SkillArchery, (xp*3+3)/4)
 	case mage:
 		AddXP(d, c, key, SkillMagic, (xp*3+3)/4)
 	default:
-		AddXP(d, c, key, SkillStrength, (xp*3+3)/4)
+		style := StyleNone
+		if d.Style != nil {
+			style = d.Style()
+		}
+		switch style {
+		case StyleStab:
+			AddXP(d, c, key, SkillAccuracy, (xp*3+3)/4)
+		case StyleSlash:
+			AddXP(d, c, key, SkillStrength, (xp*3+3)/4)
+		case StyleDefensive:
+			AddXP(d, c, key, SkillDefense, (xp*3+3)/4)
+		case StyleCrush:
+			AddXP(d, c, key, SkillAccuracy, (xp*3+7)/8)
+			AddXP(d, c, key, SkillStrength, (xp*3+7)/8)
+		case StyleShared:
+			AddXP(d, c, key, SkillAccuracy, (xp+3)/4)
+			AddXP(d, c, key, SkillStrength, (xp+3)/4)
+			AddXP(d, c, key, SkillDefense, (xp+3)/4)
+		case StyleHack:
+			AddXP(d, c, key, SkillStrength, (xp*3+7)/8)
+			AddXP(d, c, key, SkillDefense, (xp*3+7)/8)
+		case StyleChop:
+			AddXP(d, c, key, SkillAccuracy, (xp*3)/8)
+			AddXP(d, c, key, SkillDefense, (xp*3)/8)
+		default:
+			AddXP(d, c, key, SkillStrength, (xp*3+3)/4)
+		}
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"rpg-world-server/internal/abilities"
 	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
 	gnet "rpg-world-server/internal/net"
@@ -322,9 +323,17 @@ func xpDeps() player.Deps {
 func m5Percentage(xp int) float64 { return player.Percentage(xp) }
 
 // m5AwardCombatXP ports player.handleExperience (canonical owner:
-// internal/player AwardCombatXP).
+// internal/player AwardCombatXP). The class flags mirror
+// weapon.isArcher/isMagic (heroIsArcher/heroIsMagic over the equipped
+// weapon, with precedence over the style switch exactly as in TS);
+// Style carries the attack-style store (controller.AttackStyleFor:
+// last explicit switch, else the weapon's first style) and HasMana
+// the hasManaForAttack gate (player.ts:1700 — current mana >= weapon
+// manaCost via the same heroManaCost lookup the swing gate uses;
+// 0 for non-magic weapons so melee never halves).
 func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 	var pc *player.Conn
+	d := xpDeps()
 	if c != nil {
 		cc := c
 		pc = &player.Conn{
@@ -334,8 +343,10 @@ func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 				_ = gnet.Send(cc.Conn, frames...)
 			},
 		}
+		d.Style = func() int { return controller.AttackStyleFor(m6deps(), cc.Username) }
+		d.HasMana = func() bool { return abilities.ManaFor(cc.Instance) >= heroManaCost(cc.Username) }
 	}
-	player.AwardCombatXP(xpDeps(), pc, key, damage, archer, mage)
+	player.AwardCombatXP(d, pc, key, damage, archer, mage)
 }
 
 // m5AwardGatherXP is the M4-hook successor: table experience on exhaust
@@ -558,7 +569,7 @@ func handlePlayerAttack(c *playerConn, target string) {
 		if abHeroWeaponPoisonous(c.Username) {
 			abApplyPoison(target)
 		}
-		m5AwardCombatXP(c, c.Username, dmg, false, false)
+		m5AwardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
 		return
 	}
 	switch target {
@@ -585,7 +596,7 @@ func handlePlayerAttack(c *playerConn, target string) {
 				m6vitals{}.HealHero(c.Instance, heal, 0)
 			}
 		}
-		m5AwardCombatXP(c, c.Username, dmg, false, false)
+		m5AwardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
 		if died {
 			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.Instance)
 		}
