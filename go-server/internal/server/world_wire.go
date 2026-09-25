@@ -96,6 +96,7 @@ func worldApplyTeleport(instance string, lx, ly int) {
 	worldcore.SetEntityPos(c.Instance, lx, ly)
 	worldcore.UpdateRegion(c, lx, ly)
 	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: lx, Y: ly}))
+	c.markTeleported()
 	m10OnPositionUpdate(c)
 	m5TrackPos(c)
 	worldPushLights(c)

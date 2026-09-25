@@ -27,7 +27,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"rpg-world-server/internal/abilities"
 	"rpg-world-server/internal/app"
+	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
 	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
@@ -1779,6 +1781,73 @@ func checkSpeed(s *gnet.Session, tiles int) bool {
 	return violation
 }
 
+// movementBlocked mirrors the player.ts:1122 gate (isStunned() ||
+// teleporting). isStunned() is status.has(Modules.Effects.Stun): weapon-stun
+// procs land Effects.Stun (= fxStun 4, combat_procs applyHitStatus) and the
+// /toggle debug path lands the same ID (CmdEffectStun 4) in the abilities
+// tracker, so HasStatusEffect covers both. The teleport half mirrors
+// character.teleport's 500ms window via markTeleported (set on every
+// server-side teleport funnel). TS note: player.teleport/setPosition never
+// arm teleporting for players (player.ts:1579 setPosition's third parameter
+// is `forced`, not withTeleport — only mobs arm it, mob.ts:306), so the TS
+// gate is near-dead code for players; the Go flag arms it on server
+// teleports instead, which is the behavior the gate exists for.
+func movementBlocked(c *playerConn) bool {
+	if c == nil {
+		return false
+	}
+	if abilities.HasStatusEffect(c.Instance, fxStun) {
+		return true
+	}
+	return c.isTeleporting()
+}
+
+// isTeleporting reports the teleport grace window (sessMu-guarded: read on
+// the conn goroutine, cleared on a timer goroutine).
+func (c *playerConn) isTeleporting() bool {
+	if c == nil {
+		return false
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.teleporting
+}
+
+// markTeleported arms the teleporting flag, cleared 500ms later
+// (character.teleport setTimeout parity). Called by every server-side
+// teleport funnel (m7Teleport, m8Teleport, worldApplyTeleport). Respawn is
+// excluded: it delivers a Respawn packet (not Teleport) that already resets
+// client pathing, matching TS player.respawn (player.teleport, no flag).
+func (c *playerConn) markTeleported() {
+	if c == nil {
+		return
+	}
+	c.sessMu.Lock()
+	c.teleporting = true
+	c.sessMu.Unlock()
+	time.AfterFunc(500*time.Millisecond, func() {
+		c.sessMu.Lock()
+		c.teleporting = false
+		c.sessMu.Unlock()
+	})
+}
+
+// clearMovementState mirrors the player.ts movement clears: the container
+// gate (canAccessContainer=false, :1125), the open loot bag
+// (activeLootBag=”, :1126), the crafting interface
+// (activeCraftingInterface=-1, :1127) and the talk cursor (resetTalk,
+// handleMovementStep:1224). Trade sessions are untouched — the crafting
+// Iface lives beside, not inside, trade state. resetTalk clears
+// talkNPC/talkIndex, the cursor shared by NPC talk and the world sign
+// TalkWith paging path (world_wire worldSignTalk operates on the same
+// fields via withTalk).
+func clearMovementState(c *playerConn) {
+	clearContainerAccess(c)
+	entity.ClearBagOpener(c.Instance)
+	controller.ClearCraftingIface(c)
+	c.resetTalk()
+}
+
 // handleMovement enforces collisions the client grid cannot: resource-entity
 // tiles (walkable c:false, e.g. demo oak) plus a backstop for static collisions.
 // Request (the client already refuses static targets itself, handler.ts:56):
@@ -1795,11 +1864,31 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 	if mv.Opcode == nil {
 		return false
 	}
-	// M6: any movement closes the store UI and revokes bank access
-	// (stores.ts storeOpen=none + player.ts canAccessContainer=false on move).
-	clearContainerAccess(c)
 	if mv.TargetInstance != "" {
 		s.Target = mv.TargetInstance
+	}
+	// player.ts:1119-1127 order (Request) + Step:1199-1224: target-clear
+	// above, then the stun/teleport halt, then the container/bag/crafting/
+	// talk clears — on every move request, before the door/combat
+	// early-returns and verify. Request returns after the halt; Step falls
+	// through (TS has no return after the Step stop) and still clears.
+	if op := *mv.Opcode; op == MovementRequest || op == MovementStep {
+		if movementBlocked(c) {
+			// Halt: Stop + teleport-back + Positions, same frames as
+			// the rejectLocked path (no cheatScore: TS does not
+			// increment on the Request block).
+			stopPlayer(c)
+			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
+			if op == MovementRequest {
+				return false
+			}
+		}
+		clearMovementState(c)
+	} else {
+		// M6: any movement closes the store UI and revokes bank access
+		// (stores.ts storeOpen=none + player.ts canAccessContainer=false
+		// on move). Request/Step clear it via clearMovementState above.
+		clearContainerAccess(c)
 	}
 	switch *mv.Opcode {
 	case MovementRequest:
@@ -2125,6 +2214,13 @@ type playerConn struct {
 	canAccessContainer bool   // banker-granted bank access (cleared on move)
 	talkNPC            string // last plain-NPC key talked to (talkIndex reset)
 	talkIndex          int    // current npc.talk() index for talkNPC
+	// Teleport grace (character.teleport parity): armed by every
+	// server-side teleport funnel, cleared 500ms later via markTeleported
+	// (the setTimeout(() => teleporting=false, 500) parity). While armed,
+	// movement Requests halt like a stun (player.ts:1122). sessMu-guarded
+	// like the M6 fields above: the conn goroutine reads it on movement
+	// while the timer goroutine clears it.
+	teleporting bool
 
 	// M7 chat session state (player.chat parity).
 	rank int        // Modules.Ranks value (seeded for e2e only)

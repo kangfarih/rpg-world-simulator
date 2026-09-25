@@ -784,6 +784,17 @@ func ClampCraftCount(count int, reqs []CraftRequirement, have func(key string) i
 // Crafting (controllers/crafting.ts).
 // ---------------------------------------------------------------------------
 
+// ClearCraftingIface resets the crafting interface to none (-1,
+// player.ts handleMovementRequest activeCraftingInterface=-1 parity).
+// Trade sessions are untouched: Iface lives beside, not inside, the
+// Trades/TradeReq maps, so clearing it never drops a trade.
+func ClearCraftingIface(c Conn) {
+	if c == nil {
+		return
+	}
+	stateFor(c.PlayerName()).Iface = -1
+}
+
 // CraftOpen ports crafting.open: previews for the interface's skill file +
 // activeCraftingInterface = type.
 func CraftOpen(d Deps, c Conn, iface int) {

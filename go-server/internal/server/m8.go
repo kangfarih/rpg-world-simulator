@@ -213,6 +213,7 @@ func m8Teleport(c *playerConn, x, y int) {
 	worldcore.SetEntityPos(c.Instance, x, y)
 	worldcore.UpdateRegion(c, x, y)
 	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
+	c.markTeleported()
 	m5TrackPos(c)
 }
 
