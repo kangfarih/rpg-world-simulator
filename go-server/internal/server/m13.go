@@ -767,8 +767,11 @@ func m13QuestFinish(c *playerConn, key string) {
 }
 
 // m13AchievementsReset zeroes every achievement stage.
-func m13AchievementsReset(c *playerConn) {
+func m13AchievementsReset(c *playerConn, key string) {
 	controller.AchievementsReset(c, m13deps())
+	// Dynmap: commands.ts resetachievements re-sends the region
+	// (updateRegion); SetAchStage bypasses m11AchProgress, so push here.
+	maybePushDynamicMap(m13conn(c))
 }
 
 // m13AchievementFinish completes one achievement.
@@ -1171,6 +1174,9 @@ func (m13misc) ResendRegions(c controller.CommandConn) {
 	// then the login region-load burst scoped to the admin (List Spawns +
 	// Positions, then one Spawn per surrounding-region entity).
 	worldcore.UpdateRegion(pc, pc.Sess.PlayerX, pc.Sess.PlayerY)
+	// Dynmap: commands.ts resetregions ends in updateRegion, which
+	// re-sends the per-player region (signature-gated here).
+	maybePushDynamicMap(pc)
 	handleList(pc)
 	regions := pc.Conn.Regions()
 	regionSet := make(map[int]bool, len(regions))

@@ -188,6 +188,43 @@ func TestDynamicRemapMatrix(t *testing.T) {
 	}
 }
 
+// MappedAnimTile matrix (area.ts getMappedAnimationTile parity): the
+// animation tile relative to the area re-based onto the mapped-animation
+// counterpart; ok=false without an animation link.
+func TestMappedAnimTileMatrix(t *testing.T) {
+	resetAreas()
+	LoadAreas([]byte(`{"width":100,"areas":{"dynamic":[
+		{"id":21,"x":1,"y":1,"width":2,"height":2,"mapping":22,"animation":23,"quest":"q"},
+		{"id":22,"x":5,"y":5,"width":2,"height":2},
+		{"id":23,"x":9,"y":9,"width":2,"height":2},
+		{"id":24,"x":30,"y":30,"width":1,"height":1,"mapping":22,"quest":"q"}
+	]}}`))
+	var linked, unlinked *Area
+	for _, a := range DynamicAreas() {
+		switch a.ID {
+		case 21:
+			linked = a
+		case 24:
+			unlinked = a
+		}
+	}
+	if linked == nil || linked.MappedAnimation() == nil {
+		t.Fatalf("animation link = %+v", linked)
+	}
+	if ax, ay, ok := MappedAnimTile(linked, 1, 1); !ok || ax != 9 || ay != 9 {
+		t.Fatalf("anim(1,1) = %d,%d,%v, want 9,9,true", ax, ay, ok)
+	}
+	if ax, ay, ok := MappedAnimTile(linked, 2, 2); !ok || ax != 10 || ay != 10 {
+		t.Fatalf("anim(2,2) = %d,%d,%v, want 10,10,true", ax, ay, ok)
+	}
+	if _, _, ok := MappedAnimTile(unlinked, 30, 30); ok {
+		t.Fatal("area without animation link must not map")
+	}
+	if _, _, ok := MappedAnimTile(nil, 1, 1); ok {
+		t.Fatal("nil area must not map")
+	}
+}
+
 // Chest clear awards the area achievement to the attacker (chest.ts onEmpty
 // parity); killerless clears and achievement-less areas award nothing.
 func TestChestClearAwardsAchievement(t *testing.T) {

@@ -229,34 +229,36 @@ func getTestRegionData() map[int][]RegionTile {
 // (0/[]) skipped and data>=1 kept, mirroring getRegionTileData
 // (regions.ts:541-563). Framing stays [4,base64gzip,bufSize] with gzip
 // (Utils.compress default) + encodeURI byte length. Built once and cached.
+// This is the STATIC base: per-player dynamic re-skins layer on top via
+// buildMapFrameFor (dynmap.go) without changing this frame.
 func buildMapFrame() []any {
 	mapOnce.Do(func() {
-		var data map[int][]RegionTile
-		if cleanMode || combatMode {
-			data = getRegionData(100, 100)
-		} else if testMode {
-			data = getTestRegionData()
-		} else {
-			data = getRegionData(100, 100)
-		}
-		regionsJSON, err := json.Marshal(data)
-		if err != nil {
-			log.Fatalf("marshal regions: %v", err)
-		}
-
-		var buf bytes.Buffer
-		w := gzip.NewWriter(&buf)
-		if _, err := w.Write(regionsJSON); err != nil {
-			log.Fatalf("gzip write: %v", err)
-		}
-		if err := w.Close(); err != nil {
-			log.Fatalf("gzip close: %v", err)
-		}
-
-		mapFrame = mapPkt(base64.StdEncoding.EncodeToString(buf.Bytes()), bufferSize(regionsJSON))
-		log.Printf("map frame: cleanMode=%v testMode=%v %d regions, %d bytes json", cleanMode, testMode, len(data), len(regionsJSON))
+		data := mapBaseData()
+		mapFrame = encodeMapFrame(data)
+		log.Printf("map frame: cleanMode=%v testMode=%v %d regions", cleanMode, testMode, len(data))
 	})
 	return mapFrame
+}
+
+// encodeMapFrame gzips + base64-framing for region data: the shared
+// [4,base64gzip,bufSize] constructor for the static boot frame and the
+// per-player dynamic variants (identical framing, dynmap.go).
+func encodeMapFrame(data map[int][]RegionTile) []any {
+	regionsJSON, err := json.Marshal(data)
+	if err != nil {
+		log.Fatalf("marshal regions: %v", err)
+	}
+
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(regionsJSON); err != nil {
+		log.Fatalf("gzip write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		log.Fatalf("gzip close: %v", err)
+	}
+
+	return mapPkt(base64.StdEncoding.EncodeToString(buf.Bytes()), bufferSize(regionsJSON))
 }
 
 var (
@@ -2316,6 +2318,8 @@ func registerDisconnectHooks() {
 		m10ForgetPlayer(c.Instance)
 		// Plateau: drop the tracked plateauLevel.
 		plateauForget(c.Instance)
+		// Dynmap: drop the last-pushed map signature.
+		dynMapForget(c.Instance)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)
@@ -2941,6 +2945,10 @@ func handleConn(conn *websocket.Conn) {
 				worldPushLights(c) // world: login region-enter Lamp fan-out
 				maybeBannerConn(c) // R2: refresh banner when behind preferred (hub-gated no-op)
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
+				// Dynmap: TS handleReady re-sends the per-player region
+				// (updateRegion) so returning progress applies to tiles.
+				// No-remap players are signature-clean: no extra frame.
+				maybePushDynamicMap(c)
 				sendSpawns()
 			case PacketList: // C List request -> Spawns + Positions
 				handleList(c)

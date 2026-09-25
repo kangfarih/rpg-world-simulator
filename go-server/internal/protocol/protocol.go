@@ -439,13 +439,16 @@ type resourceData struct {
 // RegionTile mirrors RegionTileData in types/map.d.ts:17-25.
 // Data is Tile (number | number[]) straight from world.json. C is always
 // emitted (false = walkable grass, true = collision); o/cur only when set.
+// Animation carries the mapped-animation raw tile for dynamic remaps
+// (regions.ts buildDynamicTile); omitted unless a remap sets it.
 type RegionTile struct {
-	X    int    `json:"x"`
-	Y    int    `json:"y"`
-	Data any    `json:"data"`
-	C    bool   `json:"c"`
-	O    bool   `json:"o,omitempty"`
-	Cur  string `json:"cur,omitempty"`
+	X         int    `json:"x"`
+	Y         int    `json:"y"`
+	Data      any    `json:"data"`
+	C         bool   `json:"c"`
+	O         bool   `json:"o,omitempty"`
+	Cur       string `json:"cur,omitempty"`
+	Animation any    `json:"animation,omitempty"`
 }
 
 // Container opcodes (Opcodes.Container: Batch0 Add1 Remove2 Select3 Swap4)

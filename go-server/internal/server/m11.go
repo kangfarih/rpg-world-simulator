@@ -246,6 +246,12 @@ func m11NpcOf(st questStageData) string {
 // effects. progress=false mirrors setStage(..., false) for DB loads.
 func m11SetStage(c *playerConn, st *m11PlayerState, key string, stage, subStage int, progress bool) {
 	quest.SetStage(m11qc(c), m11deps(), st.PlayerState, key, stage, subStage, progress)
+	if progress {
+		// Dynmap: quests.ts handleProgress re-sends the region on finish
+		// (player.updateRegion); resets can revert a remap the same way.
+		// maybePush is signature-gated, so non-gating stages send nothing.
+		maybePushDynamicMap(c)
+	}
 }
 
 // m11GiveRewards grants stage itemRewards (givePlayerRewards): NO_SPACE
@@ -284,7 +290,12 @@ func m11ProgressSub(c *playerConn, st *m11PlayerState, key string) {
 // (handler.handleTalkToNPC order). Returns true when the quest/achievement
 // consumed the interaction (caller skips the default dialogue).
 func m11Talk(c *playerConn, npcKey string) bool {
-	return quest.Talk(m11qc(c), m11deps(), npcKey)
+	out := quest.Talk(m11qc(c), m11deps(), npcKey)
+	// Dynmap: talk can advance achievement discovery stages internally
+	// (HandleAchTalk bypasses m11AchProgress); signature-gated no-op
+	// when nothing changed.
+	maybePushDynamicMap(c)
+	return out
 }
 
 // m11RequirementsOK mirrors hasRequirements: skill levels + finished quests.
@@ -308,6 +319,9 @@ func m11HandleAchTalk(c *playerConn, st *m11PlayerState, key string) bool {
 // m11Kill fires on mob death credited to the killer.
 func m11Kill(c *playerConn, mobKey string) {
 	quest.Kill(m11qc(c), m11deps(), mobKey)
+	// Dynmap: kill achievements progress inside the quest package;
+	// signature-gated (m11Talk parity).
+	maybePushDynamicMap(c)
 }
 
 func m11AchHasMob(def *m11AchDef, mobKey string) bool {
@@ -320,6 +334,9 @@ func m11AchHasMob(def *m11AchDef, mobKey string) bool {
 // substage; no count = single-stage progress).
 func m11Resource(c *playerConn, skill, resourceKey string) {
 	quest.Resource(m11qc(c), m11deps(), skill, resourceKey)
+	// Dynmap: resource quest stages progress inside the quest package;
+	// signature-gated (m11Talk parity).
+	maybePushDynamicMap(c)
 }
 
 // m11HeroDamageMult multiplies hero damage vs engine mobs when M11_HERODMG is
@@ -347,6 +364,8 @@ func m11DropGated(username, questKey, achievementKey, status string) bool {
 // at the finish stage (achievement.setStage).
 func m11AchProgress(c *playerConn, st *m11PlayerState, key string) {
 	quest.AchProgress(m11qc(c), m11deps(), st.PlayerState, key)
+	// Dynmap: achievements.ts finishCallback re-sends the region on finish.
+	maybePushDynamicMap(c)
 }
 
 // m11FinishAchievement finishes an achievement outright (achievement.finish
@@ -360,6 +379,9 @@ func m11FinishAchievement(c *playerConn, key string) {
 		return
 	}
 	quest.Finish(m11qc(c), m11deps(), quest.StateFor(c.Username), key)
+	// Dynmap: outright achievement finish re-skins tiles like a stage
+	// finish (covers statistics milestones, doors, chest clears).
+	maybePushDynamicMap(c)
 }
 
 // m11EnsureTables creates the quest/achievement tables (M5 DDL order).
@@ -386,6 +408,9 @@ func m11HandleTest(c *playerConn, data []byte) {
 		return
 	}
 	quest.HandleTest(m11qc(c), m11deps(), data)
+	// Dynmap: setstage/setach inject finish states directly (bypassing the
+	// wrappers above); signature-gated.
+	maybePushDynamicMap(c)
 }
 
 // ---------------------------------------------------------------------------

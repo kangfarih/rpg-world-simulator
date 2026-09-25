@@ -14,9 +14,9 @@
 //
 // Dynamic collision (map.ts:234-244): blockedForPlayer resolves the tile for
 // one player through the quest/achievement-gated dynamic remap before the
-// static checks. Client tile SERVING is unchanged (getRegionData has no
-// player context — every client receives the same static tiles; only the
-// server-side collision honors the mapped state).
+// static checks. Client tile SERVING is per-player too (dynmap.go
+// buildMapFrameFor re-skins the same remapped tiles at Ready and on
+// quest/achievement finish, regions.ts buildDynamicTile parity).
 package server
 
 import (

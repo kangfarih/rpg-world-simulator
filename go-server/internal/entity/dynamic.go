@@ -9,10 +9,9 @@
 //
 // The per-player gate is a Progression the caller supplies (the server wires
 // it to quest state). Collision callers use DynamicRemap as the remap
-// function for worldmap.IsBlockedRemapped. Client tile SERVING stays static
-// (getRegionData has no player context — same tiles for everyone; the mapped
-// state is collision-only here, documented divergence from regions.ts
-// buildDynamicTile which also re-skins the rendered tile per player).
+// function for worldmap.IsBlockedRemapped. Client tile SERVING is per-player
+// too (server dynmap.go buildMapFrameFor re-skins served tiles through
+// DynamicRemap + MappedTile, regions.ts buildDynamicTile parity).
 package entity
 
 // Progression is one player's quest/achievement finish state (served by the
@@ -84,6 +83,30 @@ func DynamicRemap(x, y int, p Progression) (mx, my int, ok bool) {
 		return 0, 0, false
 	}
 	return MappedTile(area, x, y)
+}
+
+// MappedAnimTile ports area.ts getMappedAnimationTile: the animation tile
+// relative to the area re-based onto the mapped-animation counterpart.
+// ok=false when there is no animation mapping (the common case — no
+// world.json dynamic area currently sets one; the server tile overlay
+// omits the animation field then, client loadRegionTileData parity).
+func MappedAnimTile(area *Area, x, y int) (ax, ay int, ok bool) {
+	if area == nil {
+		return 0, 0, false
+	}
+	mapped := area.MappedAnimation()
+	if mapped == nil {
+		return 0, 0, false
+	}
+	relX := area.X - x
+	if relX < 0 {
+		relX = -relX
+	}
+	relY := area.Y - y
+	if relY < 0 {
+		relY = -relY
+	}
+	return mapped.X + relX, mapped.Y + relY, true
 }
 
 // DynamicAreas returns a copy of the dynamic-area group (test/introspection).
