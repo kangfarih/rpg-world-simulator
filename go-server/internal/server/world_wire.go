@@ -66,7 +66,31 @@ func worldWarpConn(c *playerConn) controller.WarpConn {
 // before warps load or Warp frames route).
 func worldConfigureWarps() {
 	controller.ConfigureWarps(controller.WarpDeps{
-		IsJailed:      m13IsJailed,
+		IsJailed: m13IsJailed,
+		TutorialFinished: func(username string) bool {
+			// quests.ts isTutorialFinished parity (warps.ts warp() tutorial
+			// gate): default true when the tutorial quest def is absent,
+			// otherwise the m11 quest-stage lookup — the same read the warp
+			// quest gate uses.
+			if m11Q["tutorial"] == nil {
+				return true
+			}
+			return m11StateFor(username).isFinished("tutorial")
+		},
+		InCombat: func(instance string) bool {
+			// character.ts inCombat parity (warps.ts warp() combat gate) via
+			// the live-target indicators the stub already owns: the hero's
+			// live ability target (abTarget liveness through
+			// abilities.LiveTarget) or any live engine mob targeting the
+			// hero (m9MobTargeting). m6vitals.InCombat owns exactly this
+			// composition (item-use combat gate precedent); reusing it keeps
+			// the warp gate and the item gate in agreement on "in combat".
+			// Combat-timestamp recency is deliberately NOT consulted: the
+			// stub tracks no per-hero combat clock, and the two live-target
+			// signals already cover both directions (hero attacking, hero
+			// attacked).
+			return m6vitals{}.InCombat(instance)
+		},
 		PlayerLevel:   func(username string) int { return m5StateFor(username).Level },
 		QuestFinished: func(username, quest string) bool { return m11StateFor(username).isFinished(quest) },
 		AchievementDone: func(username, ach string) bool {

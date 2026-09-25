@@ -2,9 +2,9 @@
 // internal/warps, internal/events and internal/globals packages.
 //
 // Warp orchestration mirrors packages/server/src/controllers/warps.ts
-// (menu-driven warp(id): jailed/cooldown/level/quest/achievement gates,
-// random landing tile in the target rect, Teleport delivery, `warps:*`
-// notifies). This package owns the registry + gating table + cooldown
+// (menu-driven warp(id): jailed/tutorial/combat/cooldown/level/quest/
+// achievement gates, random landing tile in the target rect, Teleport
+// delivery, `warps:*` notifies). This package owns the registry + gating table + cooldown
 // clocks and computes gate outcomes; the root adapter (package main)
 // owns transport (playerConn, send/broadcast) and implements WarpStore
 // to supply jail/rank/level/quest/achievement reads.
@@ -44,11 +44,14 @@ type WarpEntry struct {
 }
 
 // WarpStore supplies the gate reads the stub owns (jail flags, ranks,
-// levels, quests, achievements, display names). Implemented by the root
-// adapter; kept as an interface so this package never imports main.
+// tutorial/combat state, levels, quests, achievements, display names).
+// Implemented by the root adapter; kept as an interface so this package
+// never imports main.
 type WarpStore interface {
 	IsJailed(username string) bool
 	IsAdmin(username string) bool
+	TutorialFinished(username string) bool
+	InCombat(username string) bool
 	PlayerLevel(username string) int
 	QuestFinished(username, quest string) bool
 	AchievementDone(username, ach string) bool
@@ -181,11 +184,11 @@ func (c *WarpController) At(x, y int) *warps.Warp {
 	return c.reg.At(x, y)
 }
 
-// Authorize ports the controllers/warps.ts warp() gates: jail, cooldown,
-// level, quest and achievement requirements. It returns the deny notify
-// message ("" when allowed). Cooldown reads use nowMs; the clock advances
-// only via Record on success, so callers record after applying side
-// effects. Tutorial/combat gates are documented skips (no stub state).
+// Authorize ports the controllers/warps.ts warp() gates in TS order: jail,
+// tutorial, combat, cooldown, then level, quest and achievement
+// requirements. It returns the deny notify message ("" when allowed).
+// Cooldown reads use nowMs; the clock advances only via Record on success,
+// so callers record after applying side effects.
 func (c *WarpController) Authorize(username string, w *WarpEntry, nowMs int64, store WarpStore) string {
 	if w == nil {
 		return ""
@@ -195,6 +198,12 @@ func (c *WarpController) Authorize(username string, w *WarpEntry, nowMs int64, s
 	}
 	if store != nil && store.IsJailed(username) {
 		return "warps:CANNOT_WARP_JAIL"
+	}
+	if store != nil && !store.TutorialFinished(username) {
+		return "warps:CANNOT_WARP_TUTORIAL"
+	}
+	if store != nil && store.InCombat(username) {
+		return "warps:CANNOT_WARP_COMBAT"
 	}
 	if cd := CooldownMs(); cd > 0 && (store == nil || !store.IsAdmin(username)) {
 		c.mu.Lock()

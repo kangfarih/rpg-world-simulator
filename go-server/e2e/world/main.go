@@ -262,6 +262,13 @@ func main() {
 	})
 	check(bub2 != nil, "bubble Position on Target 796-646 (Tread carefully...)")
 
+	// --- tutorial gate (fresh account warps denied until tutorial finished) ---
+	send(conn, `[39,{"id":0}]`)
+	n = waitNotify(c, 3*time.Second, "warps:CANNOT_WARP_TUTORIAL")
+	check(n != nil, "tutorial gate denies warp id 0 on fresh account")
+	send(conn, `[46,{"m11test":"setstage","key":"tutorial","stage":16,"sub":0}]`)
+	time.Sleep(500 * time.Millisecond)
+
 	// --- menu warp [39] to mudwich (id 0) ---
 	send(conn, `[39,{"id":0}]`)
 	tp := c.waitFor(3*time.Second, func(f []json.RawMessage) bool {

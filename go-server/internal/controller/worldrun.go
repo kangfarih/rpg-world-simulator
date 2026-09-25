@@ -46,12 +46,15 @@ type WarpConn struct {
 // WarpDeps bundles the warp-runner seams (implemented by the root adapter;
 // never by this package).
 type WarpDeps struct {
-	// Gate reads (worldWarpStore parity, username-keyed).
-	IsJailed        func(username string) bool
-	PlayerLevel     func(username string) int
-	QuestFinished   func(username, quest string) bool
-	AchievementDone func(username, ach string) bool
-	FormatName      func(name string) string
+	// Gate reads (worldWarpStore parity, username-keyed except InCombat
+	// which resolves the caller's instance).
+	IsJailed         func(username string) bool
+	TutorialFinished func(username string) bool
+	InCombat         func(instance string) bool
+	PlayerLevel      func(username string) int
+	QuestFinished    func(username, quest string) bool
+	AchievementDone  func(username, ach string) bool
+	FormatName       func(name string) string
 	// Notify sends a client text notification (m6Notify parity).
 	Notify func(instance, message string)
 	// ApplyTeleport applies the landing: authoritative pos + region +
@@ -67,7 +70,8 @@ func ConfigureWarps(d WarpDeps) { warpDeps = d }
 
 // warpStore adapts WarpDeps + the caller to the WarpStore gate interface.
 type warpStore struct {
-	admin bool
+	admin    bool
+	instance string
 }
 
 func (s warpStore) IsJailed(username string) bool {
@@ -78,6 +82,26 @@ func (s warpStore) IsJailed(username string) bool {
 }
 
 func (s warpStore) IsAdmin(username string) bool { return s.admin }
+
+// TutorialFinished mirrors quests.ts isTutorialFinished (warps.ts warp()
+// tutorial gate). An unwired seam defaults to finished so the gate stays
+// open, preserving the pre-gate behaviour for non-server callers.
+func (s warpStore) TutorialFinished(username string) bool {
+	if warpDeps.TutorialFinished == nil {
+		return true
+	}
+	return warpDeps.TutorialFinished(username)
+}
+
+// InCombat mirrors character.ts inCombat (warps.ts warp() combat gate) via
+// the caller's instance. An unwired seam defaults to peace so the gate
+// stays open, preserving the pre-gate behaviour for non-server callers.
+func (s warpStore) InCombat(username string) bool {
+	if warpDeps.InCombat == nil {
+		return false
+	}
+	return warpDeps.InCombat(s.instance)
+}
 
 func (s warpStore) PlayerLevel(username string) int {
 	if warpDeps.PlayerLevel == nil {
@@ -139,9 +163,8 @@ func HandleWarp(c WarpConn, data []byte) {
 	DoWarp(c, w)
 }
 
-// DoWarp ports controllers/warps.ts warp(): jail/cooldown/requirement
-// gates then a random landing tile + Teleport delivery. Tutorial/combat gates
-// are documented skips (no stub state for either).
+// DoWarp ports controllers/warps.ts warp(): jail/tutorial/combat/cooldown/
+// requirement gates then a random landing tile + Teleport delivery.
 func DoWarp(c WarpConn, w *WarpEntry) bool {
 	if c.Instance == "" || c.Username == "" || w == nil {
 		return false
@@ -150,7 +173,7 @@ func DoWarp(c WarpConn, w *WarpEntry) bool {
 		return false
 	}
 	nowMs := time.Now().UnixMilli()
-	if deny := Warps.Authorize(c.Username, w, nowMs, warpStore{admin: c.Admin}); deny != "" {
+	if deny := Warps.Authorize(c.Username, w, nowMs, warpStore{admin: c.Admin, instance: c.Instance}); deny != "" {
 		warpDeps.Notify(c.Instance, deny)
 		return false
 	}
