@@ -56,6 +56,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -398,11 +399,111 @@ type Mob interface {
 	DropAttacker(inst string)
 	Attackers() map[string]time.Time // copy
 	ClearAttackers()
+	// AddDamage records clamped player damage in the TS damageTable port
+	// (character.ts addToDamageTable parity: accumulate per attacker;
+	// first-hit order is kept for ranking tiebreaks). Callers pass the
+	// pre-decrement clamp (HitMob); the lock must be held like every
+	// other accessor.
+	AddDamage(inst string, dmg int, username string)
+	// DamageRank returns the damage table ranked TS-exact
+	// (mob.ts getDamageTable parity): damage descending, first-hit
+	// ascending tiebreak. A copy; call with the mob lock held.
+	DamageRank() []DamageEntry
+	// ClearDamage drops the damage table (mob.destroy parity: death
+	// clears it; pruning/leash deliberately do NOT — removeAttacker and
+	// combat.stop touch only the attackers list in TS).
+	ClearDamage()
 	// Plateau is the mob's bound plateau level, set at spawn from the
 	// spawn tile (mob.ts:148) and never changed afterwards (respawns
 	// return to spawn, so the level is stable).
 	Plateau() int
 }
+
+// DamageEntry is one ranked damage-table row (mob.ts getDamageTable
+// parity): the attacker's instance, clamped damage total, and the username
+// snapshot from hit time (loot ownership needs the name after a disconnect
+// or death, when no live view may exist).
+type DamageEntry struct {
+	Instance string
+	Damage   int
+	Username string
+}
+
+// DamageTable is the TS damageTable port (character.ts damageTable +
+// addToDamageTable, mob.ts getDamageTable): per-attacker clamped damage
+// totals with first-hit order.
+//
+// Ranking rule (TS-exact): damage descending; ties break by first-hit
+// order. Rationale: getDamageTable sorts damage desc with V8's stable
+// sort over Object.entries, whose order for instance-string keys is
+// insertion order — i.e. max-damage with first-hit tiebreak. The Go rank
+// reproduces that deterministically via an explicit sequence number
+// instead of relying on map iteration order.
+//
+// NOTE (verified upstream quirk, deliberately NOT mirrored): TS
+// addToDamageTable misses the `else` — a first hit is recorded twice
+// (`table[inst] = dmg` then unconditionally `table[inst] += dmg`). The
+// port implements the documented intent (new entry OR accumulate); the
+// double-count only inflates first hits and never changes who dealt most
+// damage in the shapes that matter here.
+type DamageTable struct {
+	recs map[string]*dmgRec
+	seq  uint64
+}
+
+type dmgRec struct {
+	total    int
+	order    uint64
+	username string
+}
+
+// Add records clamped damage for an attacker (accumulate per attacker;
+// first hit opens the entry and fixes its tiebreak order + username).
+// Zero-value ready (lazy map init, so struct-literal mobs keep working).
+func (t *DamageTable) Add(inst string, dmg int, username string) {
+	if t.recs == nil {
+		t.recs = map[string]*dmgRec{}
+	}
+	r, ok := t.recs[inst]
+	if !ok {
+		t.seq++
+		r = &dmgRec{order: t.seq, username: username}
+		t.recs[inst] = r
+	}
+	if username != "" {
+		r.username = username
+	}
+	r.total += dmg
+}
+
+// Len reports the entry count (empty table = environmental kill).
+func (t *DamageTable) Len() int { return len(t.recs) }
+
+// Rank returns the table sorted damage-desc, first-hit-asc (a copy).
+func (t *DamageTable) Rank() []DamageEntry {
+	type ranked struct {
+		inst string
+		rec  *dmgRec
+	}
+	rows := make([]ranked, 0, len(t.recs))
+	for inst, r := range t.recs {
+		rows = append(rows, ranked{inst, r})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].rec.total != rows[j].rec.total {
+			return rows[i].rec.total > rows[j].rec.total
+		}
+		return rows[i].rec.order < rows[j].rec.order
+	})
+	out := make([]DamageEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, DamageEntry{Instance: row.inst, Damage: row.rec.total, Username: row.rec.username})
+	}
+	return out
+}
+
+// Clear drops the table (mob.destroy parity).
+func (t *DamageTable) Clear() { t.recs = map[string]*dmgRec{} }
 
 // MobSpawn is the Spawn-frame descriptor for a mob (Mob.serialize:
 // hitPoints/maxHitPoints/attackRange/level). The root adapter renders the
@@ -426,6 +527,11 @@ type MobSpawn struct {
 type MobWorld interface {
 	Players() []PlayerView
 	PlayerPos(instance string) (x, y int, ok bool)
+	// PlayerExists reports whether instance belongs to a still-connected
+	// player (the quest hook's worldcore.Find parity: corpses still
+	// count — only disconnects drop out — mirroring TS
+	// world.entities.get(instance) at handleDeath time; nil-safe).
+	PlayerExists(instance string) bool
 	Blocked(x, y int) bool
 	// PlateauLevel is map.getPlateauLevel (map.ts): the plateau level at
 	// (x,y), 0 when the tile carries none. Serves the roam-step gate.
@@ -861,13 +967,26 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 		m.Unlock()
 		return
 	}
-	hp := m.HP() - dmg
+	hpBefore := m.HP()
+	hp := hpBefore - dmg
 	if hp < 0 {
 		hp = 0
 	}
 	m.SetHP(hp)
 	if attacker != nil {
 		m.TouchAttacker(attacker.Instance, now)
+		// TS character.hit order: the damage-table update runs BEFORE the
+		// HP decrement, clamped to remaining HP (addToDamageTable
+		// parity). Only player attackers are recorded (the
+		// attacker?.isPlayer() gate — a non-nil PlayerView is a player).
+		clipped := dmg
+		if clipped > hpBefore {
+			clipped = hpBefore
+		}
+		if clipped < 0 {
+			clipped = 0
+		}
+		m.AddDamage(attacker.Instance, clipped, attacker.Username)
 		// Retaliate (handler.handleHit): idle mobs swing back; busy mobs
 		// keep their current target. Worker-ant minions never respond
 		// (ant.ts handleHit no-op); wild ants retaliate normally.
@@ -901,14 +1020,29 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 
 // KillMob ports handler.handleDeath: despawn + kill credit (M5 loot) +
 // chest-area onEmpty + mimic-chest respawn + M11 quest credit + destroy
-// (respawn timer restores full HP at spawn). killer is nil for non-player
-// kills (environmental deaths: DoT ticks, admin commands — no attacker is
-// invented). A killerless kill still drops loot (unowned, owner "") and
-// still runs the chest-area hook; the quest hook fires with an empty killer
-// instance, which the root adapter resolves to a nil conn (nil-safe no-op:
-// no quest or statistics credit is invented for anyone). A dead mimic
-// additionally re-spawns its chest after CHEST_RESPAWN and leaves the
-// registry (TS destroy); every other mob is untouched by that hook.
+// (respawn timer restores full HP at spawn). killer is the killing-blow
+// dealer (nil for non-player kills: environmental deaths — DoT ticks,
+// admin commands — no attacker is invented).
+//
+// Credit rule (TS-EXACT, handler.ts:85-109 + mob.ts getDamageTable): the
+// FIRST damage-table entry in rank order (damage desc, first-hit
+// tiebreak) that still resolves to an existing player earns the kill —
+// loot ownership + quest kill + statistics go to THEM, never to the
+// killing-blow dealer. Consequences, mirroring the TS loop exactly:
+//   - Stale (disconnected/unresolvable) entries are skipped WITHOUT
+//     dropping (the `if (!entity?.isPlayer()) continue`); the next
+//     resolvable entry in rank order is credited.
+//   - An all-stale table drops NOTHING and fires no quest credit (the
+//     loop runs, every entry continues, index 0 never resolves —
+//     drop()/killCallback() are never reached).
+//   - An EMPTY table is the environmental path: unowned loot (owner "")
+//     plus the nil-safe quest hook, unchanged from the DoT batch.
+//
+// The killer param is deliberately NOT a tiebreak or fallback for loot,
+// quest or statistics (TS ignores it there); it still feeds the
+// chest-area hook (TS removeEntity(mob, attacker) + deathICallback use
+// the killing-blow dealer — the area achievement goes to the last
+// hitter, exactly like TS).
 func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	m.Lock()
 	if m.Dead() {
@@ -918,6 +1052,8 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	m.SetDead(true)
 	m.SetHP(0)
 	m.SetTarget("")
+	rank := m.DamageRank() // copy under lock (destroy clears the table)
+	m.ClearDamage()        // mob.destroy parity: death clears damageTable
 	mx, my := m.Pos()
 	inst := m.Instance()
 	key := m.MobKey()
@@ -933,14 +1069,43 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 		log.Printf("m9: %s (%s) died -> respawn in %v", inst, key, delay)
 	}
 
-	owner, killerInstance := "", ""
+	// Killing-blow dealer (chest-area hook only, TS removeEntity parity).
+	blowInstance := ""
 	if killer != nil {
-		owner, killerInstance = killer.Username, killer.Instance
+		blowInstance = killer.Instance
 	}
-	w.SpawnLoot(key, mx, my, owner)
-	KillHookForMob(mx, my, inst, killerInstance, w) // chest-area onEmpty (reward chest spawn)
-	handleMimicDeath(inst, w)                       // mimic.chest?.respawn() (chest re-spawn + destroy)
-	w.QuestKill(killerInstance, key)                // quest kill stages + achievements (nil-safe when "")
+	// Kill credit: first ranked entry resolving to an existing player.
+	creditOwner, creditInstance := "", ""
+	credited := false
+	for _, e := range rank {
+		if !w.PlayerExists(e.Instance) {
+			continue
+		}
+		creditOwner, creditInstance, credited = e.Username, e.Instance, true
+		break // later entries never act (TS credits index 0 only)
+	}
+	switch {
+	case credited:
+		log.Printf("m9: %s (%s) kill credit -> %s (%s) dmg=%d of %d entries (last blow by %q)",
+			inst, key, creditOwner, creditInstance, rank[0].Damage, len(rank), blowInstance)
+		w.SpawnLoot(key, mx, my, creditOwner)
+		w.QuestKill(creditInstance, key) // quest kill stages + achievements + statistics
+	case len(rank) == 0:
+		// Environmental kill (nil killer, no entries): unowned loot path,
+		// unchanged. The quest hook fires with an empty killer instance,
+		// which the root adapter resolves to a nil conn (nil-safe no-op:
+		// no quest or statistics credit is invented for anyone).
+		w.SpawnLoot(key, mx, my, "")
+		w.QuestKill("", key)
+	default:
+		// All-stale table: TS-exact outcome — no loot, no quest credit.
+		log.Printf("m9: %s (%s) died with an all-stale damage table (%d entries) -> no loot, no credit",
+			inst, key, len(rank))
+	}
+	KillHookForMob(mx, my, inst, blowInstance, w) // chest-area onEmpty (reward chest spawn)
+	handleMimicDeath(inst, w)                     // mimic.chest?.respawn() (chest re-spawn + destroy)
+	// NOTE: no QuestKill here — quest/statistics credit fired exactly once
+	// above (credited top-damager, or the nil-safe environmental hook).
 	// Mob-plugin death hook (handleDeath port: minion cleanup + state
 	// reset). No-op for default mobs and untracked instances.
 	pluginOnDeath(key, inst, w)
@@ -967,6 +1132,7 @@ func RespawnMob(m Mob, w GameWorld) {
 	sx, sy := m.SpawnPos()
 	m.SetPos(sx, sy)
 	m.ClearAttackers()
+	m.ClearDamage() // belt-and-braces: KillMob (destroy parity) already cleared it
 	inst := m.Instance()
 	p := m.Profile()
 	s := MobSpawn{

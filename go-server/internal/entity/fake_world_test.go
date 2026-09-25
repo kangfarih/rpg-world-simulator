@@ -172,6 +172,34 @@ func (f *simFake) PlayerPos(instance string) (int, int, bool) {
 	return 0, 0, false
 }
 
+// PlayerExists mirrors the quest hook's registry check: presence in the
+// player list (a removed entry = disconnected = stale damage entry).
+// removePlayer drops the entry without touching damage (m9PlayerLeave
+// parity: it deletes only target/attackers).
+func (f *simFake) PlayerExists(instance string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range f.players {
+		if v.Instance == instance {
+			return true
+		}
+	}
+	return false
+}
+
+// removePlayer disconnects a player (registry drop only).
+func (f *simFake) removePlayer(instance string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.players[:0]
+	for _, v := range f.players {
+		if v.Instance != instance {
+			kept = append(kept, v)
+		}
+	}
+	f.players = kept
+}
+
 func (f *simFake) Blocked(x, y int) bool {
 	if f.blocked != nil {
 		return f.blocked(x, y)
@@ -451,6 +479,7 @@ type testMob struct {
 	lastRoam  time.Time
 	lastTgt   time.Time
 	attackers map[string]time.Time
+	dmg       DamageTable
 }
 
 func newTestMob(instance, key string, prof MobProfile, x, y int) *testMob {
@@ -493,6 +522,12 @@ func (m *testMob) SetLastTgt(t time.Time)  { m.lastTgt = t }
 
 func (m *testMob) TouchAttacker(inst string, now time.Time) { m.attackers[inst] = now }
 func (m *testMob) DropAttacker(inst string)                 { delete(m.attackers, inst) }
+
+func (m *testMob) AddDamage(inst string, dmg int, username string) {
+	m.dmg.Add(inst, dmg, username)
+}
+func (m *testMob) DamageRank() []DamageEntry { return m.dmg.Rank() }
+func (m *testMob) ClearDamage()              { m.dmg.Clear() }
 
 func (m *testMob) Attackers() map[string]time.Time {
 	out := make(map[string]time.Time, len(m.attackers))

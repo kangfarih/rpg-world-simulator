@@ -309,6 +309,10 @@ func TestAggroGates(t *testing.T) {
 func TestHitRetaliateKillRespawn(t *testing.T) {
 	resetAreas()
 	w := newSimFake()
+	// Kill credit resolves against existing players (TS
+	// world.entities.get + isPlayer parity), so the attacker must be
+	// registered — an unregistered attacker is a stale entry (no loot).
+	w.withPlayer("hero-1", "hero", 100, 101, 1, 1)
 	atk := &PlayerView{Instance: "hero-1", Username: "hero"}
 	m := newTestMob("mob-fight", "rat", ratProfile(), 100, 100)
 	now := time.Now()

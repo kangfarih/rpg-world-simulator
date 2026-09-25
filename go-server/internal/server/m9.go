@@ -69,6 +69,12 @@ type m9Mob struct {
 	lastRoam  time.Time
 	lastTgt   time.Time
 	attackers map[string]time.Time // instance -> last hit (addAttacker)
+	// dmg is the TS damageTable port (entity.DamageTable): per-attacker
+	// clamped damage totals for top-damager kill credit. Lifecycle
+	// differs from attackers on purpose (TS parity): pruning/leash touch
+	// only attackers; death clears dmg (entity.KillMob). Value struct,
+	// zero-value ready — struct literals need no init.
+	dmg entity.DamageTable
 
 	over m9Overrides
 }
@@ -122,6 +128,15 @@ func (m *m9Mob) SetLastTgt(t time.Time)  { m.lastTgt = t }
 
 func (m *m9Mob) TouchAttacker(inst string, now time.Time) { m.attackers[inst] = now }
 func (m *m9Mob) DropAttacker(inst string)                 { delete(m.attackers, inst) }
+
+// AddDamage/DamageRank/ClearDamage delegate to the embedded damage table
+// (pruning DropAttacker deliberately does NOT drop damage — TS
+// removeAttacker touches only the attackers list).
+func (m *m9Mob) AddDamage(inst string, dmg int, username string) {
+	m.dmg.Add(inst, dmg, username)
+}
+func (m *m9Mob) DamageRank() []entity.DamageEntry { return m.dmg.Rank() }
+func (m *m9Mob) ClearDamage()                     { m.dmg.Clear() }
 
 func (m *m9Mob) Attackers() map[string]time.Time {
 	out := make(map[string]time.Time, len(m.attackers))
@@ -177,6 +192,18 @@ func (gameWorldAdapter) PlayerPos(instance string) (int, int, bool) {
 		return c.Sess.PlayerX, c.Sess.PlayerY, true
 	}
 	return 0, 0, false
+}
+
+// PlayerExists is the kill-credit existence check (TS
+// world.entities.get(instance) + isPlayer parity at handleDeath time):
+// the registry lookup the quest hook uses (QuestKill -> worldcore.Find),
+// so corpses still count and only disconnects drop out. Nil-safe.
+func (gameWorldAdapter) PlayerExists(instance string) bool {
+	if instance == "" {
+		return false
+	}
+	c, _ := worldcore.Find[*playerConn](instance)
+	return c != nil
 }
 
 func (gameWorldAdapter) Blocked(x, y int) bool { return blocked(x, y) }
