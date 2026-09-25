@@ -434,6 +434,11 @@ type MobWorld interface {
 	Despawn(instance string)
 	MoveMob(instance string, x, y int)
 	SpawnMobFrame(s MobSpawn)
+	// SkipFarRoam ports the entities.ts load roam-interval guard (the
+	// setInterval body): when more than 30 players are online, mobs with no
+	// player in their region skip roaming. Combat, aggro, leash and chase
+	// still tick every 500ms — only the roam step sleeps.
+	SkipFarRoam(mx, my int) bool
 	// RemoveMob drops a dead non-respawning mob from the registry
 	// (TS destroy; no despawn frame — KillMob already sent it).
 	RemoveMob(instance string)
@@ -743,6 +748,10 @@ func StepMob(m Mob, w GameWorld, now time.Time) {
 	// 5. Roam (roamingCallback on the ROAM_FREQUENCY interval).
 	if now.Sub(m.LastRoam()) >= RoamInterval() {
 		m.SetLastRoam(now)
+		mx, my := m.Pos()
+		if w.SkipFarRoam(mx, my) {
+			return
+		}
 		roamMob(m, w)
 	}
 }

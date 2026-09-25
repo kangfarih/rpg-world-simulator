@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -53,6 +54,9 @@ type Tile struct {
 // getPlateauLevel; TS `map.plateau`, 26325 entries). Tiles absent from the
 // table are plateau 0. The `high` array (1421 entries) is rendering-only
 // (foreground layer select) and is intentionally not loaded.
+// Entities maps tile index (y*Width+x) to the static entity marker key
+// (world.json `entities`, 4226 entries; TS `map.entities` consumed by
+// map.ts forEachEntity -> entities.ts load). Absent tiles carry no marker.
 type World struct {
 	Width      int
 	Height     int
@@ -61,6 +65,7 @@ type World struct {
 	Objects    map[int]bool
 	Cursors    map[int]string
 	Plateau    map[int]int
+	Entities   map[int]string
 	SideLen    int
 }
 
@@ -74,6 +79,7 @@ type worldFile struct {
 	Objects    []int             `json:"objects"`
 	Cursors    map[string]string `json:"cursors"`
 	Plateau    map[string]int    `json:"plateau"`
+	Entities   map[string]string `json:"entities"`
 }
 
 // Load reads and parses the world JSON at path, building the collision,
@@ -113,6 +119,14 @@ func Load(path string) (*World, error) {
 		}
 		plateau[id] = v
 	}
+	entities := make(map[int]string, len(w.Entities))
+	for k, v := range w.Entities {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		entities[id] = v
+	}
 	return &World{
 		Width:      w.Width,
 		Height:     w.Height,
@@ -121,6 +135,7 @@ func Load(path string) (*World, error) {
 		Objects:    objSet,
 		Cursors:    curSet,
 		Plateau:    plateau,
+		Entities:   entities,
 		SideLen:    w.Width / MapDivisionSize,
 	}, nil
 }
@@ -284,6 +299,44 @@ func Default() *World { return defaultWorld }
 
 // DefaultErr returns the cached load error, if any.
 func DefaultErr() error { return defaultErr }
+
+// MarkerAt returns the static entity marker key at tile index idx
+// (y*Width+x), or ("", false) when the tile carries no marker (map.ts
+// forEachEntity source for entities.ts load).
+func (w *World) MarkerAt(idx int) (string, bool) {
+	if w == nil {
+		return "", false
+	}
+	key, ok := w.Entities[idx]
+	return key, ok
+}
+
+// MarkerCoord converts a tile index to its (x, y) tile (map.ts
+// indexToCoord: x = idx % width, y = idx / width).
+func (w *World) MarkerCoord(idx int) (x, y int) {
+	if w == nil || w.Width <= 0 {
+		return 0, 0
+	}
+	return idx % w.Width, idx / w.Width
+}
+
+// ForEachMarker iterates every static entity marker in tile-index order
+// (map.ts forEachEntity parity; Go map iteration is unordered, so indices
+// are sorted for deterministic boot spawns).
+func (w *World) ForEachMarker(callback func(x, y int, key string)) {
+	if w == nil {
+		return
+	}
+	indices := make([]int, 0, len(w.Entities))
+	for idx := range w.Entities {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+	for _, idx := range indices {
+		x, y := w.MarkerCoord(idx)
+		callback(x, y, w.Entities[idx])
+	}
+}
 
 // PlateauLevel returns the plateau level at (x,y) (map.ts
 // getPlateauLevel/coordToIndex over `map.plateau`). Pure function: tiles

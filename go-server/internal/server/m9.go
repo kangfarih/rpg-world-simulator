@@ -211,6 +211,25 @@ func (gameWorldAdapter) SpawnMobFrame(s entity.MobSpawn) {
 	}))
 }
 
+// SkipFarRoam ports the entities.ts load roam-interval guard (the
+// setInterval body over forEachMob): roaming only sleeps when players are
+// absent from the mob's region AND more than 30 players are online. With
+// 30 or fewer players (every test and small server) it always reports
+// false, so roam behavior there is unchanged.
+func (gameWorldAdapter) SkipFarRoam(mx, my int) bool {
+	players := gameWorld.Players()
+	if len(players) <= 30 {
+		return false
+	}
+	mr := worldcore.TileRegion(mx, my)
+	for _, v := range players {
+		if worldcore.TileRegion(v.X, v.Y) == mr {
+			return false
+		}
+	}
+	return true
+}
+
 func (gameWorldAdapter) MobPoints(instance string, hp, maxHP int) {
 	worldcore.Broadcast(pkt(PacketPoints, pointsData{
 		Instance: instance, HitPoints: intp(hp), MaxHitPoints: intp(maxHP),
@@ -466,6 +485,19 @@ func m9LoadTables() {
 // m9SpawnMob registers + broadcasts a mob (entities.ts spawnMob shape).
 // World boot adoption and the m9test dispatcher both land here.
 func m9SpawnMob(instance, key string, x, y int, over m9Overrides) bool {
+	return m9SpawnMobInner(instance, key, x, y, over, true)
+}
+
+// m9SpawnMobQuiet registers a mob identically to m9SpawnMob but skips the
+// Spawn broadcast: boot-time seeding only (zero subscribers at boot; late
+// joiners discover the mob through the region-scoped List + Who, the TS
+// updateEntityList path). Chest-area adoption, plateau bind and spawns.json
+// overrides are identical.
+func m9SpawnMobQuiet(instance, key string, x, y int, over m9Overrides) bool {
+	return m9SpawnMobInner(instance, key, x, y, over, false)
+}
+
+func m9SpawnMobInner(instance, key string, x, y int, over m9Overrides, broadcast bool) bool {
 	m9LoadTables()
 	m9Mu.Lock()
 	prof := entity.ProfileFor(m9Prof, m9Spawn, key, x, y)
@@ -496,7 +528,9 @@ func m9SpawnMob(instance, key string, x, y int, over m9Overrides) bool {
 	m9Mu.Unlock()
 
 	worldcore.SetEntityPos(instance, x, y)
-	worldcore.Broadcast(pkt(PacketSpawn, payload))
+	if broadcast {
+		worldcore.Broadcast(pkt(PacketSpawn, payload))
+	}
 	// M10: Mob.addToChestArea parity — a mob spawning inside a chest area
 	// registers with it (addEntity; removes any unlooted reward chest).
 	if area := m10ChestAreaAt(x, y); area != nil {

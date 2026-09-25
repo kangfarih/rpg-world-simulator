@@ -1637,7 +1637,10 @@ func spawnFrames() [][]any {
 	}
 	resMu.Lock()
 	defer resMu.Unlock()
-	for _, res := range resourceSpawns {
+	// Marker resources ride resourceSpawns (same gather/exhaust/respawn
+	// path) but stay out of the Ready burst: legacy demo entries only,
+	// markers are discovered region-scoped via List + Who (TS parity).
+	for _, res := range legacyResourceSpawns() {
 		res := res
 		if st, ok := resources[res.Instance]; ok && st.depleted {
 			res.State = intp(ResourceStateDepleted)
@@ -2642,6 +2645,22 @@ func spawnPayload(instance string) (any, bool) {
 		}
 	}
 	if d, ok := petPayloadByInstance(instance); ok {
+		return d, true
+	}
+	// Marker NPCs (real-mode world.json `entities` markers): showcase Spawn
+	// shape, so NPC talk/store/bank resolve through m6ResolveNPCKey.
+	if d, ok := markerNPCPayload(instance); ok {
+		return d, true
+	}
+	// Marker mobs (real-mode): live engine state at the registry pos (scoped
+	// to marker instances so m1/m-rat-1/m9test Who paths stay identical).
+	if m := markerMobFor(instance); m != nil {
+		m.mu.Lock()
+		d := m.data()
+		m.mu.Unlock()
+		if x, y, found := worldcore.EntityPos(instance); found {
+			d.X, d.Y = x, y
+		}
 		return d, true
 	}
 	if d, ok := staticPayload(instance); ok {

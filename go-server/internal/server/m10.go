@@ -49,6 +49,12 @@ func m10LoadAreas() {
 	}
 	entity.LoadAreas(raw)
 	entity.SpawnStaticChests(gameWorld)
+	// Marker population rides the same boot hook (entities.ts load parity):
+	// all 4,226 world.json `entities` markers spawn here on the REAL path
+	// only (TESTMAP/CLEAN/COMBAT return immediately, scenes untouched).
+	// Static area-chests are NOT duplicated — SpawnStaticChests above owns
+	// them (mimic batch).
+	populateMarkers()
 }
 
 // m10ChestAreaAt ports Mob.addToChestArea (mob.ts: chestAreas.inArea).

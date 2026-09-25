@@ -212,6 +212,11 @@ func (f *simFake) SpawnMobFrame(s MobSpawn) {
 	f.spawns = append(f.spawns, s)
 }
 
+func (f *simFake) SkipFarRoam(mx, my int) bool {
+	_, _ = mx, my
+	return false
+}
+
 func (f *simFake) RemoveMob(instance string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
