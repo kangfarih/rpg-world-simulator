@@ -230,7 +230,7 @@ func TestChestClearSpawnOpen(t *testing.T) {
 	}
 
 	// Opening despawns the chest and drops the rolled item persistently.
-	OpenChest(ch, "hero", w)
+	OpenChest(ch, "hero-1", "hero", w)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if area.LiveChest() != nil {

@@ -1,6 +1,7 @@
 package entity
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type simFake struct {
 	moves      []moveCall
 	spawns     []MobSpawn
 	despawns   []string
+	removed    []string
 	mobPtsInst []string
 	mobPts     []ptsCall
 	strikes    []strikeCall
@@ -46,6 +48,11 @@ type simFake struct {
 	freezes  []freezeCall
 	chests   []ChestSpawn
 	finAchs  []finAchCall
+
+	// spawnMimicOK gates the SpawnMimic double (false = failed spawn,
+	// TS spawnMob-unknown-key parity); mimicSeq numbers the instances.
+	spawnMimicOK bool
+	mimicSeq     int
 }
 
 type finAchCall struct {
@@ -131,8 +138,9 @@ type freezeCall struct {
 
 func newSimFake() *simFake {
 	return &simFake{
-		heroHP:   map[string]int{},
-		entityAt: map[string][2]int{},
+		heroHP:       map[string]int{},
+		entityAt:     map[string][2]int{},
+		spawnMimicOK: true,
 	}
 }
 
@@ -202,6 +210,12 @@ func (f *simFake) SpawnMobFrame(s MobSpawn) {
 	defer f.mu.Unlock()
 	f.entityAt[s.Instance] = [2]int{s.X, s.Y}
 	f.spawns = append(f.spawns, s)
+}
+
+func (f *simFake) RemoveMob(instance string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, instance)
 }
 
 func (f *simFake) MobPoints(instance string, hp, maxHP int) {
@@ -376,6 +390,19 @@ func (f *simFake) SpawnChestFrame(c ChestSpawn) {
 	defer f.mu.Unlock()
 	f.entityAt[c.Instance] = [2]int{c.X, c.Y}
 	f.chests = append(f.chests, c)
+}
+
+func (f *simFake) SpawnMimic(x, y int) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.spawnMimicOK {
+		return "", false
+	}
+	f.mimicSeq++
+	inst := fmt.Sprintf("mimic-test-%d", f.mimicSeq)
+	f.entityAt[inst] = [2]int{x, y}
+	f.spawns = append(f.spawns, MobSpawn{Instance: inst, Key: "mimic", Name: "Mimic", X: x, Y: y})
+	return inst, true
 }
 
 func (f *simFake) FinishAchievement(instance, key string) {

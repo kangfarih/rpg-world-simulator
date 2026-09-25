@@ -48,6 +48,7 @@ func m10LoadAreas() {
 		}
 	}
 	entity.LoadAreas(raw)
+	entity.SpawnStaticChests(gameWorld)
 }
 
 // m10ChestAreaAt ports Mob.addToChestArea (mob.ts: chestAreas.inArea).
@@ -84,11 +85,15 @@ func m10ChestItemsAt(x, y int) bool {
 	return entity.ChestAt(x, y)
 }
 
-// m10OpenChest ports Chest.getItem roll + entities.ts spawnChest onOpen:
-// despawn the chest, roll one entry, spawn it at the chest tile as a
-// persistent M5 loot entity, and log the (future) achievement reward.
+// m10OpenChest ports entities.ts spawnChest onOpen in TS order: despawn
+// the chest, spawn the mimic mob when flagged and opened by a player
+// (non-respawnable, linked so its death re-spawns the chest), roll one
+// entry and spawn it at the chest tile as a persistent M5 loot entity,
+// then finish the chest's own achievement for the opener when set (static
+// chests). Area achievements still fire at CLEAR time (RemoveChestMob,
+// chest.ts onEmpty parity), never on open.
 func m10OpenChest(c *playerConn, chest *m10Chest) {
-	entity.OpenChest(chest, c.Username, gameWorld)
+	entity.OpenChest(chest, c.Instance, c.Username, gameWorld)
 }
 
 // m10OnPositionUpdate is the M10 hook on the movement path (Node

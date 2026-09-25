@@ -29,8 +29,20 @@
 // Chest entity OPEN flow (entities.ts spawnChest onOpen): open despawns the
 // chest, rolls one item and spawns it at the chest tile (persistent — no
 // blink expiry, matching the isStatic=false spawnItem in Node's chest flow).
-// The area achievement fires at CLEAR time (RemoveChestMob, chest.ts onEmpty
-// parity), never on open.
+// A mimic-flagged chest additionally spawns a 'mimic' mob at the chest tile
+// when opened by a player (spawnMob('mimic'), non-respawnable, linked so its
+// death re-spawns THIS chest after CHEST_RESPAWN via the KillMob mimic
+// hook); the item roll still runs. The chest's own achievement (static
+// chests only — the area flow never sets one) finishes for the opener on
+// open (entities.ts onOpen finish). The AREA achievement fires at CLEAR time
+// (RemoveChestMob, chest.ts onEmpty parity), never on open.
+//
+// Static chests (world.json areas.chest, singular — e.g. id 304 at 271,731
+// with mimic:true) spawn once at boot (SpawnStaticChests) and live outside
+// the chest-area mob cycle; area chests (areas.chests, plural) spawn on
+// area clear. Both share the Chest type and the open flow. Late joiners
+// miss the boot Spawn broadcast (broadcast-only entities, same standing
+// divergence as area-reward chests).
 //
 // Everything transport/world related stays with the root adapter and is
 // reached only through the AreaWorld seam (root helpers in parentheses):
@@ -47,6 +59,7 @@
 //	SetEntityPos      -> setEntityPos (chest entity registry)
 //	Despawn           -> S->C Despawn [13] broadcast (chest remove/open)
 //	SpawnChestFrame   -> S->C Spawn [5] broadcast (reward chest)
+//	SpawnMimic        -> m9SpawnMob('mimic') + S->C Spawn [5] broadcast
 //
 // The persistent chest-item drop additionally uses ChestLoot
 // (m5NearWalkable + m5RegisterLoot + the Item Spawn frame).
@@ -110,8 +123,14 @@ type AreaWorld interface {
 	FreezeApply(instance string)
 	FreezeClear(instance string)
 	SpawnChestFrame(c ChestSpawn)
+	// SpawnMimic spawns a 'mimic' mob at (x, y), non-respawnable
+	// (TS mimic.respawnable = false via the NoRespawn override). Reports
+	// the mob instance, or ok=false when the spawn failed (unknown key —
+	// the chest link is skipped, TS `if (mimic)` parity).
+	SpawnMimic(x, y int) (instance string, ok bool)
 	// FinishAchievement finishes an achievement for the player behind
-	// instance (quest.Finish path: chest clear rewards, door achievements).
+	// instance (quest.Finish path: static-chest open rewards, chest
+	// clear rewards, door achievements).
 	FinishAchievement(instance, key string)
 }
 
@@ -146,6 +165,12 @@ type Area struct {
 	Items    string `json:"items"`    // chest area: comma list (key:count:prob)
 	SpawnX   int    `json:"spawnX"`   // chest spawn tile
 	SpawnY   int    `json:"spawnY"`
+
+	// Mimic flags a mimic chest (world.json areas.chest static entries,
+	// e.g. id 304 at 271,731): opening spawns a 'mimic' mob whose death
+	// re-spawns the chest (entities.ts spawnChest onOpen). Chest AREAS
+	// never set it (chest.ts passes no mimic to spawnChest).
+	Mimic bool `json:"mimic"`
 
 	Mapping   int `json:"mapping"`   // dynamic: mapped counterpart area id
 	Animation int `json:"animation"` // dynamic: mapped animation area id
@@ -287,6 +312,11 @@ var (
 	pvpAreas     []*Area
 	overlayAreas []*Area
 	chestAreas   []*Area
+	// staticChests holds the world.json areas.chest (singular) static
+	// entries — one-shot chests (some flagged mimic) living outside the
+	// chest-area mob cycle. Kept apart from chestAreas so mob adoption,
+	// the clear flow and the m10test chest echo never see them.
+	staticChests []*Area
 	dynamicAreas []*Area
 	dynamicByID  = map[int]*Area{}
 	areasLoaded  bool
@@ -301,6 +331,11 @@ var (
 	songState   = map[string]string{}
 	pvpState    = map[string]bool{}
 	frozenState = map[string]bool{} // active Freezing effect
+
+	// mimicChests links live mimic mobs to the chest their death re-spawns
+	// (mob.chest parity, keyed by mob instance; popped on death).
+	mimicMu     sync.Mutex
+	mimicChests = map[string]*Chest{}
 )
 
 // resetAreas clears every registry (tests only; the server loads once).
@@ -308,6 +343,7 @@ func resetAreas() {
 	areasMu.Lock()
 	cameraAreas, musicAreas, pvpAreas, overlayAreas = nil, nil, nil, nil
 	chestAreas, dynamicAreas = nil, nil
+	staticChests = nil
 	dynamicByID = map[int]*Area{}
 	doors = map[int]*Door{}
 	areasWidth = 0
@@ -320,15 +356,22 @@ func resetAreas() {
 	pvpState = map[string]bool{}
 	frozenState = map[string]bool{}
 	stateMu.Unlock()
+	mimicMu.Lock()
+	mimicChests = map[string]*Chest{}
+	mimicMu.Unlock()
 }
 
 // Chest is the chest entity spawned by a cleared chest area
-// (entities.ts spawnChest -> Chest entity).
+// (entities.ts spawnChest -> Chest entity) or once at boot for a static
+// world.json areas.chest entry (SpawnStaticChests). Mimic/Achievement ride
+// along so the mimic-death hook re-spawns THIS chest unchanged.
 type Chest struct {
-	Instance string
-	X, Y     int
-	Items    []string
-	Area     *Area
+	Instance    string
+	X, Y        int
+	Items       []string
+	Achievement string
+	Mimic       bool
+	Area        *Area
 }
 
 // LoadAreas parses a world.json document's `areas` groups (Node world.ts
@@ -353,6 +396,7 @@ func LoadAreas(doc []byte) {
 			PVP     []Area    `json:"pvp"`
 			Overlay []Area    `json:"overlay"`
 			Chests  []Area    `json:"chests"`
+			Chest   []Area    `json:"chest"`
 			Dynamic []Area    `json:"dynamic"`
 			Doors   []rawDoor `json:"doors"`
 		} `json:"areas"`
@@ -373,6 +417,7 @@ func LoadAreas(doc []byte) {
 	pvpAreas = cp(parsed.Areas.PVP)
 	overlayAreas = cp(parsed.Areas.Overlay)
 	chestAreas = cp(parsed.Areas.Chests)
+	staticChests = cp(parsed.Areas.Chest)
 	dynamicAreas = cp(parsed.Areas.Dynamic)
 
 	// map.ts loadDoors parity: link areas.doors by destination id, keyed by
@@ -393,8 +438,8 @@ func LoadAreas(doc []byte) {
 		}
 	}
 
-	log.Printf("m10: areas loaded camera=%d music=%d pvp=%d overlay=%d chests=%d dynamic=%d doors=%d",
-		len(cameraAreas), len(musicAreas), len(pvpAreas), len(overlayAreas), len(chestAreas), len(dynamicAreas), len(doors))
+	log.Printf("m10: areas loaded camera=%d music=%d pvp=%d overlay=%d chests=%d static=%d dynamic=%d doors=%d",
+		len(cameraAreas), len(musicAreas), len(pvpAreas), len(overlayAreas), len(chestAreas), len(staticChests), len(dynamicAreas), len(doors))
 }
 
 // AreasLoaded reports whether LoadAreas has run (single boot load).
@@ -520,7 +565,9 @@ func KillHookForMob(mobX, mobY int, mobInstance, killerInstance string, w GameWo
 }
 
 // spawnChestEntity ports entities.ts spawnChest for the chest-AREA flow:
-// Spawn frame (type Chest4, key "chest") + registry entry.
+// Spawn frame (type Chest4, key "chest") + registry entry. The area flow
+// passes neither achievement nor mimic (chest.ts spawnChest), so both stay
+// zero — area achievements fire at CLEAR (RemoveChestMob), never on open.
 func spawnChestEntity(area *Area, w GameWorld) {
 	inst := fmt.Sprintf("chest-%d-%d", area.ID, time.Now().UnixMilli()%1_000_000)
 	c := &Chest{Instance: inst, X: area.SpawnX, Y: area.SpawnY, Items: area.ItemsList(), Area: area}
@@ -535,12 +582,62 @@ func spawnChestEntity(area *Area, w GameWorld) {
 		inst, c.X, c.Y, area.ID, c.Items)
 }
 
+// StaticChests returns a copy of the static-chest def group (test/introspection).
+func StaticChests() []*Area {
+	areasMu.Lock()
+	defer areasMu.Unlock()
+	out := make([]*Area, len(staticChests))
+	copy(out, staticChests)
+	return out
+}
+
+// SpawnStaticChests spawns one live chest per world.json areas.chest entry
+// (entities.ts constructor loop: spawnChest(items, x, y, isStatic=true,
+// achievement, mimic)). Idempotent: entries with a live chest are skipped,
+// so a boot re-run or a mimic-death respawn race never doubles a chest.
+// The instance is deterministic per entry id (chest-static-<id>) so a
+// scripted client can address it.
+func SpawnStaticChests(w GameWorld) {
+	areasMu.Lock()
+	defs := make([]*Area, len(staticChests))
+	copy(defs, staticChests)
+	areasMu.Unlock()
+	for _, def := range defs {
+		def.mobMu.Lock()
+		if def.chest != nil {
+			def.mobMu.Unlock()
+			continue
+		}
+		c := &Chest{
+			Instance:    fmt.Sprintf("chest-static-%d", def.ID),
+			X:           def.X,
+			Y:           def.Y,
+			Items:       def.ItemsList(),
+			Achievement: def.Achievement,
+			Mimic:       def.Mimic,
+			Area:        def,
+		}
+		def.chest = c
+		def.mobMu.Unlock()
+
+		w.SetEntityPos(c.Instance, c.X, c.Y)
+		w.SpawnChestFrame(ChestSpawn{Instance: c.Instance, X: c.X, Y: c.Y})
+		log.Printf("m10: static chest %s spawned at %d,%d (entry %d, items=%v mimic=%v)",
+			c.Instance, c.X, c.Y, def.ID, c.Items, c.Mimic)
+	}
+}
+
 // ChestFor finds a live chest entity by instance.
 func ChestFor(instance string) *Chest {
 	areasMu.Lock()
 	defer areasMu.Unlock()
 	for _, area := range chestAreas {
 		if c := area.LiveChest(); c != nil && c.Instance == instance {
+			return c
+		}
+	}
+	for _, def := range staticChests {
+		if c := def.LiveChest(); c != nil && c.Instance == instance {
 			return c
 		}
 	}
@@ -556,15 +653,78 @@ func ChestAt(x, y int) bool {
 			return true
 		}
 	}
+	for _, def := range staticChests {
+		if c := def.LiveChest(); c != nil && c.X == x && c.Y == y {
+			return true
+		}
+	}
 	return false
 }
 
-// OpenChest ports Chest.getItem roll + entities.ts spawnChest onOpen:
-// despawn the chest, roll one entry (key:count:probability, Utils.randomInt
-// inclusive) and spawn the item at the chest tile as a persistent M5 loot
-// entity. The area achievement is NOT awarded here: TS awards it in the
-// onEmpty clear callback (RemoveChestMob), not on open.
-func OpenChest(chest *Chest, openerUsername string, w GameWorld) {
+// LinkMimicChest records the chest a live mimic belongs to (mob.chest
+// parity, set in OpenChest when the mimic spawn succeeds).
+func LinkMimicChest(mobInstance string, c *Chest) {
+	mimicMu.Lock()
+	defer mimicMu.Unlock()
+	mimicChests[mobInstance] = c
+}
+
+// TakeMimicChest pops the chest linked to a dead mimic (nil,false when the
+// mob is not a mimic).
+func TakeMimicChest(mobInstance string) (*Chest, bool) {
+	mimicMu.Lock()
+	defer mimicMu.Unlock()
+	c, ok := mimicChests[mobInstance]
+	if ok {
+		delete(mimicChests, mobInstance)
+	}
+	return c, ok
+}
+
+// handleMimicDeath ports the handler.ts death tail `mob.chest?.respawn()`:
+// a dead mimic drops from the registry (TS destroy) and its chest re-spawns
+// after CHEST_RESPAWN (chest.respawn setTimeout parity), reusing the same
+// chest (items/achievement/mimic flag). Non-mimics are a no-op. The slot
+// guard (no overwrite of a live chest) only fires in a repopulation race
+// the static flow cannot otherwise produce.
+func handleMimicDeath(mobInstance string, w GameWorld) {
+	c, ok := TakeMimicChest(mobInstance)
+	if !ok {
+		return
+	}
+	w.RemoveMob(mobInstance)
+	w.AfterDelay(ChestRespawnStatic, func() {
+		area := c.Area
+		if area == nil {
+			return
+		}
+		area.mobMu.Lock()
+		if area.chest != nil {
+			area.mobMu.Unlock()
+			log.Printf("m10: mimic chest %s respawn suppressed (area %d occupied)", c.Instance, area.ID)
+			return
+		}
+		area.chest = c
+		area.mobMu.Unlock()
+
+		w.SetEntityPos(c.Instance, c.X, c.Y)
+		w.SpawnChestFrame(ChestSpawn{Instance: c.Instance, X: c.X, Y: c.Y})
+		log.Printf("m10: mimic chest %s re-spawned at %d,%d (area %d)", c.Instance, c.X, c.Y, area.ID)
+	})
+	log.Printf("m10: mimic %s died -> chest %s respawns in %v", mobInstance, c.Instance, ChestRespawnStatic)
+}
+
+// OpenChest ports entities.ts spawnChest onOpen (remove -> mimic spawn ->
+// item roll -> loot spawn -> opener achievement), in that exact order:
+// despawn the chest, spawn the mimic mob when flagged and opened by a
+// player (non-respawnable, linked so its death re-spawns this chest), roll
+// one entry (key:count:probability, Utils.randomInt inclusive) and spawn
+// the item at the chest tile as a persistent M5 loot entity, then finish
+// the chest's own achievement for the opener when set (static chests;
+// the area flow never sets one — TS area spawnChest passes no achievement).
+// The AREA achievement is NOT awarded here: TS awards it in the onEmpty
+// clear callback (RemoveChestMob), not on open.
+func OpenChest(chest *Chest, openerInstance, openerUsername string, w GameWorld) {
 	// Remove the chest first (onOpen -> this.remove(chest)).
 	chest.Area.mobMu.Lock()
 	if chest.Area.chest == chest {
@@ -577,6 +737,17 @@ func OpenChest(chest *Chest, openerUsername string, w GameWorld) {
 	w.Despawn(chest.Instance)
 	log.Printf("m10: %s opened chest %s at %d,%d", openerUsername, chest.Instance, chest.X, chest.Y)
 
+	// Mimic spawn (entities.ts onOpen `if (player && mimic)`): a failed
+	// spawn skips the link (TS `if (mimic)`), the item flow still runs.
+	if openerUsername != "" && chest.Mimic {
+		if inst, ok := w.SpawnMimic(chest.X, chest.Y); ok {
+			LinkMimicChest(inst, chest)
+			log.Printf("m10: mimic %s spawned at %d,%d (chest %s)", inst, chest.X, chest.Y, chest.Instance)
+		} else {
+			log.Printf("m10: mimic spawn failed (chest %s at %d,%d)", chest.Instance, chest.X, chest.Y)
+		}
+	}
+
 	item := RollChestItem(chest.Items)
 	if item == nil {
 		return
@@ -588,6 +759,12 @@ func OpenChest(chest *Chest, openerUsername string, w GameWorld) {
 	w.RegisterLoot(inst, item.Key, item.Count, lx, ly, openerUsername)
 	w.SpawnLootItem(LootItem{Instance: inst, Key: item.Key, Count: item.Count, X: lx, Y: ly})
 	log.Printf("m10: chest item %s (x%d) spawned at %d,%d", item.Key, item.Count, lx, ly)
+
+	// Static-chest open reward (entities.ts onOpen finish): skipped with
+	// the early return above when no item rolled, exactly like Node.
+	if openerUsername != "" && openerInstance != "" && chest.Achievement != "" {
+		w.FinishAchievement(openerInstance, chest.Achievement)
+	}
 }
 
 // ChestItem is one rolled drop (chest.ts getItem return).

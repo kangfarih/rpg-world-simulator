@@ -419,7 +419,8 @@ type MobSpawn struct {
 // parentheses): players (players map), PlayerPos (connByInstance),
 // Blocked (blocked), SetEntityPos (setEntityPos), Despawn/MoveMob/
 // SpawnMobFrame/MobPoints/StrikeMob/HeroPoints/HeroDied/TeleportHero/
-// SpawnHero/HeroRespawned (broadcast/send frame builders),
+// SpawnHero/HeroRespawned/RemoveMob (broadcast/send frame builders;
+// RemoveMob is the m9Remove registry drop for the dead mimic),
 // Get/Set/ForgetHeroHP (m9PlayerHPs store), AfterDelay (time.AfterFunc),
 // ApplyPoison (abApplyPoison), PlateauLevel (map.getPlateauLevel).
 type MobWorld interface {
@@ -433,6 +434,9 @@ type MobWorld interface {
 	Despawn(instance string)
 	MoveMob(instance string, x, y int)
 	SpawnMobFrame(s MobSpawn)
+	// RemoveMob drops a dead non-respawning mob from the registry
+	// (TS destroy; no despawn frame — KillMob already sent it).
+	RemoveMob(instance string)
 	MobPoints(instance string, hp, maxHP int)
 	StrikeMob(attacker, target string, dmg int)
 	GetHeroHP(instance string) int
@@ -887,13 +891,15 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 }
 
 // KillMob ports handler.handleDeath: despawn + kill credit (M5 loot) +
-// chest-area onEmpty + M11 quest credit + destroy (respawn timer restores
-// full HP at spawn). killer is nil for non-player kills (environmental
-// deaths: DoT ticks, admin commands — no attacker is invented). A
-// killerless kill still drops loot (unowned, owner "") and still runs the
-// chest-area hook; the quest hook fires with an empty killer instance,
-// which the root adapter resolves to a nil conn (nil-safe no-op: no quest
-// or statistics credit is invented for anyone).
+// chest-area onEmpty + mimic-chest respawn + M11 quest credit + destroy
+// (respawn timer restores full HP at spawn). killer is nil for non-player
+// kills (environmental deaths: DoT ticks, admin commands — no attacker is
+// invented). A killerless kill still drops loot (unowned, owner "") and
+// still runs the chest-area hook; the quest hook fires with an empty killer
+// instance, which the root adapter resolves to a nil conn (nil-safe no-op:
+// no quest or statistics credit is invented for anyone). A dead mimic
+// additionally re-spawns its chest after CHEST_RESPAWN and leaves the
+// registry (TS destroy); every other mob is untouched by that hook.
 func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	m.Lock()
 	if m.Dead() {
@@ -924,6 +930,7 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 	}
 	w.SpawnLoot(key, mx, my, owner)
 	KillHookForMob(mx, my, inst, killerInstance, w) // chest-area onEmpty (reward chest spawn)
+	handleMimicDeath(inst, w)                       // mimic.chest?.respawn() (chest re-spawn + destroy)
 	w.QuestKill(killerInstance, key)                // quest kill stages + achievements (nil-safe when "")
 	// Mob-plugin death hook (handleDeath port: minion cleanup + state
 	// reset). No-op for default mobs and untracked instances.

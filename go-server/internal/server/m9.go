@@ -603,6 +603,29 @@ func m9Respawn(m *m9Mob) {
 // m9MinionSeq disambiguates minion instances per boss.
 var m9MinionSeq atomic.Int64
 
+// m9MimicSeq disambiguates mimic instances per opened chest.
+var m9MimicSeq atomic.Int64
+
+// SpawnMimic spawns a 'mimic' mob at (x, y) for a mimic-chest open
+// (entities.ts onOpen spawnMob('mimic')): the full m9SpawnMob path (Spawn
+// broadcast + chest-area adoption + plateau bind) with the TS
+// post-conditions layered on (non-respawning via the NoRespawn override;
+// the chest link itself lives in entity, set by OpenChest on success).
+// Reports ok=false when the profile is unknown (TS `if (mimic)` parity).
+func (gameWorldAdapter) SpawnMimic(x, y int) (string, bool) {
+	inst := fmt.Sprintf("mimic-%d", m9MimicSeq.Add(1))
+	if !m9SpawnMob(inst, "mimic", x, y, m9Overrides{NoRespawn: true}) {
+		return "", false
+	}
+	return inst, true
+}
+
+// RemoveMob drops a dead non-respawning mob from the registry (TS destroy
+// for the mimic; no despawn frame — entity.KillMob already sent it).
+func (gameWorldAdapter) RemoveMob(instance string) {
+	m9Remove(instance)
+}
+
 func (gameWorldAdapter) SpawnMinion(bossInstance, key string, x, y int, opts entity.MinionOpts) string {
 	inst := fmt.Sprintf("%s-minion-%d", bossInstance, m9MinionSeq.Add(1))
 	over := m9Overrides{Aggro: opts.AggroRange, Leash: opts.RoamDistance, NoRespawn: true}
@@ -940,6 +963,12 @@ func m9TestHandler(c *playerConn, data []byte) {
 		if c != nil {
 			c.Sess.PlayerX, c.Sess.PlayerY = d.X, d.Y
 			worldcore.SetEntityPos(c.Instance, d.X, d.Y)
+			// Every other server-side teleport (m7Teleport/m8Teleport,
+			// worldApplyTeleport, walked movement) recomputes the
+			// client's 9-region interest set — without it a debug tp
+			// across regions leaves the client blind to region-scoped
+			// frames (Spawn/Combat) at the landing tile.
+			worldcore.UpdateRegion(c, d.X, d.Y)
 			worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: d.X, Y: d.Y}))
 			m5TrackPos(c) // persist parity: the test tile must survive a save
 			plateauTrack(c)
