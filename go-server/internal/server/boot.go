@@ -2227,6 +2227,16 @@ type playerConn struct {
 	// while the timer goroutine clears it.
 	teleporting bool
 
+	// Loiter tracking (player.ts loiter/isLoiteringThreshold parity): last
+	// authoritative region id + ms epoch of the last region change,
+	// stamped by markLoiterRegion from the UpdateRegion hook (loiter.go).
+	// sessMu-guarded: the conn goroutine writes on region updates while
+	// the engine loiter sweep reads. loiterInit false = no baseline yet
+	// (first sighting stamps, mirroring entity.region -1).
+	loiterInit   bool
+	loiterRegion int
+	loiterSince  int64
+
 	// M7 chat session state (player.chat parity).
 	rank int        // Modules.Ranks value (seeded for e2e only)
 	chat *chatState // rate limiter + global cooldown + rank cache
@@ -2260,8 +2270,9 @@ type Entity = worldcore.Entry
 // process): every FlushInterval each conn's queued frames flush as a single
 // bulk write (5s write deadline; dead conns dropped + Despawn broadcast).
 // Subsystem ticks run through the internal/world Engine in frozen order
-// (abilities -> pets -> events); the Engine only sequences the existing
-// entry points owned by the frozen *_wire.go files.
+// (abilities -> regen -> pets -> events -> loiter); the Engine only sequences
+// the existing entry points owned by the frozen *_wire.go files (plus the
+// loiter sweep in loiter.go).
 var tickOnce sync.Once
 
 // tickEngine sequences the per-flush subsystem ticks (E9b orchestrator seam;
@@ -2271,6 +2282,7 @@ var tickEngine = &worldcore.Engine{Subs: []worldcore.Subsystem{
 	{Name: "regen", Tick: combatRegenTick},  // passive +1/7s regen (heroes + engine mobs)
 	{Name: "pets", Tick: petTick},           // pet follow steps / teleports (no-op with no pets)
 	{Name: "events", Tick: worldEventTick},  // event rotation -> global notices (no-op when none due)
+	{Name: "loiter", Tick: loiterTick},      // loitering XP + cheatScore forgiveness every ~19.2s (throttled)
 }}
 
 func startTickLoop() {
@@ -3087,6 +3099,7 @@ func Boot() {
 	worldcore.Configure(sideLen, mapDivisionSize, surroundingRegions, func(v any) {
 		if pc, ok := v.(*playerConn); ok {
 			worldPushLights(pc) // world: region-enter Lamp fan-out (deduped, no-op when none new)
+			markLoiterRegion(pc, worldcore.TileRegion(pc.Sess.PlayerX, pc.Sess.PlayerY))
 		}
 	})
 	registerDisconnectHooks()

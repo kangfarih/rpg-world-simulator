@@ -66,17 +66,8 @@ func worldWarpConn(c *playerConn) controller.WarpConn {
 // before warps load or Warp frames route).
 func worldConfigureWarps() {
 	controller.ConfigureWarps(controller.WarpDeps{
-		IsJailed: m13IsJailed,
-		TutorialFinished: func(username string) bool {
-			// quests.ts isTutorialFinished parity (warps.ts warp() tutorial
-			// gate): default true when the tutorial quest def is absent,
-			// otherwise the m11 quest-stage lookup — the same read the warp
-			// quest gate uses.
-			if m11Q["tutorial"] == nil {
-				return true
-			}
-			return m11StateFor(username).isFinished("tutorial")
-		},
+		IsJailed:         m13IsJailed,
+		TutorialFinished: func(username string) bool { return loiterTutorialFinished(username) },
 		InCombat: func(instance string) bool {
 			// character.ts inCombat parity (warps.ts warp() combat gate) via
 			// the live-target indicators the stub already owns: the hero's

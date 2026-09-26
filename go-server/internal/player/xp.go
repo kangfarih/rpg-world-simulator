@@ -29,7 +29,12 @@ func xpIntp(v int) *int           { return &v }
 func xpBoolp(v bool) *bool        { return &v }
 func xpFloatp(v float64) *float64 { return &v }
 
-// Skill ids mirror Modules.Skills order (m5.go consts verbatim).
+// Skill ids mirror Modules.Skills order (modules.ts:215-235 enum order:
+// Lumberjacking0 Accuracy1 Archery2 Health3 Magic4 Mining5 Strength6
+// Defense7 Fishing8 Cooking9 Smithing10 Crafting11 Chiseling12 Fletching13
+// Smelting14 Foraging15 Eating16 Loitering17 Alchemy18). Only the ids the
+// server awards are named; Chiseling(12)/Smelting(14) stay absent exactly
+// like the TS skills dict (see controller.SkillNameToID).
 const (
 	SkillLumberjacking = 0
 	SkillAccuracy      = 1
@@ -41,6 +46,9 @@ const (
 	SkillDefense       = 7
 	SkillFishing       = 8
 	SkillForaging      = 15
+	SkillEating        = 16
+	SkillLoitering     = 17
+	SkillAlchemy       = 18
 )
 
 // Attack style ids mirror Modules.AttackStyle (modules.ts:158-179).
@@ -86,6 +94,12 @@ func SkillName(id int) string {
 		return "Fishing"
 	case SkillForaging:
 		return "Foraging"
+	case SkillEating:
+		return "Eating"
+	case SkillLoitering:
+		return "Loitering"
+	case SkillAlchemy:
+		return "Alchemy"
 	}
 	return fmt.Sprintf("Skill%d", id)
 }

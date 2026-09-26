@@ -231,6 +231,7 @@ const (
 	SkillChiseling = protocol.SkillChiseling
 	SkillFletching = protocol.SkillFletching
 	SkillSmelting  = protocol.SkillSmelting
+	SkillLoitering = protocol.SkillLoitering
 	SkillAlchemy   = protocol.SkillAlchemy
 )
 

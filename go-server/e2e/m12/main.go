@@ -415,7 +415,7 @@ func main() {
 		craftType = d.Type
 		previews = len(d.Previews)
 	}
-	check(craftType != nil && *craftType == 17, "Crafting Open type=Alchemy(17)")
+	check(craftType != nil && *craftType == 18, "Crafting Open type=Alchemy(18, TS Modules.Skills)")
 	checkf(previews > 0, "Crafting Open carries previews (got %d)", previews)
 	lastFrames = nil
 	// Select flask: requirements + result.

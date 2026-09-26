@@ -513,7 +513,12 @@ const (
 	CraftingCraft  = 2
 )
 
-// Modules.Skills ids for the crafting interfaces (modules.ts:215-235).
+// Modules.Skills ids for the crafting interfaces (modules.ts:215-235 enum
+// order: Lumberjacking0 Accuracy1 Archery2 Health3 Magic4 Mining5 Strength6
+// Defense7 Fishing8 Cooking9 Smithing10 Crafting11 Chiseling12 Fletching13
+// Smelting14 Foraging15 Eating16 Loitering17 Alchemy18). Alchemy was 17
+// (Loitering's id) — an off-by-one that sent alchemy Crafting Open frames
+// and alchemy craft XP under skill 17; fixed to the TS-exact 18.
 const (
 	SkillCooking   = 9
 	SkillSmithing  = 10
@@ -521,7 +526,8 @@ const (
 	SkillChiseling = 12
 	SkillFletching = 13
 	SkillSmelting  = 14
-	SkillAlchemy   = 17
+	SkillLoitering = 17
+	SkillAlchemy   = 18
 )
 
 // enchAny widens m5Slot.Ench for packet payloads (nil -> {}). Keys stringify
