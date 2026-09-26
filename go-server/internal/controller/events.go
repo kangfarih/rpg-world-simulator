@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"rpg-world-server/internal/events"
 )
@@ -64,6 +65,13 @@ func (c *EventController) Boot() (int, int64) {
 		c.active = map[string]bool{}
 	}
 	c.sched = events.NewScheduler(list)
+	// Production weekend gate (TS events.ts getDay()%6 rotation): enabled
+	// exactly when the cadence is NOT overridden. The WORLD_EVENT_MS test
+	// hook implies test timing, where e2e/world requires events to fire
+	// any day of the week — so the override keeps the flat cadence.
+	if os.Getenv("WORLD_EVENT_MS") == "" {
+		c.sched.SetNow(time.Now)
+	}
 	c.sched.Start()
 	return len(list), every
 }
