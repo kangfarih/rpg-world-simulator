@@ -23,8 +23,10 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -33,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"rpg-world-server/internal/console"
 	"rpg-world-server/internal/hub"
 	"rpg-world-server/internal/version"
 )
@@ -198,6 +201,79 @@ func RouterHandler(h *hub.Server, lc *Lifecycle) http.Handler {
 	return mux
 }
 
+// routerShardLine renders one server-list entry for the console: the
+// shard name plus its login-redirect addr, drain state, load, and world
+// version.
+func routerShardLine(info hub.ShardInfo) string {
+	addr := info.Addr
+	if addr == "" {
+		addr = info.Name
+	}
+	return fmt.Sprintf("Server %s (%s) state=%s load=%d version=%s",
+		info.Name, addr, info.State, info.Load, info.Version)
+}
+
+// routerConsole applies hub console commands over the hub Server's
+// server-list + presence roster (TS packages/hub/src/console.ts parity).
+// `server` prints the emptiest/newest-target entry (the NewestRunning login
+// target — the router's analogue of TS findEmptyServer's first server with
+// space); `player <username>` prints the shard/presence entry hosting the
+// name (TS findPlayer parity). "undefined" mirrors the TS
+// console.log(undefined) when no shard or player matches. Read-only: it
+// uses NewestRunning + FindPlayer and never mutates hub state.
+type routerConsole struct{ h *hub.Server }
+
+func (c *routerConsole) Server() string {
+	if c == nil || c.h == nil {
+		return "undefined"
+	}
+	info, ok := c.h.NewestRunning()
+	if !ok {
+		return "undefined"
+	}
+	return routerShardLine(info)
+}
+
+func (c *routerConsole) Player(username string) string {
+	if c == nil || c.h == nil {
+		return "undefined"
+	}
+	shard, ok := c.h.FindPlayer(username)
+	if !ok {
+		return "undefined"
+	}
+	return fmt.Sprintf("Player %s is on %s", username, shard)
+}
+
+// StartRouterConsole starts the router stdin console loop over h unless
+// CONSOLE=0 or stdin is not a TTY — the same gate as the game StartConsole
+// (pipes, tests, harnesses, CI never block on stdin). Lines feed
+// console.HubExec with the routerConsole handler above.
+func StartRouterConsole(h *hub.Server) {
+	if ConsoleDisabled(os.Getenv("CONSOLE")) {
+		log.Printf("router: console disabled (CONSOLE=%s)", os.Getenv("CONSOLE"))
+		return
+	}
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		log.Printf("router: console disabled (stdin not a TTY)")
+		return
+	}
+	c := &routerConsole{h: h}
+	go func() {
+		log.Printf("router: console ready (slash commands)")
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			if out := console.HubExec(c, sc.Text()); out != "" {
+				log.Printf("console: %s", out)
+			}
+		}
+		if err := sc.Err(); err != nil {
+			log.Printf("router: console ended: %v", err)
+		}
+	}()
+}
+
 // RouterDrainGrace is the router's SIGTERM grace: it holds no sim state,
 // so DRAINING only needs to stay observable on /healthz (503) long enough
 // for a balancer scrape before the process exits. Game/shard instances use
@@ -229,6 +305,7 @@ func RunRouter(cfg Config) error {
 	addr := RouterAddr()
 	h := hub.NewServer(hub.SharedToken(), nil)
 	h.StartSweeper(context.Background())
+	StartRouterConsole(h)
 	lc := Default
 	lc.SetLoad(0)
 	go awaitRouterDrain(lc)

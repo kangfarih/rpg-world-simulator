@@ -22,6 +22,8 @@
 // consequences itself.
 package events
 
+import "time"
+
 // CheckIntervalMs mirrors Modules.Constants.EVENTS_CHECK_INTERVAL
 // (modules.ts): the TS hourly re-check cadence, 3_600_000 ms.
 const CheckIntervalMs = int64(3_600_000)
@@ -50,11 +52,19 @@ func DefaultEvents() []Event {
 // pure check: Due(nowMs) reports which events are due at nowMs and records
 // their last-fired times. The caller ticks it; nothing runs in the
 // background.
+//
+// The TS weekend gate (events.ts check(): new Date().getDay() % 6 === 0)
+// is opt-in via SetNow: a nil calendar clock keeps the flat cadence
+// (today's behavior, and what Due reports without a clock); a set clock
+// gates Due to weekends only. The clock is caller-supplied (mirroring the
+// hub Server now hook and the nowMs-param convention elsewhere), so tests
+// stay deterministic.
 type Scheduler struct {
 	events []Event
 	last   map[string]int64
 	active bool
 	seeded bool
+	now    func() time.Time
 }
 
 // NewScheduler builds a Scheduler over events (copied). A nil or empty
@@ -66,6 +76,23 @@ func NewScheduler(events []Event) *Scheduler {
 	cp := make([]Event, len(events))
 	copy(cp, events)
 	return &Scheduler{events: cp, last: make(map[string]int64, len(cp))}
+}
+
+// IsWeekend reports whether t falls on a TS weekend. JS Date.getDay() is
+// 0=Sunday..6=Saturday, identical to Go time.Weekday numbering, so the TS
+// gate `getDay() % 6 === 0` maps exactly: Sunday (0 % 6 == 0) and Saturday
+// (6 % 6 == 0) pass; Monday..Friday do not.
+func IsWeekend(t time.Time) bool {
+	return int(t.Weekday())%6 == 0
+}
+
+// SetNow installs the calendar clock that enables the TS weekend gate:
+// with a clock set, Due reports events only on weekends (gate-closed days
+// return nil without seeding or advancing the last-fired clocks, so the
+// first open-day Due re-seeds and firing resumes one cadence later).
+// Passing nil restores the flat cadence (no calendar gating).
+func (s *Scheduler) SetNow(fn func() time.Time) {
+	s.now = fn
 }
 
 // Start activates the scheduler. The first Due call after Start only seeds
@@ -91,11 +118,15 @@ func (s *Scheduler) IsActive() bool {
 
 // Due returns the events whose cadence has elapsed at nowMs (in rotation
 // order) and advances their last-fired clocks to nowMs. It returns nil
-// while stopped, and the seeding call right after Start also returns nil.
-// A non-positive IntervalMs means the event is due on every Due call after
-// seeding.
+// while stopped, on gate-closed (weekday) days when a calendar clock is
+// set via SetNow, and on the seeding call right after Start (which also
+// returns nil). A non-positive IntervalMs means the event is due on every
+// Due call after seeding.
 func (s *Scheduler) Due(nowMs int64) []Event {
 	if !s.active {
+		return nil
+	}
+	if s.now != nil && !IsWeekend(s.now()) {
 		return nil
 	}
 	if !s.seeded {
@@ -116,15 +147,17 @@ func (s *Scheduler) Due(nowMs int64) []Event {
 }
 
 // Divergences from TS (documented):
-//   - No calendar gating: TS only activates on weekends (getDay() % 6 == 0)
-//     and picks a single active event by week-number remainder; the weekend
-//     pick persists until a weekday disables it. This scheduler has no clock
-//     calendar — the caller decides when to Start/Stop (e.g. weekend policy)
-//     and Due fires each configured event on its own IntervalMs cadence.
-//   - No single-active latch: TS keeps one activeEvent until disable(); here
-//     each event re-fires independently per cadence and Due may return
-//     several at once. Callers wanting one-at-a-time rotation should
-//     configure staggered intervals or consume only the first due event.
+//   - Weekend gate is opt-in: TS checks getDay() % 6 == 0 on every hourly
+//     tick (weekends activate, weekdays disable). Here the gate applies
+//     only once a calendar clock is installed via SetNow (nil clock = flat
+//     cadence, today's default); gate-closed days return nil without
+//     seeding or advancing clocks, so firing resumes one cadence after the
+//     next open-day Due.
+//   - No single-active latch and no week-number remainder pick: TS keeps
+//     one activeEvent (events[weekNumber % len]) until disable(); here each
+//     event re-fires independently per cadence and Due may return several
+//     at once. Callers wanting one-at-a-time rotation should configure
+//     staggered intervals or consume only the first due event.
 //   - No side effects: TS broadcasts world.globalMessage frames and flips
 //     Utils.doubleLumberjacking/doubleMining (plus exposes
 //     doubleDropProbability/experiencePerHit multipliers). This package only
