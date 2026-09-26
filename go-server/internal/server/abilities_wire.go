@@ -94,6 +94,17 @@ func abConfigure() {
 			return true
 		},
 		HeroWeaponPoisonous: func(username string) bool {
+			// player.ts:2057 isPoisonous — an archer reads the equipped
+			// ARROWS' poisonous flag (arrows only, never the bow); anyone
+			// else reads the weapon (existing behavior, unchanged).
+			if heroIsArcher(username) {
+				a := heroEquipSlot(username, EquipmentArrows)
+				if a.Key == "" {
+					return false
+				}
+				it := m6ItemInfoFor(a.Key)
+				return it != nil && it.Poisonous
+			}
 			st := m5StateFor(username)
 			if len(st.Equip) <= EquipmentWeapon {
 				return false

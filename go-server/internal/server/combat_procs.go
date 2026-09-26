@@ -128,6 +128,15 @@ func heroIsMagic(username string) bool {
 	return it != nil && it.Type == "weaponmagic"
 }
 
+// heroHasArrows ports player.hasArrows (player.ts:1708-1711) for the hero:
+// the equipped arrows-slot count is above zero. (TS additionally bypasses
+// the check while the tutorial is unfinished; the hero models the slot
+// only — an empty arrows slot never lets a bow swing.)
+func heroHasArrows(username string) bool {
+	a := heroEquipSlot(username, EquipmentArrows)
+	return a.Count > 0
+}
+
 // heroManaCost ports equipment.getWeapon().manaCost (weapon.ts:54 from
 // items.json `manaCost`) for the hero's equipped weapon (0 when none).
 func heroManaCost(username string) int {

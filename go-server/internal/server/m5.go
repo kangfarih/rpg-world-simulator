@@ -496,6 +496,15 @@ func handlePlayerAttack(c *playerConn, target string) {
 	if target == "" || c == nil {
 		return
 	}
+	// Arrow gate (combat.ts:208-210 sendRangedAttack): a non-magic archer
+	// with no arrows stops the loop — the per-swing Go equivalent is a
+	// silent no-swing (no frames). Same heroIsArcher detection the
+	// damage-type roll uses, same EquipmentArrows slot lookup the equip
+	// code uses. No arrows are consumed per shot (TS has no consumption).
+	if heroIsArcher(c.Username) && !heroIsMagic(c.Username) && !heroHasArrows(c.Username) {
+		log.Printf("m5: %s bow swing refused (no arrows)", c.Instance)
+		return
+	}
 	dmg := 8 + rand.Intn(5)
 	// Attack-style damage bonus (formulas.getMaxDamage parity): the hero's
 	// current style scales the swing (bots keep their own styles via
