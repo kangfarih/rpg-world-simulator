@@ -255,6 +255,15 @@ func m12ClearSession(me, peer *playerConn) {
 	controller.ClearSession(me, p, m12deps())
 }
 
+// m12DisconnectClose ports player.ts disconnect trade.close(): the open peer
+// (if any) gets Trade Close and both sides are cleared. No-op without a session.
+func m12DisconnectClose(me *playerConn) {
+	if me == nil {
+		return
+	}
+	controller.DisconnectClose(me, m12deps())
+}
+
 // m12ForgetSession drops trade state when a connection leaves (world.ts
 // clearActiveTrade parity happens via close; stale map entries are dropped).
 func m12ForgetSession(key string) {

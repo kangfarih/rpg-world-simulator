@@ -539,3 +539,85 @@ func TestOpenEnchanterGrantsAccess(t *testing.T) {
 		t.Fatal("no NPC Enchant frame")
 	}
 }
+
+func TestDisconnectCloseNotifiesPeerAndClearsBoth(t *testing.T) {
+	resetTradeState()
+	s := newFakeStore()
+	a := &fakeConn{instance: "a1", username: "alice", x: 100, y: 96}
+	b := &fakeConn{instance: "b1", username: "bob", x: 101, y: 96}
+	bus := newFakeBus()
+	d := testDeps(s, bus, newFakePeers(a, b))
+
+	// Mutual request opens the session for both parties.
+	HandleTrade(a, []byte(`{"opcode":0,"instance":"b1"}`), d)
+	HandleTrade(b, []byte(`{"opcode":0,"instance":"a1"}`), d)
+	if tr, _ := pair(a, d); tr == nil {
+		t.Fatal("session never opened")
+	}
+
+	// Alice disconnects: Bob must get Trade Close, both sides cleared.
+	DisconnectClose(a, d)
+	if !bus.hasOpcode("b1", protocol.PacketTrade, protocol.TradeClose) {
+		t.Fatal("peer never got Trade Close on disconnect")
+	}
+	if bus.hasOpcode("a1", protocol.PacketTrade, protocol.TradeClose) {
+		t.Fatal("disconnecter must not get a Close frame (conn is gone)")
+	}
+	if tr, _ := pair(a, d); tr != nil {
+		t.Fatal("disconnecter's session not cleared")
+	}
+	if tr, _ := pair(b, d); tr != nil {
+		t.Fatal("peer's session not cleared")
+	}
+
+	// The cleared peer can immediately open a fresh trade.
+	bus.sent = map[string][]frame{}
+	c := &fakeConn{instance: "c1", username: "carol", x: 102, y: 96}
+	d.Peers.(*fakePeers).byInst["c1"] = c
+	d.Peers.(*fakePeers).byName["carol"] = c
+	HandleTrade(b, []byte(`{"opcode":0,"instance":"c1"}`), d)
+	HandleTrade(c, []byte(`{"opcode":0,"instance":"b1"}`), d)
+	if !bus.hasOpcode("b1", protocol.PacketTrade, protocol.TradeOpen) {
+		t.Fatal("peer could not open a fresh trade after disconnect clear")
+	}
+}
+
+func TestDisconnectCloseNoSessionNoOp(t *testing.T) {
+	resetTradeState()
+	s := newFakeStore()
+	a := &fakeConn{instance: "a1", username: "alice", x: 100, y: 96}
+	bus := newFakeBus()
+	d := testDeps(s, bus, newFakePeers(a))
+
+	DisconnectClose(a, d) // must not panic, must send nothing
+	for inst, frames := range bus.sent {
+		if len(frames) != 0 {
+			t.Fatalf("no-session disconnect sent %d frames to %s", len(frames), inst)
+		}
+	}
+	for inst, notifs := range bus.notifs {
+		if len(notifs) != 0 {
+			t.Fatalf("no-session disconnect sent %d notifs to %s", len(notifs), inst)
+		}
+	}
+	DisconnectClose(nil, d) // nil-safe, must not panic
+}
+
+func TestDisconnectClosePeerGoneClearsStale(t *testing.T) {
+	resetTradeState()
+	s := newFakeStore()
+	a := &fakeConn{instance: "a1", username: "alice"}
+	bus := newFakeBus()
+	d := testDeps(s, bus, newFakePeers(a)) // bob is not connected
+	stateFor("alice").Trades["b9"] = &Trade{other: "bob", offers: map[int]*OfferedItem{}}
+
+	DisconnectClose(a, d) // nobody to notify: no frames, stale entry dropped
+	for inst, frames := range bus.sent {
+		if len(frames) != 0 {
+			t.Fatalf("gone-peer disconnect sent %d frames to %s", len(frames), inst)
+		}
+	}
+	if got := len(stateFor("alice").Trades); got != 0 {
+		t.Fatalf("stale session not cleared (%d entries left)", got)
+	}
+}

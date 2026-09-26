@@ -2366,7 +2366,9 @@ func registerDisconnectHooks() {
 		if !ok || c == nil {
 			return
 		}
-		m12ClearSession(c, nil)
+		// Trade: notify the open peer with Trade Close + clear both sides
+		// (player.ts disconnect trade.close() parity; no-op without a session).
+		m12DisconnectClose(c)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)

@@ -443,6 +443,43 @@ func ClearSession(me, peer Conn, d Deps) {
 	}
 }
 
+// DisconnectClose ports player.ts disconnect trade.close(): when the
+// disconnecter has an open session, the peer is resolved BEFORE clearing,
+// gets the Trade Close frame ([33, Close opcode, {}] — the same construction
+// tradeClose uses; the disconnecter's own send is skipped, its conn is gone),
+// and both sides' state is dropped via ClearSession. No-op without an open
+// session (trade.close's `if (!this.activeTrade) return`).
+func DisconnectClose(me Conn, d Deps) {
+	if me == nil {
+		return
+	}
+	if !hasSession(me) {
+		return
+	}
+	_, peer := pair(me, d)
+	if peer != nil {
+		d.Bus.SendTo(peer.InstanceID(), protocol.PktOp(protocol.PacketTrade, protocol.TradeClose, tradePacketData{}))
+	}
+	ClearSession(me, peer, d)
+}
+
+// hasSession reports whether me holds an open trade session. Read-only: it
+// never creates state, so the no-session disconnect path stays a true no-op.
+func hasSession(me Conn) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	st, ok := states[me.PlayerName()]
+	if !ok || st == nil {
+		return false
+	}
+	for _, t := range st.Trades {
+		if t != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // tradeRequest ports trade.request: 1-tile range, hollow-admin/cheater
 // guards are stubbed out (no such flags in the Go slice); mutual requests
 // open the session, otherwise notify both parties of the pending request.
